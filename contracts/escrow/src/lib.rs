@@ -214,6 +214,14 @@ impl Escrow {
         if env
             .storage()
             .persistent()
+            .get(&DataKey::ServiceDisabled(service_id.clone()))
+            .unwrap_or(false)
+        {
+            panic_with_error!(&env, EscrowError::ServiceDisabled);
+        }
+        if env
+            .storage()
+            .persistent()
             .get(&DataKey::AllowlistEnabled)
             .unwrap_or(false)
             && !env
