@@ -159,6 +159,16 @@ fn test_unpause_admin_can_unpause() {
 }
 
 #[test]
+#[should_panic(expected = "Error(Contract, #4)")]
+fn test_record_usage_rejected_while_paused() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    client.pause();
+    let agent = Address::generate(&env);
+    client.record_usage(&agent, &Symbol::new(&env, "infer"), &1u32);
+}
+
+#[test]
 fn test_is_paused_round_trip() {
     let env = Env::default();
     let (client, _admin) = setup_initialized(&env);

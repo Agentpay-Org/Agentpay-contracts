@@ -93,6 +93,14 @@ impl Escrow {
         service_id: Symbol,
         requests: u32,
     ) -> UsageRecord {
+        if env
+            .storage()
+            .persistent()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+        {
+            panic_with_error!(&env, EscrowError::ContractPaused);
+        }
         if requests == 0 {
             panic_with_error!(&env, EscrowError::RequestsMustBePositive);
         }
