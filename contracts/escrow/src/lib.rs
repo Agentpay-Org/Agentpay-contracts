@@ -171,6 +171,19 @@ impl Escrow {
         {
             panic_with_error!(&env, EscrowError::ServiceNotRegistered);
         }
+        if env
+            .storage()
+            .persistent()
+            .get(&DataKey::AllowlistEnabled)
+            .unwrap_or(false)
+            && !env
+                .storage()
+                .persistent()
+                .get(&DataKey::AgentAllowed(agent.clone()))
+                .unwrap_or(false)
+        {
+            panic_with_error!(&env, EscrowError::AgentNotAllowed);
+        }
         let key = DataKey::Usage(agent.clone(), service_id.clone());
         let prev: u32 = env.storage().persistent().get(&key).unwrap_or(0);
         let total = prev.saturating_add(requests);
