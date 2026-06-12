@@ -128,6 +128,14 @@ impl Escrow {
         if requests == 0 {
             panic_with_error!(&env, EscrowError::RequestsMustBePositive);
         }
+        let max_per_call: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MaxRequestsPerCall)
+            .unwrap_or(u32::MAX);
+        if requests > max_per_call {
+            panic_with_error!(&env, EscrowError::RequestsExceedsMaxPerCall);
+        }
         if env
             .storage()
             .persistent()
