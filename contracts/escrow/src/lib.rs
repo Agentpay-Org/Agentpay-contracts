@@ -285,6 +285,14 @@ impl Escrow {
             .unwrap_or(0)
     }
 
+    /// Read whether an agent is explicitly allowed (false for never-set).
+    pub fn is_agent_allowed(env: Env, agent: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AgentAllowed(agent))
+            .unwrap_or(false)
+    }
+
     /// Admin sets the allowlist status for a specific agent.
     pub fn set_agent_allowed(env: Env, agent: Address, allowed: bool) {
         let admin: Address = env
