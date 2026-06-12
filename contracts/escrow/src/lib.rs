@@ -31,6 +31,10 @@ pub enum DataKey {
     ServiceRegistered(Symbol),
     /// `true` when `record_usage` should reject unknown services.
     RequireServiceRegistration,
+    /// Upper bound on `requests` per single `record_usage` call. When
+    /// set, `record_usage` rejects calls above this delta. Defaults to
+    /// `u32::MAX` (no limit) when absent.
+    MaxRequestsPerCall,
 }
 
 /// Typed contract errors. Codes are append-only to keep client SDKs stable.
@@ -53,6 +57,9 @@ pub enum EscrowError {
     /// `record_usage` referenced a service that has not been registered
     /// while strict registration is enabled.
     ServiceNotRegistered = 7,
+    /// `record_usage` was called with a `requests` value above the
+    /// configured `MaxRequestsPerCall` cap.
+    RequestsExceedsMaxPerCall = 8,
 }
 
 #[contracttype]
@@ -238,6 +245,20 @@ impl Escrow {
         let billed = (requests as i128).saturating_mul(price);
         env.storage().persistent().set(&usage_key, &0u32);
         billed
+    }
+
+    /// Admin sets the per-call upper bound on `requests` accepted by
+    /// `record_usage`. Pass `u32::MAX` to effectively disable the cap.
+    pub fn set_max_requests_per_call(env: Env, max_requests: u32) {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, EscrowError::NotInitialized));
+        admin.require_auth();
+        env.storage()
+            .persistent()
+            .set(&DataKey::MaxRequestsPerCall, &max_requests);
     }
 
     /// Admin toggles strict-registration mode. When enabled,
