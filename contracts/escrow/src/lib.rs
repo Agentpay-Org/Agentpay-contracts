@@ -634,6 +634,13 @@ impl Escrow {
         env.storage().persistent().set(&DataKey::SchemaVersion, &2u32);
     }
 
+    /// Read the metadata for a service, or `None` if none has been set.
+    pub fn get_service_metadata(env: Env, service_id: Symbol) -> Option<ServiceMetadata> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ServiceMetadata(service_id))
+    }
+
     /// Admin sets human-readable metadata for a service. Persisted
     /// under `DataKey::ServiceMetadata(service_id)`. Description is
     /// capped at 256 UTF-8 bytes to bound storage cost.
