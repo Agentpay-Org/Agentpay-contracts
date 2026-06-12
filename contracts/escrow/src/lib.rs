@@ -163,6 +163,32 @@ impl Escrow {
         (requests as i128).saturating_mul(price)
     }
 
+    /// Settle the accumulated usage for an `(agent, service_id)` pair.
+    ///
+    /// Admin-gated. Computes the outstanding bill (same math as
+    /// `compute_billing`), resets the usage counter to zero, and returns
+    /// the billed amount in stroops. The settlement loop is expected to
+    /// transfer the returned amount off-chain or via a paired token
+    /// contract call; this contract intentionally holds no balance.
+    pub fn settle(env: Env, agent: Address, service_id: Symbol) -> i128 {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, EscrowError::NotInitialized));
+        admin.require_auth();
+        let usage_key = DataKey::Usage(agent.clone(), service_id.clone());
+        let requests: u32 = env.storage().persistent().get(&usage_key).unwrap_or(0);
+        let price: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ServicePrice(service_id))
+            .unwrap_or(0);
+        let billed = (requests as i128).saturating_mul(price);
+        env.storage().persistent().set(&usage_key, &0u32);
+        billed
+    }
+
     /// Get the version of the contract for compatibility checks.
     pub fn version(env: Env) -> u32 {
         let _ = env;

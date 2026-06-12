@@ -131,6 +131,29 @@ fn test_compute_billing_basic() {
 }
 
 #[test]
+fn test_settle_drains_usage_and_returns_billed() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "infer");
+    client.set_service_price(&svc, &10i128);
+    client.record_usage(&agent, &svc, &42u32);
+    let billed = client.settle(&agent, &svc);
+    assert_eq!(billed, 420i128);
+    assert_eq!(client.get_usage(&agent, &svc), 0);
+}
+
+#[test]
+fn test_settle_returns_zero_for_unused_pair() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "infer");
+    client.set_service_price(&svc, &10i128);
+    assert_eq!(client.settle(&agent, &svc), 0i128);
+}
+
+#[test]
 fn test_compute_billing_zero_when_unpriced_or_unused() {
     let env = Env::default();
     let (client, _admin) = setup_initialized(&env);
