@@ -391,8 +391,12 @@ impl Escrow {
         let billed = (requests as i128).saturating_mul(price);
         env.storage().persistent().set(&usage_key, &0u32);
         env.storage().persistent().set(
-            &DataKey::LastSettlement(agent, service_id),
+            &DataKey::LastSettlement(agent.clone(), service_id.clone()),
             &env.ledger().timestamp(),
+        );
+        env.events().publish(
+            (symbol_short!("settled"),),
+            (agent, service_id, requests, billed),
         );
         billed
     }
