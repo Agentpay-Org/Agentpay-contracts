@@ -207,6 +207,15 @@ impl Escrow {
         }
     }
 
+    /// Read the cross-service lifetime request count for an agent.
+    /// Not affected by `settle` (which only drains per-service counters).
+    pub fn get_total_usage_by_agent(env: Env, agent: Address) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::TotalUsageByAgent(agent))
+            .unwrap_or(0)
+    }
+
     /// Returns the accumulated request count for an `(agent, service_id)`
     /// pair, or `0` if no usage has been recorded yet.
     pub fn get_usage(env: Env, agent: Address, service_id: Symbol) -> u32 {
