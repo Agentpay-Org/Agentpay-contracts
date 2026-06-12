@@ -634,6 +634,27 @@ impl Escrow {
         env.storage().persistent().set(&DataKey::SchemaVersion, &2u32);
     }
 
+    /// Admin sets human-readable metadata for a service. Persisted
+    /// under `DataKey::ServiceMetadata(service_id)`. Description is
+    /// capped at 256 UTF-8 bytes to bound storage cost.
+    pub fn set_service_metadata(
+        env: Env,
+        service_id: Symbol,
+        description: String,
+        owner: Address,
+    ) {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, EscrowError::NotInitialized));
+        admin.require_auth();
+        env.storage().persistent().set(
+            &DataKey::ServiceMetadata(service_id),
+            &ServiceMetadata { description, owner },
+        );
+    }
+
     /// Read the on-chain schema version, or `1` (the implicit
     /// pre-migration default) if absent.
     pub fn get_schema_version(env: Env) -> u32 {
