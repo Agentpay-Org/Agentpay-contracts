@@ -184,6 +184,14 @@ impl Escrow {
     /// transfer the returned amount off-chain or via a paired token
     /// contract call; this contract intentionally holds no balance.
     pub fn settle(env: Env, agent: Address, service_id: Symbol) -> i128 {
+        if env
+            .storage()
+            .persistent()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+        {
+            panic_with_error!(&env, EscrowError::ContractPaused);
+        }
         let admin: Address = env
             .storage()
             .persistent()

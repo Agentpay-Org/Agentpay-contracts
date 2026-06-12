@@ -160,6 +160,16 @@ fn test_unpause_admin_can_unpause() {
 
 #[test]
 #[should_panic(expected = "Error(Contract, #4)")]
+fn test_settle_rejected_while_paused() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    client.pause();
+    let agent = Address::generate(&env);
+    client.settle(&agent, &Symbol::new(&env, "infer"));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")]
 fn test_record_usage_rejected_while_paused() {
     let env = Env::default();
     let (client, _admin) = setup_initialized(&env);
