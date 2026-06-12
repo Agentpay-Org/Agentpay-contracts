@@ -221,6 +221,14 @@ impl Escrow {
         }
     }
 
+    /// Read the protocol-wide lifetime request counter (u64).
+    pub fn get_total_requests_all_time(env: Env) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::TotalRequestsAllTime)
+            .unwrap_or(0)
+    }
+
     /// Read the cross-service lifetime request count for an agent.
     /// Not affected by `settle` (which only drains per-service counters).
     pub fn get_total_usage_by_agent(env: Env, agent: Address) -> u32 {
