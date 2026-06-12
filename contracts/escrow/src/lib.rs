@@ -90,6 +90,9 @@ pub enum EscrowError {
     /// `record_usage` was called by/for an agent not on the allowlist
     /// while strict allowlisting is enabled.
     AgentNotAllowed = 10,
+    /// `migrate_v1_to_v2` was called from a non-v1 schema. v2 itself is
+    /// already migrated.
+    MigrationVersionMismatch = 11,
 }
 
 #[contracttype]
@@ -591,6 +594,30 @@ impl Escrow {
             .unwrap_or_else(|| panic_with_error!(&env, EscrowError::NotInitialized));
         admin.require_auth();
         env.storage().persistent().set(&DataKey::Paused, &true);
+    }
+
+    /// Migrate the persisted schema from v1 to v2. Admin-gated and
+    /// idempotent in shape — but panics with `MigrationVersionMismatch`
+    /// if the current schema is already at v2 (or higher), to surface
+    /// accidental double-runs. All v2 reads default sensibly when their
+    /// new slots are absent, so the migration body itself only stamps
+    /// the new SchemaVersion; no data fan-out is required.
+    pub fn migrate_v1_to_v2(env: Env) {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, EscrowError::NotInitialized));
+        admin.require_auth();
+        let current: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SchemaVersion)
+            .unwrap_or(1);
+        if current != 1 {
+            panic_with_error!(&env, EscrowError::MigrationVersionMismatch);
+        }
+        env.storage().persistent().set(&DataKey::SchemaVersion, &2u32);
     }
 
     /// Read the on-chain schema version, or `1` (the implicit
