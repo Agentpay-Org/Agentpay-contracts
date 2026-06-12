@@ -225,6 +225,20 @@ impl Escrow {
         }
     }
 
+    /// Read the ledger timestamp at which `settle` last drained an
+    /// `(agent, service_id)` pair. Returns `None` for pairs that have
+    /// never been settled (vs. `Some(0)`, which would be a genesis-block
+    /// settlement and should not be confused with absent).
+    pub fn get_last_settlement(
+        env: Env,
+        agent: Address,
+        service_id: Symbol,
+    ) -> Option<u64> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::LastSettlement(agent, service_id))
+    }
+
     /// Read the protocol-wide lifetime request counter (u64).
     pub fn get_total_requests_all_time(env: Env) -> u64 {
         env.storage()
