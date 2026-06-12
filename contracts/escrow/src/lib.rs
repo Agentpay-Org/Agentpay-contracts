@@ -648,6 +648,14 @@ impl Escrow {
             .get(&DataKey::ServiceMetadata(service_id))
     }
 
+    /// Returns `true` iff the service has been disabled.
+    pub fn is_service_disabled(env: Env, service_id: Symbol) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ServiceDisabled(service_id))
+            .unwrap_or(false)
+    }
+
     /// Admin sets the disabled flag for a service. Disabling a service
     /// causes `record_usage` to panic with `ServiceDisabled` for that
     /// id; registration and metadata are preserved.
