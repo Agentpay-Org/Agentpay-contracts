@@ -227,6 +227,22 @@ impl Escrow {
         billed
     }
 
+    /// Unregister a service. Admin-gated; idempotent (removing an absent
+    /// entry is a no-op). Existing usage records and prices for the
+    /// service are NOT touched — call reset_usage or remove the price
+    /// separately if a clean wipe is required.
+    pub fn unregister_service(env: Env, service_id: Symbol) {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, EscrowError::NotInitialized));
+        admin.require_auth();
+        env.storage()
+            .persistent()
+            .remove(&DataKey::ServiceRegistered(service_id));
+    }
+
     /// Register a service so `record_usage` accepts it under strict
     /// registration. Admin-gated and idempotent.
     pub fn register_service(env: Env, service_id: Symbol) {
