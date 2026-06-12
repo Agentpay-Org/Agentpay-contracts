@@ -104,6 +104,22 @@ fn test_set_service_price_admin_can_write() {
 }
 
 #[test]
+fn test_get_service_price_round_trip() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let svc = Symbol::new(&env, "infer");
+    client.set_service_price(&svc, &500i128);
+    assert_eq!(client.get_service_price(&svc), 500i128);
+}
+
+#[test]
+fn test_get_service_price_defaults_to_zero() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    assert_eq!(client.get_service_price(&Symbol::new(&env, "never_set")), 0i128);
+}
+
+#[test]
 #[should_panic(expected = "Error(Contract, #2)")]
 fn test_record_usage_rejects_zero_requests() {
     let env = Env::default();

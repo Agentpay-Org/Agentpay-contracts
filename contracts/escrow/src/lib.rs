@@ -133,6 +133,15 @@ impl Escrow {
             .set(&DataKey::ServicePrice(service_id), &price_stroops);
     }
 
+    /// Get the per-request price (in stroops) for a service, or 0 if
+    /// no price has been configured (the service is free / unset).
+    pub fn get_service_price(env: Env, service_id: Symbol) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ServicePrice(service_id))
+            .unwrap_or(0)
+    }
+
     /// Get the version of the contract for compatibility checks.
     pub fn version(env: Env) -> u32 {
         let _ = env;
