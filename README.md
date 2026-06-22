@@ -4,6 +4,8 @@ Soroban smart contracts for the AgentPay protocol: escrow, usage recording, and 
 
 ## Overview
 
+For a practical setup walkthrough, see the [escrow record-settle integration guide](docs/escrow/integration.md).
+
 - **escrow** — Records usage and supports settlement logic for machine-to-machine payments.
 
 ## Prerequisites
