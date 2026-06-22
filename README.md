@@ -55,6 +55,10 @@ agentpay-contracts/
 | `cargo build` | Build |
 | `cargo test` | Run tests |
 
+## Documentation
+
+- [Escrow schema versioning and migration runbook](docs/escrow/migrations.md)
+
 ## CI/CD
 
 On push/PR to `main`, GitHub Actions runs:
