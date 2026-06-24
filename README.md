@@ -65,6 +65,9 @@ On push/PR to `main`, GitHub Actions runs:
 
 ## Contributing
 
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the full guide, including the
+append-only error-code table, event conventions, and the test/coverage gate.
+
 1. Fork the repo and create a branch.
 2. Make changes; ensure `cargo fmt`, `cargo build`, and `cargo test` pass locally.
 3. Open a pull request. CI must pass before merge.
