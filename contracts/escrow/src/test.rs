@@ -510,4 +510,16 @@ fn test_settle_zero_usage_returns_zero_stamps_and_emits_event() {
 
     // Still stamps LastSettlement so SLA monitors see the drain ran.
     assert_eq!(client.get_last_settlement(&agent, &svc), Some(ts));
+fn test_init_stamps_schema_version() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    assert_eq!(client.get_schema_version(), 2);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #11)")]
+fn test_migrate_v1_to_v2_rejected_on_fresh_v2_init() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    client.migrate_v1_to_v2();
 }

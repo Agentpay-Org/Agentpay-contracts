@@ -24,6 +24,13 @@ history are untouched.
 `propose_admin_transfer` rejects proposing the current admin as the new admin
 (panics with `InvalidAdminProposal`). This surfaces no-op handovers as caller
 mistakes rather than silently storing a pending entry equal to the active admin.
+### Schema version: fresh v2 init vs. legacy v1→v2 migration
+
+`init` stamps the current storage schema version (v2) directly, so a freshly
+deployed contract reports `get_schema_version() == 2` without ever running a
+migration. A legacy contract deployed before this change carries the implicit v1
+default and must call `migrate_v1_to_v2()` to reach v2; calling that migration on
+a fresh v2 deploy panics with `MigrationVersionMismatch`.
 
 ## Prerequisites
 
