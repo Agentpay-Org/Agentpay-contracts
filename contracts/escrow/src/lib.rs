@@ -117,6 +117,10 @@ pub enum EscrowError {
     /// A metadata-scoped entrypoint referenced a service that has no
     /// `ServiceMetadata` slot set.
     ServiceMetadataNotFound = 13,
+    /// `propose_admin_transfer` was called with the current admin as the
+    /// proposed new admin — a no-op handover that is rejected to surface
+    /// caller mistakes early.
+    InvalidAdminProposal = 14,
 }
 
 #[contracttype]
@@ -563,6 +567,9 @@ impl Escrow {
             .get(&DataKey::Admin)
             .unwrap_or_else(|| panic_with_error!(&env, EscrowError::NotInitialized));
         admin.require_auth();
+        if new_admin == admin {
+            panic_with_error!(&env, EscrowError::InvalidAdminProposal);
+        }
         env.storage()
             .persistent()
             .set(&DataKey::PendingAdmin, &new_admin);

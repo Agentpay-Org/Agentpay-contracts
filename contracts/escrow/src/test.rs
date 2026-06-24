@@ -335,4 +335,28 @@ fn test_clear_service_metadata_leaves_registration_untouched() {
 
     assert!(client.get_service_metadata(&svc).is_none());
     assert!(client.is_service_registered(&svc));
+#[should_panic(expected = "Error(Contract, #13)")]
+fn test_propose_admin_transfer_rejects_self_target() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    client.propose_admin_transfer(&admin);
+}
+
+#[test]
+fn test_propose_admin_transfer_accepts_distinct_address() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let next = Address::generate(&env);
+    client.propose_admin_transfer(&next);
+    assert_eq!(client.get_pending_admin(), Some(next));
+}
+
+#[test]
+fn test_accept_admin_transfer_clears_pending() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let next = Address::generate(&env);
+    client.propose_admin_transfer(&next);
+    client.accept_admin_transfer(&next);
+    assert_eq!(client.get_pending_admin(), None);
 }

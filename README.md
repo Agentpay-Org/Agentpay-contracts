@@ -19,6 +19,11 @@ A service's metadata (`description` + `owner`) and its registration flag live in
 independent storage slots. `clear_service_metadata` (admin-gated, idempotent)
 removes only the metadata; the registration flag and per-(agent, service) usage
 history are untouched.
+### Admin proposal validation
+
+`propose_admin_transfer` rejects proposing the current admin as the new admin
+(panics with `InvalidAdminProposal`). This surfaces no-op handovers as caller
+mistakes rather than silently storing a pending entry equal to the active admin.
 
 ## Prerequisites
 
