@@ -248,3 +248,16 @@ fn test_record_usage_rejects_zero_requests() {
     let service_id = Symbol::new(&env, "weather_api");
     client.record_usage(&agent, &service_id, &0u32);
 }
+
+#[test]
+fn test_bool_flag_accessor_round_trip() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    // Defaults to false when unset.
+    assert!(!client.is_allowlist_enabled());
+    // Round-trips true then false through the centralised accessors.
+    client.set_allowlist_enabled(&true);
+    assert!(client.is_allowlist_enabled());
+    client.set_allowlist_enabled(&false);
+    assert!(!client.is_allowlist_enabled());
+}
