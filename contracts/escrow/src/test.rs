@@ -1,8 +1,30 @@
 #![cfg(test)]
 #![allow(deprecated)]
 
+//! # Settle / record_usage event and invariant coverage
+//!
+//! The tests at the bottom of this module (see the
+//! `settle event payload and drain-to-zero invariants` section) lock down
+//! the following invariants of the settlement path:
+//!
+//! - After `settle`, the per-(agent, service) usage counter drains to `0`.
+//! - `settle` stamps `LastSettlement` with the *current ledger timestamp*;
+//!   `get_last_settlement` then returns `Some(ts)` matching the clock set
+//!   via `env.ledger().with_mut`.
+//! - The `billed` amount returned by `settle` equals `compute_billing` for
+//!   the same pre-settle state (requests * price, in stroops).
+//! - `settle` publishes a `settled` event carrying
+//!   `(agent, service_id, requests, billed)`.
+//! - `record_usage` publishes a `usage` event carrying
+//!   `(agent, service_id, requests, total)`.
+//! - Settling a zero-usage pair returns `0`, still stamps `LastSettlement`,
+//!   and still emits a `settled` event.
+
 use super::*;
-use soroban_sdk::{testutils::Address as _, Address, Symbol};
+use soroban_sdk::{
+    testutils::{Address as _, Events, Ledger},
+    Address, IntoVal, Symbol,
+};
 
 fn setup_initialized(env: &Env) -> (EscrowClient<'_>, Address) {
     env.mock_all_auths();
@@ -247,4 +269,134 @@ fn test_record_usage_rejects_zero_requests() {
     let agent = Address::generate(&env);
     let service_id = Symbol::new(&env, "weather_api");
     client.record_usage(&agent, &service_id, &0u32);
+}
+
+// ---------------------------------------------------------------------------
+// settle event payload and drain-to-zero invariants (issue #40)
+//
+// Locks down the settlement path: usage drains to zero, LastSettlement is
+// stamped with the ledger clock, the returned `billed` matches
+// `compute_billing`, and the `settled` / `usage` events are emitted with
+// their documented payloads.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_settle_drains_to_zero_and_stamps_last_settlement() {
+    let env = Env::default();
+    let ts: u64 = 12345;
+    env.ledger().with_mut(|li| li.timestamp = ts);
+
+    let (client, _admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "infer");
+    client.set_service_price(&svc, &10i128);
+    client.record_usage(&agent, &svc, &42u32);
+
+    // No settlement has happened yet for this pair.
+    assert_eq!(client.get_last_settlement(&agent, &svc), None);
+
+    let billed = client.settle(&agent, &svc);
+
+    assert_eq!(billed, 420i128);
+    // Usage drains to exactly zero.
+    assert_eq!(client.get_usage(&agent, &svc), 0);
+    // LastSettlement is stamped with the current ledger timestamp.
+    assert_eq!(client.get_last_settlement(&agent, &svc), Some(ts));
+}
+
+#[test]
+fn test_settle_billed_matches_compute_billing_for_presettle_state() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "infer");
+    client.set_service_price(&svc, &7i128);
+    client.record_usage(&agent, &svc, &13u32);
+
+    // Capture the bill the contract would report for the pre-settle state.
+    let expected = client.compute_billing(&agent, &svc);
+    assert_eq!(expected, 91i128);
+
+    let billed = client.settle(&agent, &svc);
+    assert_eq!(billed, expected);
+    // And compute_billing now reads zero since usage drained.
+    assert_eq!(client.compute_billing(&agent, &svc), 0i128);
+}
+
+#[test]
+fn test_settle_emits_settled_event_with_payload() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "infer");
+    client.set_service_price(&svc, &10i128);
+    client.record_usage(&agent, &svc, &42u32);
+
+    let billed = client.settle(&agent, &svc);
+
+    let events = env.events().all();
+    assert!(!events.is_empty());
+    // The settled event is the most recent publish: (contract, topics, data).
+    let (_addr, topics, data) = events.last().unwrap();
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("settled"),).into_val(&env);
+    // Topics is a Vec<Val> with a reliable structural PartialEq.
+    assert_eq!(topics, expected_topics);
+    // Decode the data payload back into typed values and assert the tuple.
+    let decoded: (Address, Symbol, u32, i128) = data.into_val(&env);
+    assert_eq!(decoded, (agent.clone(), svc.clone(), 42u32, billed));
+}
+
+#[test]
+fn test_record_usage_emits_usage_event_with_payload() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "weather_api");
+
+    let record = client.record_usage(&agent, &svc, &25u32);
+
+    let events = env.events().all();
+    assert!(!events.is_empty());
+    let (_addr, topics, data) = events.last().unwrap();
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("usage"),).into_val(&env);
+    assert_eq!(topics, expected_topics);
+    // Payload is (agent, service_id, requests_delta, new_total).
+    let decoded: (Address, Symbol, u32, u32) = data.into_val(&env);
+    assert_eq!(
+        decoded,
+        (agent.clone(), svc.clone(), 25u32, record.requests)
+    );
+}
+
+#[test]
+fn test_settle_zero_usage_returns_zero_stamps_and_emits_event() {
+    let env = Env::default();
+    let ts: u64 = 99_999;
+    env.ledger().with_mut(|li| li.timestamp = ts);
+
+    let (client, _admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "infer");
+    client.set_service_price(&svc, &10i128);
+
+    // Settle a pair that never recorded any usage.
+    let billed = client.settle(&agent, &svc);
+    assert_eq!(billed, 0i128);
+
+    // Capture events immediately after `settle`: `events().all()` only
+    // surfaces events from the most recent contract invocation, so any
+    // intervening read (e.g. get_last_settlement) would clear them.
+    let events = env.events().all();
+    assert!(!events.is_empty());
+    let (_addr, topics, data) = events.last().unwrap();
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("settled"),).into_val(&env);
+    assert_eq!(topics, expected_topics);
+    let decoded: (Address, Symbol, u32, i128) = data.into_val(&env);
+    assert_eq!(decoded, (agent.clone(), svc.clone(), 0u32, 0i128));
+
+    // Still stamps LastSettlement so SLA monitors see the drain ran.
+    assert_eq!(client.get_last_settlement(&agent, &svc), Some(ts));
 }
