@@ -2071,4 +2071,90 @@ fn test_owner_settle_rejected_while_paused() {
     client.set_service_metadata(&svc, &String::from_str(&env, "inference"), &owner);
     client.pause();
     client.settle(&owner, &agent, &svc);
+// ---------------------------------------------------------------------------
+// Per-agent, per-window rate limiting (#10)
+// ---------------------------------------------------------------------------
+
+/// By default the limiter is disabled (cap 0, window 0): an agent can record
+/// far more than any cap would allow.
+#[test]
+fn test_rate_limit_disabled_by_default() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    assert_eq!(client.get_max_requests_per_window(), 0);
+    assert_eq!(client.get_rate_window_seconds(), 0);
+
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "infer");
+    for _ in 0..50 {
+        client.record_usage(&agent, &svc, &100u32);
+    }
+    assert_eq!(client.get_usage(&agent, &svc), 5_000);
+}
+
+/// Config setters round-trip.
+#[test]
+fn test_rate_limit_config_round_trips() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    client.set_max_requests_per_window(&10u32);
+    client.set_rate_window_seconds(&60u64);
+    assert_eq!(client.get_max_requests_per_window(), 10);
+    assert_eq!(client.get_rate_window_seconds(), 60);
+}
+
+/// Accumulating exactly up to the cap is allowed; one more request in the
+/// same window is rejected with RateLimitExceeded (#15).
+#[test]
+#[should_panic(expected = "Error(Contract, #15)")]
+fn test_rate_limit_rejects_over_cap_in_window() {
+    let env = Env::default();
+    env.ledger().with_mut(|li| li.timestamp = 1_000);
+    let (client, _admin) = setup_initialized(&env);
+    client.set_max_requests_per_window(&10u32);
+    client.set_rate_window_seconds(&100u64);
+
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "infer");
+    client.record_usage(&agent, &svc, &6u32); // count = 6
+    client.record_usage(&agent, &svc, &4u32); // count = 10 (exactly at cap)
+    client.record_usage(&agent, &svc, &1u32); // count = 11 → reject #15
+}
+
+/// After the window expires the counter resets and the agent can record
+/// again (fixed-window rollover).
+#[test]
+fn test_rate_limit_window_rollover_resets_count() {
+    let env = Env::default();
+    env.ledger().with_mut(|li| li.timestamp = 1_000);
+    let (client, _admin) = setup_initialized(&env);
+    client.set_max_requests_per_window(&10u32);
+    client.set_rate_window_seconds(&100u64);
+
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "infer");
+    client.record_usage(&agent, &svc, &10u32); // fills the window
+
+    // Advance past the window; the count resets.
+    env.ledger().with_mut(|li| li.timestamp = 1_100);
+    let rec = client.record_usage(&agent, &svc, &10u32);
+    // Usage is cumulative (20), but the rate window accepted the new 10.
+    assert_eq!(rec.requests, 20);
+}
+
+/// The limiter is per-agent: one agent hitting the cap does not block another.
+#[test]
+fn test_rate_limit_is_per_agent() {
+    let env = Env::default();
+    env.ledger().with_mut(|li| li.timestamp = 1_000);
+    let (client, _admin) = setup_initialized(&env);
+    client.set_max_requests_per_window(&5u32);
+    client.set_rate_window_seconds(&100u64);
+
+    let a = Address::generate(&env);
+    let b = Address::generate(&env);
+    let svc = Symbol::new(&env, "infer");
+    client.record_usage(&a, &svc, &5u32); // a at cap
+    let rec_b = client.record_usage(&b, &svc, &5u32); // b independent
+    assert_eq!(rec_b.requests, 5);
 }

@@ -89,11 +89,16 @@ pub enum DataKey {
     /// disabled without unregistering, preserving the metadata and the
     /// per-(agent, service) usage history.
     ServiceDisabled(Symbol),
-    /// Per-agent blocklist (deny list) flag. When `true`, `record_usage`
-    /// rejects the agent with `AgentBlocked`, independent of and taking
-    /// precedence over the allowlist. Absent entry defaults to `false`
-    /// (not blocked), so existing behaviour is unchanged when unused.
-    AgentBlocked(Address),
+    /// Max `requests` an agent may accumulate within one rate-limit
+    /// window. `0` (the default) disables the limiter entirely.
+    MaxRequestsPerWindow,
+    /// Length of the fixed rate-limit window in seconds. `0` (the
+    /// default) disables the limiter entirely.
+    WindowSeconds,
+    /// Per-agent fixed-window rate-limit state: `(window_start, count)`
+    /// where `window_start` is the ledger timestamp the current window
+    /// opened and `count` is the requests accumulated in it so far.
+    RateWindow(Address),
 }
 
 /// Typed contract errors. Codes are append-only to keep client SDKs stable.
@@ -137,12 +142,9 @@ pub enum EscrowError {
     /// proposed new admin — a no-op handover that is rejected to surface
     /// caller mistakes early.
     InvalidAdminProposal = 14,
-    /// `get_usage_batch` was called with more than `MAX_BATCH_READ` pairs.
-    BatchTooLarge = 15,
-    /// `record_usage` was called by/for an agent on the per-agent
-    /// blocklist. Takes precedence over the allowlist: a blocked agent is
-    /// rejected even when it is also allow-listed.
-    AgentBlocked = 16,
+    /// `record_usage` would push the agent's per-window request count
+    /// above the configured `MaxRequestsPerWindow` cap.
+    RateLimitExceeded = 15,
 }
 
 #[contracttype]
@@ -314,6 +316,45 @@ impl Escrow {
         {
             panic_with_error!(&env, EscrowError::AgentNotAllowed);
         }
+
+        // Per-agent fixed-window rate limit. Enabled only when both the cap
+        // and the window length are non-zero. The window is anchored at the
+        // first in-window call's timestamp and rolls forward whole-window
+        // (fixed, not sliding) once `now >= window_start + window_seconds`.
+        let max_per_window: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MaxRequestsPerWindow)
+            .unwrap_or(0);
+        let window_seconds: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::WindowSeconds)
+            .unwrap_or(0);
+        if max_per_window > 0 && window_seconds > 0 {
+            let now = env.ledger().timestamp();
+            let (window_start, count): (u64, u32) = env
+                .storage()
+                .persistent()
+                .get(&DataKey::RateWindow(agent.clone()))
+                .unwrap_or((0, 0));
+            // Roll the window forward if the current one has expired. The
+            // agent can never reset it early: window_start only advances.
+            let (window_start, count) = if now >= window_start.saturating_add(window_seconds) {
+                (now, 0u32)
+            } else {
+                (window_start, count)
+            };
+            let new_count = count.saturating_add(requests);
+            if new_count > max_per_window {
+                panic_with_error!(&env, EscrowError::RateLimitExceeded);
+            }
+            env.storage().persistent().set(
+                &DataKey::RateWindow(agent.clone()),
+                &(window_start, new_count),
+            );
+        }
+
         let key = DataKey::Usage(agent.clone(), service_id.clone());
         let prev: u32 = env.storage().persistent().get(&key).unwrap_or(0);
         // saturate: settlement drains long before u32::MAX; never panic the hot path.
@@ -667,6 +708,55 @@ impl Escrow {
             .persistent()
             .get(&DataKey::MaxRequestsPerCall)
             .unwrap_or(u32::MAX)
+    }
+
+    /// Read the configured per-window request cap, or `0` (limiter
+    /// disabled) when unset.
+    pub fn get_max_requests_per_window(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MaxRequestsPerWindow)
+            .unwrap_or(0)
+    }
+
+    /// Admin sets the per-agent, per-window request cap. The limiter is
+    /// active only when both this cap and the window length
+    /// ([`Self::set_rate_window_seconds`]) are non-zero. Pass `0` to
+    /// disable.
+    pub fn set_max_requests_per_window(env: Env, max_requests: u32) {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, EscrowError::NotInitialized));
+        admin.require_auth();
+        env.storage()
+            .persistent()
+            .set(&DataKey::MaxRequestsPerWindow, &max_requests);
+    }
+
+    /// Read the configured rate-limit window length in seconds, or `0`
+    /// (limiter disabled) when unset.
+    pub fn get_rate_window_seconds(env: Env) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::WindowSeconds)
+            .unwrap_or(0)
+    }
+
+    /// Admin sets the fixed rate-limit window length in seconds. The
+    /// limiter is active only when both this and the per-window cap are
+    /// non-zero. Pass `0` to disable.
+    pub fn set_rate_window_seconds(env: Env, window_seconds: u64) {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, EscrowError::NotInitialized));
+        admin.require_auth();
+        env.storage()
+            .persistent()
+            .set(&DataKey::WindowSeconds, &window_seconds);
     }
 
     /// Admin sets the per-call upper bound on `requests` accepted by
