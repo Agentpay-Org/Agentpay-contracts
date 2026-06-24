@@ -24,6 +24,23 @@ history are untouched.
 `propose_admin_transfer` rejects proposing the current admin as the new admin
 (panics with `InvalidAdminProposal`). This surfaces no-op handovers as caller
 mistakes rather than silently storing a pending entry equal to the active admin.
+
+### Settlement authorization (admin or service owner)
+
+`settle(caller, agent, service_id)` accepts **either** the global admin **or**
+the `ServiceMetadata(service_id).owner` for that specific service, so a service
+owner can drain their own service without holding the central admin key.
+
+| `caller` | Condition | Result |
+|----------|-----------|--------|
+| admin | always | settles |
+| service owner | `caller == ServiceMetadata(service_id).owner` | settles |
+| non-admin | service has no metadata/owner | `ServiceMetadataNotFound` (#13) |
+| any other address | metadata exists but `caller` isn't the owner | `NotPendingAdmin` (#6, reused as unauthorized) |
+
+The owner of service A cannot settle service B. The pause gate and
+counter-drain semantics are unchanged, and the `settled` event is emitted
+identically.
 ### Schema version: fresh v2 init vs. legacy v1→v2 migration
 
 `init` stamps the current storage schema version (v2) directly, so a freshly
