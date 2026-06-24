@@ -24,6 +24,25 @@ history are untouched.
 `propose_admin_transfer` rejects proposing the current admin as the new admin
 (panics with `InvalidAdminProposal`). This surfaces no-op handovers as caller
 mistakes rather than silently storing a pending entry equal to the active admin.
+### Per-agent rate limiting (fixed window)
+
+`record_usage` supports an optional per-agent rate limit anchored to
+`env.ledger().timestamp()`. It is configured by two admin settings and is
+**disabled by default** (both default to `0`):
+
+- `set_max_requests_per_window(max)` — max `requests` an agent may accumulate
+  per window (`get_max_requests_per_window`).
+- `set_rate_window_seconds(seconds)` — the **fixed** window length
+  (`get_rate_window_seconds`).
+
+The limiter is active only when **both** are non-zero. Semantics are a
+**fixed window** (not sliding): the window opens at an agent's first in-window
+call and rolls forward as a whole once `now >= window_start + window_seconds`,
+resetting the count. A call that would push the in-window count above the cap
+is rejected with `RateLimitExceeded` (#15). State is per-agent
+(`DataKey::RateWindow(agent)`), and an agent can never reset its own window
+early — `window_start` only advances. Window arithmetic is saturating.
+
 ### Schema version: fresh v2 init vs. legacy v1→v2 migration
 
 `init` stamps the current storage schema version (v2) directly, so a freshly
