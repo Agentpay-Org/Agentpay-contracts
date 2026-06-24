@@ -365,6 +365,37 @@ impl Escrow {
             .set(&DataKey::ServicePrice(service_id), &price_stroops);
     }
 
+    /// Remove the configured per-request price for a service, freeing the
+    /// `DataKey::ServicePrice(service_id)` storage slot.
+    ///
+    /// Admin-gated and honours the pause gate (panics with
+    /// [`EscrowError::ContractPaused`] when paused, consistent with other
+    /// admin mutations). Idempotent — removing the price of a service that
+    /// was never priced is a no-op.
+    ///
+    /// After removal, `get_service_price` and `compute_billing` read back
+    /// `0`, exactly as for a service that was never priced. Note the
+    /// zero-vs-removed distinction: removal frees the underlying storage
+    /// slot and emits a `price_rm` event, whereas `set_service_price(_, 0)`
+    /// leaves a stored slot holding `0`. Both read back as `0`, but only
+    /// removal reclaims the slot. Emits `price_rm(service_id)`.
+    pub fn remove_service_price(env: Env, service_id: Symbol) {
+        if read_flag(&env, &DataKey::Paused) {
+            panic_with_error!(&env, EscrowError::ContractPaused);
+        }
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, EscrowError::NotInitialized));
+        admin.require_auth();
+        env.storage()
+            .persistent()
+            .remove(&DataKey::ServicePrice(service_id.clone()));
+        env.events()
+            .publish((symbol_short!("price_rm"),), service_id);
+    }
+
     /// Get the per-request price (in stroops) for a service, or 0 if
     /// no price has been configured (the service is free / unset).
     pub fn get_service_price(env: Env, service_id: Symbol) -> i128 {
