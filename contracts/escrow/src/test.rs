@@ -789,6 +789,14 @@ fn test_set_service_price_rejected_while_paused() {
     client.set_service_price(&Symbol::new(&env, "infer"), &500i128);
 #[test]
 fn test_remove_service_price_clears_price() {
+// ---------------------------------------------------------------------------
+// set_service_price registration coupling (#11)
+// ---------------------------------------------------------------------------
+
+/// With strict registration off (default), pricing an unregistered service
+/// still works — backward compatible.
+#[test]
+fn test_set_price_lax_allows_unregistered_service() {
     let env = Env::default();
     let (client, _admin) = setup_initialized(&env);
     let svc = Symbol::new(&env, "infer");
@@ -821,6 +829,16 @@ fn test_remove_service_price_then_reset_works() {
     assert_eq!(client.get_service_price(&svc), 0i128);
 
     // Re-setting after removal works and round-trips.
+}
+
+/// With strict registration on, pricing a registered service works.
+#[test]
+fn test_set_price_strict_allows_registered_service() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let svc = Symbol::new(&env, "infer");
+    client.set_require_service_registration(&true);
+    client.register_service(&svc);
     client.set_service_price(&svc, &750i128);
     assert_eq!(client.get_service_price(&svc), 750i128);
 }
@@ -1562,4 +1580,39 @@ fn test_allowlist_mixed_agents() {
     assert!(client
         .try_record_usage(&blocked, &service_id, &1u32)
         .is_err());
+/// With strict registration on, pricing an unregistered service is rejected
+/// with ServiceNotRegistered (#7).
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn test_set_price_strict_rejects_unregistered_service() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let svc = Symbol::new(&env, "phantom");
+    client.set_require_service_registration(&true);
+    client.set_service_price(&svc, &100i128);
+}
+
+/// Pricing a disabled service is rejected with ServiceDisabled (#12),
+/// regardless of the strict-registration flag.
+#[test]
+#[should_panic(expected = "Error(Contract, #12)")]
+fn test_set_price_rejects_disabled_service() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let svc = Symbol::new(&env, "infer");
+    client.set_service_disabled(&svc, &true);
+    client.set_service_price(&svc, &100i128);
+}
+
+/// Toggling the flag on mid-life starts enforcing the coupling: a service
+/// priced while lax can no longer be re-priced once strict unless registered.
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn test_set_price_flag_toggled_mid_life() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let svc = Symbol::new(&env, "infer");
+    client.set_service_price(&svc, &100i128); // lax: allowed
+    client.set_require_service_registration(&true);
+    client.set_service_price(&svc, &200i128); // strict + unregistered: rejected
 }

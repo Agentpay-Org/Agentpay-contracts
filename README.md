@@ -35,6 +35,17 @@ holding `0`. Both cases bill to zero, but only removal reclaims the slot.
 `propose_admin_transfer` rejects proposing the current admin as the new admin
 (panics with `InvalidAdminProposal`). This surfaces no-op handovers as caller
 mistakes rather than silently storing a pending entry equal to the active admin.
+
+### Pricing requires registration (strict mode)
+
+`set_service_price` is coupled to the same `RequireServiceRegistration` flag that
+`record_usage` honours. When strict mode is **off** (the default), pricing any
+`service_id` is allowed — fully backward compatible. When it is **on**
+(`set_require_service_registration(true)`), a price can only attach to a
+registered service; pricing an unregistered one panics with `ServiceNotRegistered`
+(#7). A **disabled** service is always rejected with `ServiceDisabled` (#12),
+mirroring `record_usage`. On success, `set_service_price` emits a
+`price_set(service_id, price_stroops)` event after every validation passes.
 ### Schema version: fresh v2 init vs. legacy v1→v2 migration
 
 `init` stamps the current storage schema version (v2) directly, so a freshly

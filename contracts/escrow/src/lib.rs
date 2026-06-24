@@ -349,6 +349,20 @@ impl Escrow {
     /// math can assume a non-negative multiplicand; a zero price is
     /// allowed and means "free service" (still records usage, settles to
     /// zero).
+    ///
+    /// Registration coupling: when `RequireServiceRegistration` (the same
+    /// strict-mode flag enforced by `record_usage`) is enabled, a price
+    /// can only attach to a registered `service_id` — otherwise the call
+    /// is rejected with [`EscrowError::ServiceNotRegistered`]. With the
+    /// flag off (the default), pricing is unrestricted, preserving the
+    /// prior backward-compatible behaviour.
+    ///
+    /// A disabled service is always rejected with
+    /// [`EscrowError::ServiceDisabled`], mirroring `record_usage`'s gate,
+    /// so prices cannot drift onto services that are out of commission.
+    ///
+    /// Emits `price_set(service_id, price_stroops)` only after every
+    /// validation passes.
     pub fn set_service_price(env: Env, service_id: Symbol, price_stroops: i128) {
         let admin: Address = env
             .storage()
@@ -360,9 +374,19 @@ impl Escrow {
         if price_stroops < 0 {
             panic_with_error!(&env, EscrowError::RequestsMustBePositive);
         }
+        if read_flag(&env, &DataKey::RequireServiceRegistration)
+            && !read_flag(&env, &DataKey::ServiceRegistered(service_id.clone()))
+        {
+            panic_with_error!(&env, EscrowError::ServiceNotRegistered);
+        }
+        if read_flag(&env, &DataKey::ServiceDisabled(service_id.clone())) {
+            panic_with_error!(&env, EscrowError::ServiceDisabled);
+        }
         env.storage()
             .persistent()
-            .set(&DataKey::ServicePrice(service_id), &price_stroops);
+            .set(&DataKey::ServicePrice(service_id.clone()), &price_stroops);
+        env.events()
+            .publish((symbol_short!("price_set"),), (service_id, price_stroops));
     }
 
     /// Remove the configured per-request price for a service, freeing the
