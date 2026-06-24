@@ -697,3 +697,69 @@ fn test_pause_pause_unpause_ends_unpaused() {
 
     assert!(!client.is_paused());
 }
+
+// ---------------------------------------------------------------------------
+// Issue #17 — per-call request floor/ceiling coverage for `record_usage`.
+// Covers the default sentinels (max = u32::MAX, min = 0), exact-bound
+// acceptance, and the over-max (#8) / under-min (#9) rejection paths.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_i17_per_call_bounds_default_to_unbounded() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    // No cap and no floor configured by default.
+    assert_eq!(client.get_max_requests_per_call(), u32::MAX);
+    assert_eq!(client.get_min_requests_per_call(), 0);
+    // Any positive value is therefore accepted.
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "infer");
+    assert_eq!(
+        client.record_usage(&agent, &svc, &1_000_000u32).requests,
+        1_000_000
+    );
+}
+
+#[test]
+fn test_i17_record_usage_accepts_value_exactly_at_max() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    client.set_max_requests_per_call(&100u32);
+    assert_eq!(client.get_max_requests_per_call(), 100);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "infer");
+    // Exactly at the ceiling is allowed (boundary is inclusive).
+    assert_eq!(client.record_usage(&agent, &svc, &100u32).requests, 100);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #8)")]
+fn test_i17_record_usage_rejects_above_max() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    client.set_max_requests_per_call(&100u32);
+    let agent = Address::generate(&env);
+    client.record_usage(&agent, &Symbol::new(&env, "infer"), &101u32);
+}
+
+#[test]
+fn test_i17_record_usage_accepts_value_exactly_at_min() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    client.set_min_requests_per_call(&10u32);
+    assert_eq!(client.get_min_requests_per_call(), 10);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "infer");
+    // Exactly at the floor is allowed (boundary is inclusive).
+    assert_eq!(client.record_usage(&agent, &svc, &10u32).requests, 10);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #9)")]
+fn test_i17_record_usage_rejects_below_min() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    client.set_min_requests_per_call(&10u32);
+    let agent = Address::generate(&env);
+    client.record_usage(&agent, &Symbol::new(&env, "infer"), &9u32);
+}
