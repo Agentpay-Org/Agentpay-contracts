@@ -697,3 +697,106 @@ fn test_pause_pause_unpause_ends_unpaused() {
 
     assert!(!client.is_paused());
 }
+
+// ---------------------------------------------------------------------------
+// Issue #22 — negative authorization coverage. `setup_initialized` uses
+// `mock_all_auths`, which can never prove that a *missing* signature is
+// rejected. These tests initialise with a scoped mock that authorises only
+// `init`, then invoke privileged entrypoints with no matching auth and assert
+// the call panics in `require_auth`. A positive control proves the same call
+// succeeds once the signature is supplied.
+// ---------------------------------------------------------------------------
+
+use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+
+/// Register and `init` the contract authorising only `admin` for the `init`
+/// call. Subsequent privileged calls are intentionally left unauthorised so
+/// their `require_auth` fails.
+fn setup_scoped_auth(env: &Env) -> EscrowClient<'_> {
+    let contract_id = env.register_contract(None, Escrow);
+    let client = EscrowClient::new(env, &contract_id);
+    let admin = Address::generate(env);
+    env.mock_auths(&[MockAuth {
+        address: &admin,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "init",
+            args: (admin.clone(),).into_val(env),
+            sub_invokes: &[],
+        },
+    }]);
+    client.init(&admin);
+    client
+}
+
+#[test]
+#[should_panic]
+fn test_i22_pause_requires_admin_auth() {
+    let env = Env::default();
+    let client = setup_scoped_auth(&env);
+    client.pause();
+}
+
+#[test]
+#[should_panic]
+fn test_i22_set_service_price_requires_admin_auth() {
+    let env = Env::default();
+    let client = setup_scoped_auth(&env);
+    client.set_service_price(&Symbol::new(&env, "infer"), &10i128);
+}
+
+#[test]
+#[should_panic]
+fn test_i22_register_service_requires_admin_auth() {
+    let env = Env::default();
+    let client = setup_scoped_auth(&env);
+    client.register_service(&Symbol::new(&env, "infer"));
+}
+
+#[test]
+#[should_panic]
+fn test_i22_set_agent_allowed_requires_admin_auth() {
+    let env = Env::default();
+    let client = setup_scoped_auth(&env);
+    let agent = Address::generate(&env);
+    client.set_agent_allowed(&agent, &true);
+}
+
+#[test]
+#[should_panic]
+fn test_i22_set_service_disabled_requires_admin_auth() {
+    let env = Env::default();
+    let client = setup_scoped_auth(&env);
+    client.set_service_disabled(&Symbol::new(&env, "infer"), &true);
+}
+
+#[test]
+#[should_panic]
+fn test_i22_migrate_requires_admin_auth() {
+    let env = Env::default();
+    let client = setup_scoped_auth(&env);
+    client.migrate_v1_to_v2();
+}
+
+#[test]
+#[should_panic]
+fn test_i22_propose_admin_transfer_requires_admin_auth() {
+    let env = Env::default();
+    let client = setup_scoped_auth(&env);
+    let next = Address::generate(&env);
+    client.propose_admin_transfer(&next);
+}
+
+/// Positive control: with `mock_all_auths` the same privileged call
+/// succeeds, proving the panics above stem from the missing signature.
+#[test]
+fn test_i22_pause_succeeds_with_admin_auth() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, Escrow);
+    let client = EscrowClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.init(&admin);
+    client.pause();
+    assert!(client.is_paused());
+}
