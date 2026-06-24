@@ -261,6 +261,7 @@ fn test_bool_flag_accessor_round_trip() {
     client.set_allowlist_enabled(&false);
     assert!(!client.is_allowlist_enabled());
 fn test_transfer_service_ownership_by_owner_preserves_description() {
+fn test_clear_service_metadata_removes_entry() {
     let env = Env::default();
     let (client, _admin) = setup_initialized(&env);
     let svc = Symbol::new(&env, "infer");
@@ -302,4 +303,36 @@ fn test_transfer_service_ownership_missing_metadata_panics() {
     let caller = Address::generate(&env);
     let new_owner = Address::generate(&env);
     client.transfer_service_ownership(&caller, &svc, &new_owner);
+    let desc = String::from_str(&env, "inference service");
+    client.set_service_metadata(&svc, &desc, &owner);
+    assert!(client.get_service_metadata(&svc).is_some());
+
+    client.clear_service_metadata(&svc);
+    assert!(client.get_service_metadata(&svc).is_none());
+}
+
+#[test]
+fn test_clear_service_metadata_is_idempotent() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let svc = Symbol::new(&env, "never_set");
+    // Clearing a never-set entry is a no-op (no panic).
+    client.clear_service_metadata(&svc);
+    assert!(client.get_service_metadata(&svc).is_none());
+}
+
+#[test]
+fn test_clear_service_metadata_leaves_registration_untouched() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let svc = Symbol::new(&env, "infer");
+    let owner = Address::generate(&env);
+    let desc = String::from_str(&env, "inference service");
+    client.register_service(&svc);
+    client.set_service_metadata(&svc, &desc, &owner);
+
+    client.clear_service_metadata(&svc);
+
+    assert!(client.get_service_metadata(&svc).is_none());
+    assert!(client.is_service_registered(&svc));
 }

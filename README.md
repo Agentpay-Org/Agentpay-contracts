@@ -13,6 +13,12 @@ current owner (or the admin) can reassign the `owner` via
 `transfer_service_ownership(caller, service_id, new_owner)` without touching the
 `description`. The call honours the pause gate and emits `owner_chg` for
 indexers.
+### Service metadata vs. registration
+
+A service's metadata (`description` + `owner`) and its registration flag live in
+independent storage slots. `clear_service_metadata` (admin-gated, idempotent)
+removes only the metadata; the registration flag and per-(agent, service) usage
+history are untouched.
 
 ## Prerequisites
 
