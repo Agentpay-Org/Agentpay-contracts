@@ -106,6 +106,7 @@ agentpay-contracts/
 ## Documentation
 
 - [Escrow: Build, Test, and Deploy Guide](docs/escrow/build-deploy.md) — build the release WASM, run the test suite, and deploy to testnet with the Stellar/Soroban CLI.
+- [Escrow: Schema Versioning & Migration](docs/escrow/migrations.md) — the difference between `version()` and `SchemaVersion`, the double-run guard, and the migration runbook.
 
 ## CI/CD
 
