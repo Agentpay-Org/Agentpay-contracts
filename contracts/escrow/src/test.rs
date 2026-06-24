@@ -697,3 +697,90 @@ fn test_pause_pause_unpause_ends_unpaused() {
 
     assert!(!client.is_paused());
 }
+
+#[test]
+#[should_panic(expected = "Error(Contract, #15)")]
+fn test_record_usage_rejects_blocked_agent() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "infer");
+
+    client.set_agent_blocked(&agent, &true);
+    client.record_usage(&agent, &svc, &1u32);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #15)")]
+fn test_blocklist_takes_precedence_over_allowlist() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "infer");
+
+    // Enable the allowlist and explicitly allow the agent...
+    client.set_allowlist_enabled(&true);
+    client.set_agent_allowed(&agent, &true);
+    // ...but also block it: the block must win.
+    client.set_agent_blocked(&agent, &true);
+    client.record_usage(&agent, &svc, &1u32);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #15)")]
+fn test_blocked_agent_rejected_while_allowlist_disabled() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "infer");
+
+    // Allowlist stays disabled (its default); the block alone rejects.
+    assert!(!client.is_allowlist_enabled());
+    client.set_agent_blocked(&agent, &true);
+    client.record_usage(&agent, &svc, &1u32);
+}
+
+#[test]
+fn test_unblock_then_record_succeeds() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "infer");
+
+    client.set_agent_blocked(&agent, &true);
+    client.set_agent_blocked(&agent, &false);
+
+    let record = client.record_usage(&agent, &svc, &5u32);
+    assert_eq!(record.requests, 5);
+    assert_eq!(client.get_usage(&agent, &svc), 5);
+}
+
+#[test]
+fn test_is_agent_blocked_round_trip() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+
+    // Defaults to false when never set.
+    assert!(!client.is_agent_blocked(&agent));
+    client.set_agent_blocked(&agent, &true);
+    assert!(client.is_agent_blocked(&agent));
+    client.set_agent_blocked(&agent, &false);
+    assert!(!client.is_agent_blocked(&agent));
+}
+
+#[test]
+#[should_panic(expected = "Unauthorized")]
+fn test_set_agent_blocked_requires_admin_auth() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, Escrow);
+    let client = EscrowClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    env.mock_all_auths();
+    client.init(&admin);
+
+    // Drop the mocked auths so the admin require_auth is enforced.
+    env.set_auths(&[]);
+    let agent = Address::generate(&env);
+    client.set_agent_blocked(&agent, &true);
+}
