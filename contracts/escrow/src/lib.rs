@@ -114,6 +114,9 @@ pub enum EscrowError {
     MigrationVersionMismatch = 11,
     /// `record_usage` referenced a service that has been disabled.
     ServiceDisabled = 12,
+    /// A metadata-scoped entrypoint referenced a service that has no
+    /// `ServiceMetadata` slot set.
+    ServiceMetadataNotFound = 13,
 }
 
 #[contracttype]
@@ -664,6 +667,51 @@ impl Escrow {
         env.storage().persistent().set(
             &DataKey::ServiceMetadata(service_id),
             &ServiceMetadata { description, owner },
+        );
+    }
+
+    /// Transfer ownership of a service's metadata to `new_owner`,
+    /// preserving the existing `description`. Authorised by `caller`,
+    /// which must be the current owner OR the admin. Panics with
+    /// `ServiceMetadataNotFound` if no metadata has been set. Emits
+    /// `owner_chg(service_id, old_owner, new_owner)` for indexers.
+    /// Honours the pause gate.
+    pub fn transfer_service_ownership(
+        env: Env,
+        caller: Address,
+        service_id: Symbol,
+        new_owner: Address,
+    ) {
+        if env
+            .storage()
+            .persistent()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+        {
+            panic_with_error!(&env, EscrowError::ContractPaused);
+        }
+        caller.require_auth();
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, EscrowError::NotInitialized));
+        let mut meta: ServiceMetadata = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ServiceMetadata(service_id.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, EscrowError::ServiceMetadataNotFound));
+        if caller != meta.owner && caller != admin {
+            panic_with_error!(&env, EscrowError::NotPendingAdmin); // reuse: unauthorized caller
+        }
+        let old_owner = meta.owner.clone();
+        meta.owner = new_owner.clone();
+        env.storage()
+            .persistent()
+            .set(&DataKey::ServiceMetadata(service_id.clone()), &meta);
+        env.events().publish(
+            (symbol_short!("owner_chg"),),
+            (service_id, old_owner, new_owner),
         );
     }
 

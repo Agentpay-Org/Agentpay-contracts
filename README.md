@@ -6,6 +6,14 @@ Soroban smart contracts for the AgentPay protocol: escrow, usage recording, and 
 
 - **escrow** — Records usage and supports settlement logic for machine-to-machine payments.
 
+### Service ownership handover
+
+A service's `ServiceMetadata` carries a `description` and an `owner`. The
+current owner (or the admin) can reassign the `owner` via
+`transfer_service_ownership(caller, service_id, new_owner)` without touching the
+`description`. The call honours the pause gate and emits `owner_chg` for
+indexers.
+
 ## Prerequisites
 
 - [Rust](https://rustup.rs/) (stable, with `rustfmt`)
