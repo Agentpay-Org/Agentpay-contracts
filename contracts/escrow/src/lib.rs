@@ -203,12 +203,37 @@ impl Escrow {
         service_id: Symbol,
         requests: u32,
     ) -> UsageRecord {
+        // ---- Validation chain (order is part of the public contract) ----
+        //
+        // Errors MUST fire in this fixed precedence so that client SDKs and
+        // off-chain settlement loops can rely on a stable failure ordering:
+        //
+        //   1. Paused            -> #4  ContractPaused
+        //   2. requests == 0     -> #2  RequestsMustBePositive
+        //   3. requests > max    -> #8  RequestsExceedsMaxPerCall
+        //   4. requests < min    -> #9  RequestsBelowMinPerCall
+        //   5. registration      -> #7  ServiceNotRegistered
+        //   6. disabled          -> #12 ServiceDisabled
+        //   7. allowlist         -> #10 AgentNotAllowed
+        //
+        // Read-count note (before/after): the storage reads performed here are
+        // unchanged in the worst case, but several are *conditionally gated* so
+        // they never execute when their controlling flag is off:
+        //   - ServiceRegistered is only read when RequireServiceRegistration is
+        //     true (short-circuited via `&&`).
+        //   - AgentAllowed is only read when AllowlistEnabled is true (ditto).
+        // The Paused flag, the max/min caps, and ServiceDisabled are always
+        // read (unconditional gates). Each key is read at most once: the
+        // max/min caps are cached in locals below, and the usage counter (read
+        // further down) is read exactly once. No value is read twice.
+        // -------------------------------------------------------------------
         if read_flag(&env, &DataKey::Paused) {
             panic_with_error!(&env, EscrowError::ContractPaused);
         }
         if requests == 0 {
             panic_with_error!(&env, EscrowError::RequestsMustBePositive);
         }
+        // Cached: read once, compared once. Defaults to u32::MAX (no cap).
         let max_per_call: u32 = env
             .storage()
             .persistent()
@@ -217,6 +242,7 @@ impl Escrow {
         if requests > max_per_call {
             panic_with_error!(&env, EscrowError::RequestsExceedsMaxPerCall);
         }
+        // Cached: read once, compared once. Defaults to 0 (no floor).
         let min_per_call: u32 = env
             .storage()
             .persistent()
@@ -225,6 +251,8 @@ impl Escrow {
         if requests < min_per_call {
             panic_with_error!(&env, EscrowError::RequestsBelowMinPerCall);
         }
+        // Conditional read: ServiceRegistered is only touched when strict
+        // registration is enabled (the `&&` short-circuits otherwise).
         if read_flag(&env, &DataKey::RequireServiceRegistration)
             && !read_flag(&env, &DataKey::ServiceRegistered(service_id.clone()))
         {
@@ -233,6 +261,8 @@ impl Escrow {
         if read_flag(&env, &DataKey::ServiceDisabled(service_id.clone())) {
             panic_with_error!(&env, EscrowError::ServiceDisabled);
         }
+        // Conditional read: AgentAllowed is only touched when the allowlist is
+        // enabled (the `&&` short-circuits otherwise).
         if read_flag(&env, &DataKey::AllowlistEnabled)
             && !read_flag(&env, &DataKey::AgentAllowed(agent.clone()))
         {

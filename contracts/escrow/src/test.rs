@@ -860,4 +860,170 @@ fn test_getter_works_while_paused() {
     client.pause();
     // Read getters must remain callable while paused.
     assert_eq!(client.get_service_price(&svc), 500i128);
+// ---- record_usage validation-chain error precedence -------------------
+// These assert that the fixed error ordering
+//   Paused(#4) -> ZeroRequests(#2) -> Max(#8) -> Min(#9)
+//   -> Registration(#7) -> Disabled(#12) -> Allowlist(#10)
+// is preserved after the read-ordering refactor, and that each gate still
+// fires on its own trigger.
+
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")]
+fn test_record_usage_paused_beats_zero_requests() {
+    // Paused (#4) must win even when requests == 0 (which would be #2).
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    client.pause();
+    let agent = Address::generate(&env);
+    let service_id = Symbol::new(&env, "weather_api");
+    client.record_usage(&agent, &service_id, &0u32);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #2)")]
+fn test_record_usage_zero_requests_beats_max() {
+    // Zero-requests (#2) must win over the max cap (#8): with max=5 and
+    // requests=0, the zero check fires first.
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    client.set_max_requests_per_call(&5u32);
+    let agent = Address::generate(&env);
+    let service_id = Symbol::new(&env, "weather_api");
+    client.record_usage(&agent, &service_id, &0u32);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #8)")]
+fn test_record_usage_max_beats_min() {
+    // Max (#8) must win over min (#9): with max=5 and min=10 (an
+    // inconsistent config), a request above max trips #8 first.
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    client.set_max_requests_per_call(&5u32);
+    client.set_min_requests_per_call(&10u32);
+    let agent = Address::generate(&env);
+    let service_id = Symbol::new(&env, "weather_api");
+    client.record_usage(&agent, &service_id, &6u32);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #9)")]
+fn test_record_usage_min_beats_registration() {
+    // Min (#9) must win over the registration gate (#7): with min=10 and
+    // strict registration required (service unregistered), a below-min
+    // request trips #9 before #7.
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    client.set_min_requests_per_call(&10u32);
+    client.set_require_service_registration(&true);
+    let agent = Address::generate(&env);
+    let service_id = Symbol::new(&env, "weather_api");
+    client.record_usage(&agent, &service_id, &3u32);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn test_record_usage_registration_beats_disabled() {
+    // Registration (#7) must win over disabled (#12): require registration,
+    // leave the service unregistered, and also disable it. #7 fires first.
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    client.set_require_service_registration(&true);
+    let service_id = Symbol::new(&env, "weather_api");
+    client.set_service_disabled(&service_id, &true);
+    let agent = Address::generate(&env);
+    client.record_usage(&agent, &service_id, &5u32);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #12)")]
+fn test_record_usage_disabled_beats_allowlist() {
+    // Disabled (#12) must win over the allowlist (#10): disable a registered
+    // service and enable a (non-matching) allowlist. #12 fires first.
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let service_id = Symbol::new(&env, "weather_api");
+    client.register_service(&service_id);
+    client.set_service_disabled(&service_id, &true);
+    client.set_allowlist_enabled(&true);
+    let agent = Address::generate(&env);
+    client.record_usage(&agent, &service_id, &5u32);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #10)")]
+fn test_record_usage_allowlist_fires_when_enabled_and_not_allowed() {
+    // Allowlist (#10) fires when enabled and the agent is not allowed.
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    client.set_allowlist_enabled(&true);
+    let agent = Address::generate(&env);
+    let service_id = Symbol::new(&env, "weather_api");
+    client.record_usage(&agent, &service_id, &5u32);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn test_record_usage_registration_fires_when_required_and_unregistered() {
+    // Registration (#7) fires when required and the service is unregistered.
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    client.set_require_service_registration(&true);
+    let agent = Address::generate(&env);
+    let service_id = Symbol::new(&env, "weather_api");
+    client.record_usage(&agent, &service_id, &5u32);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #12)")]
+fn test_record_usage_disabled_fires_when_service_disabled() {
+    // Disabled (#12) fires when the service is disabled.
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let service_id = Symbol::new(&env, "weather_api");
+    client.set_service_disabled(&service_id, &true);
+    let agent = Address::generate(&env);
+    client.record_usage(&agent, &service_id, &5u32);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #8)")]
+fn test_record_usage_max_fires_above_cap() {
+    // Max (#8) fires when requests exceed the configured cap.
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    client.set_max_requests_per_call(&5u32);
+    let agent = Address::generate(&env);
+    let service_id = Symbol::new(&env, "weather_api");
+    client.record_usage(&agent, &service_id, &6u32);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #9)")]
+fn test_record_usage_min_fires_below_floor() {
+    // Min (#9) fires when requests fall below the configured floor.
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    client.set_min_requests_per_call(&10u32);
+    let agent = Address::generate(&env);
+    let service_id = Symbol::new(&env, "weather_api");
+    client.record_usage(&agent, &service_id, &3u32);
+}
+
+#[test]
+fn test_record_usage_passes_all_gates_when_satisfied() {
+    // Sanity: with every gate enabled and satisfied, record_usage succeeds.
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let service_id = Symbol::new(&env, "weather_api");
+    let agent = Address::generate(&env);
+    client.set_max_requests_per_call(&100u32);
+    client.set_min_requests_per_call(&1u32);
+    client.set_require_service_registration(&true);
+    client.register_service(&service_id);
+    client.set_allowlist_enabled(&true);
+    client.set_agent_allowed(&agent, &true);
+
+    let record = client.record_usage(&agent, &service_id, &5u32);
+    assert_eq!(record.requests, 5);
 }
