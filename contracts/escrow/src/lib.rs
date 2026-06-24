@@ -157,6 +157,17 @@ fn ensure_not_paused(env: &Env) {
     }
 }
 
+/// Persist a service's metadata (`description`, `owner`) under
+/// `DataKey::ServiceMetadata(service_id)`. Shared by `set_service_metadata`
+/// and `register_service_with_metadata` so the storage shape stays in one
+/// place. Performs no auth — callers are responsible for admin gating.
+fn write_service_metadata(env: &Env, service_id: &Symbol, description: String, owner: Address) {
+    env.storage().persistent().set(
+        &DataKey::ServiceMetadata(service_id.clone()),
+        &ServiceMetadata { description, owner },
+    );
+}
+
 #[contract]
 pub struct Escrow;
 
@@ -776,10 +787,35 @@ impl Escrow {
             .unwrap_or_else(|| panic_with_error!(&env, EscrowError::NotInitialized));
         admin.require_auth();
         ensure_not_paused(&env);
-        env.storage().persistent().set(
-            &DataKey::ServiceMetadata(service_id),
-            &ServiceMetadata { description, owner },
-        );
+        write_service_metadata(&env, &service_id, description, owner);
+    }
+
+    /// Register a service and set its metadata in a single admin-gated,
+    /// atomic call. Equivalent to calling `register_service` followed by
+    /// `set_service_metadata`, but with one auth check and one event so
+    /// indexers see registration and metadata land together.
+    ///
+    /// Sets `ServiceRegistered(service_id) = true` and persists
+    /// `ServiceMetadata(service_id)` (`description` + `owner`). Idempotent:
+    /// re-registering an existing id overwrites its metadata. An empty
+    /// `description` is accepted. Emits `svc_reg(service_id, owner)`.
+    pub fn register_service_with_metadata(
+        env: Env,
+        service_id: Symbol,
+        description: String,
+        owner: Address,
+    ) {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, EscrowError::NotInitialized));
+        admin.require_auth();
+        ensure_not_paused(&env);
+        write_flag(&env, &DataKey::ServiceRegistered(service_id.clone()), true);
+        write_service_metadata(&env, &service_id, description, owner.clone());
+        env.events()
+            .publish((symbol_short!("svc_reg"),), (service_id, owner));
     }
 
     /// Transfer ownership of a service's metadata to `new_owner`,

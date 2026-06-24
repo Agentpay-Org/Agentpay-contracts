@@ -19,6 +19,7 @@ A service's metadata (`description` + `owner`) and its registration flag live in
 independent storage slots. `clear_service_metadata` (admin-gated, idempotent)
 removes only the metadata; the registration flag and per-(agent, service) usage
 history are untouched.
+<<<<<<< HEAD
 ### Service pricing: removed vs. set-to-zero
 
 `set_service_price` stores a per-request price under
@@ -30,6 +31,15 @@ storage, not the read value: removal frees the storage slot (and emits
 `price_rm`), whereas `set_service_price(service_id, 0)` leaves a stored slot
 holding `0`. Both cases bill to zero, but only removal reclaims the slot.
 
+=======
+
+`register_service_with_metadata(service_id, description, owner)` is an
+admin-gated convenience that does both in one atomic call: it sets the
+registration flag and persists the metadata, with a single auth check and a
+single `svc_reg(service_id, owner)` event. It is equivalent to calling
+`register_service` then `set_service_metadata`. Re-registering an existing id
+overwrites its metadata idempotently, and an empty `description` is accepted.
+>>>>>>> pr-60
 ### Admin proposal validation
 
 `propose_admin_transfer` rejects proposing the current admin as the new admin
