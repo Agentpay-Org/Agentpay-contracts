@@ -5,6 +5,9 @@ use soroban_sdk::{
     Env, String, Symbol,
 };
 
+/// Current on-chain storage schema version stamped at init.
+const CURRENT_SCHEMA: u32 = 2;
+
 /// Free-form metadata about a service. Stored under
 /// `DataKey::ServiceMetadata(service_id)` so dashboards and clients can
 /// resolve a service to a human-readable description and owner without
@@ -146,6 +149,9 @@ impl Escrow {
         }
         admin.require_auth();
         env.storage().persistent().set(&DataKey::Admin, &admin);
+        env.storage()
+            .persistent()
+            .set(&DataKey::SchemaVersion, &CURRENT_SCHEMA);
     }
 
     /// Returns the admin address stored at `init`, if any.

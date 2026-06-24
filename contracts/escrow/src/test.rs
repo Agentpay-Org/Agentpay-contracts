@@ -248,3 +248,18 @@ fn test_record_usage_rejects_zero_requests() {
     let service_id = Symbol::new(&env, "weather_api");
     client.record_usage(&agent, &service_id, &0u32);
 }
+
+#[test]
+fn test_init_stamps_schema_version() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    assert_eq!(client.get_schema_version(), 2);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #11)")]
+fn test_migrate_v1_to_v2_rejected_on_fresh_v2_init() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    client.migrate_v1_to_v2();
+}
