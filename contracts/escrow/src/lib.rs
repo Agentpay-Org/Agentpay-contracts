@@ -149,6 +149,44 @@ fn write_flag(env: &Env, key: &DataKey, value: bool) {
     env.storage().persistent().set(key, &value);
 }
 
+// Shared access-control helpers.
+//
+// Admin-gated entrypoints and the pause gate repeat the same small blocks of
+// logic. These free functions centralise that logic so every call site stays
+// byte-for-byte identical in behaviour (same error codes, same checks) while
+// removing the duplication. They are deliberately plain module-level `fn`s,
+// not `Escrow` methods: call them directly (e.g. `require_admin(&env)`), not
+// via `Self::`. When adding a new admin-gated entrypoint, start its body with
+// `let admin = require_admin(&env);` (or drop the binding when the admin value
+// is unused), and gate state-changing entrypoints with `ensure_not_paused`
+// at the same position the existing convention dictates.
+
+/// Load the stored admin and require its authorization.
+///
+/// Panics with [`EscrowError::NotInitialized`] when no admin has been set
+/// (i.e. `init` has not run). Otherwise calls `admin.require_auth()` and
+/// returns the admin address. This is the canonical admin gate for
+/// admin-only entrypoints.
+fn require_admin(env: &Env) -> Address {
+    let admin: Address = env
+        .storage()
+        .persistent()
+        .get(&DataKey::Admin)
+        .unwrap_or_else(|| panic_with_error!(env, EscrowError::NotInitialized));
+    admin.require_auth();
+    admin
+}
+
+/// Reject the call if the contract is currently paused.
+///
+/// Panics with [`EscrowError::ContractPaused`] when the `Paused` flag is set.
+/// Mirrors the inline pause check used by state-changing entrypoints.
+fn ensure_not_paused(env: &Env) {
+    if read_flag(env, &DataKey::Paused) {
+        panic_with_error!(env, EscrowError::ContractPaused);
+    }
+}
+
 #[contract]
 pub struct Escrow;
 
@@ -195,9 +233,7 @@ impl Escrow {
         service_id: Symbol,
         requests: u32,
     ) -> UsageRecord {
-        if read_flag(&env, &DataKey::Paused) {
-            panic_with_error!(&env, EscrowError::ContractPaused);
-        }
+        ensure_not_paused(&env);
         if requests == 0 {
             panic_with_error!(&env, EscrowError::RequestsMustBePositive);
         }
@@ -309,12 +345,7 @@ impl Escrow {
     /// allowed and means "free service" (still records usage, settles to
     /// zero).
     pub fn set_service_price(env: Env, service_id: Symbol, price_stroops: i128) {
-        let admin: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Admin)
-            .unwrap_or_else(|| panic_with_error!(&env, EscrowError::NotInitialized));
-        admin.require_auth();
+        require_admin(&env);
         if price_stroops < 0 {
             panic_with_error!(&env, EscrowError::RequestsMustBePositive);
         }
@@ -361,15 +392,8 @@ impl Escrow {
     /// transfer the returned amount off-chain or via a paired token
     /// contract call; this contract intentionally holds no balance.
     pub fn settle(env: Env, agent: Address, service_id: Symbol) -> i128 {
-        if read_flag(&env, &DataKey::Paused) {
-            panic_with_error!(&env, EscrowError::ContractPaused);
-        }
-        let admin: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Admin)
-            .unwrap_or_else(|| panic_with_error!(&env, EscrowError::NotInitialized));
-        admin.require_auth();
+        ensure_not_paused(&env);
+        require_admin(&env);
         let usage_key = DataKey::Usage(agent.clone(), service_id.clone());
         let requests: u32 = env.storage().persistent().get(&usage_key).unwrap_or(0);
         let price: i128 = env
@@ -401,12 +425,7 @@ impl Escrow {
     /// Admin enables or disables the agent allowlist gate. While
     /// disabled, `record_usage` does not consult the per-agent entries.
     pub fn set_allowlist_enabled(env: Env, enabled: bool) {
-        let admin: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Admin)
-            .unwrap_or_else(|| panic_with_error!(&env, EscrowError::NotInitialized));
-        admin.require_auth();
+        require_admin(&env);
         write_flag(&env, &DataKey::AllowlistEnabled, enabled);
     }
 
@@ -422,24 +441,14 @@ impl Escrow {
 
     /// Admin sets the allowlist status for a specific agent.
     pub fn set_agent_allowed(env: Env, agent: Address, allowed: bool) {
-        let admin: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Admin)
-            .unwrap_or_else(|| panic_with_error!(&env, EscrowError::NotInitialized));
-        admin.require_auth();
+        require_admin(&env);
         write_flag(&env, &DataKey::AgentAllowed(agent), allowed);
     }
 
     /// Admin sets the per-call lower bound on `requests` for batched
     /// writes. Pass `0` to disable the floor.
     pub fn set_min_requests_per_call(env: Env, min_requests: u32) {
-        let admin: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Admin)
-            .unwrap_or_else(|| panic_with_error!(&env, EscrowError::NotInitialized));
-        admin.require_auth();
+        require_admin(&env);
         env.storage()
             .persistent()
             .set(&DataKey::MinRequestsPerCall, &min_requests);
@@ -457,12 +466,7 @@ impl Escrow {
     /// Admin sets the per-call upper bound on `requests` accepted by
     /// `record_usage`. Pass `u32::MAX` to effectively disable the cap.
     pub fn set_max_requests_per_call(env: Env, max_requests: u32) {
-        let admin: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Admin)
-            .unwrap_or_else(|| panic_with_error!(&env, EscrowError::NotInitialized));
-        admin.require_auth();
+        require_admin(&env);
         env.storage()
             .persistent()
             .set(&DataKey::MaxRequestsPerCall, &max_requests);
@@ -472,12 +476,7 @@ impl Escrow {
     /// `record_usage` rejects unknown services with
     /// EscrowError::ServiceNotRegistered.
     pub fn set_require_service_registration(env: Env, required: bool) {
-        let admin: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Admin)
-            .unwrap_or_else(|| panic_with_error!(&env, EscrowError::NotInitialized));
-        admin.require_auth();
+        require_admin(&env);
         write_flag(&env, &DataKey::RequireServiceRegistration, required);
     }
 
@@ -496,12 +495,7 @@ impl Escrow {
     /// service are NOT touched — call reset_usage or remove the price
     /// separately if a clean wipe is required.
     pub fn unregister_service(env: Env, service_id: Symbol) {
-        let admin: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Admin)
-            .unwrap_or_else(|| panic_with_error!(&env, EscrowError::NotInitialized));
-        admin.require_auth();
+        require_admin(&env);
         env.storage()
             .persistent()
             .remove(&DataKey::ServiceRegistered(service_id));
@@ -510,24 +504,14 @@ impl Escrow {
     /// Register a service so `record_usage` accepts it under strict
     /// registration. Admin-gated and idempotent.
     pub fn register_service(env: Env, service_id: Symbol) {
-        let admin: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Admin)
-            .unwrap_or_else(|| panic_with_error!(&env, EscrowError::NotInitialized));
-        admin.require_auth();
+        require_admin(&env);
         write_flag(&env, &DataKey::ServiceRegistered(service_id), true);
     }
 
     /// Cancel a pending admin transfer. Current admin only. No-op when
     /// nothing is pending.
     pub fn cancel_admin_transfer(env: Env) {
-        let admin: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Admin)
-            .unwrap_or_else(|| panic_with_error!(&env, EscrowError::NotInitialized));
-        admin.require_auth();
+        require_admin(&env);
         env.storage().persistent().remove(&DataKey::PendingAdmin);
     }
 
@@ -559,12 +543,7 @@ impl Escrow {
     /// from their own key to finish the rotation. Re-proposing
     /// overwrites the prior pending entry.
     pub fn propose_admin_transfer(env: Env, new_admin: Address) {
-        let admin: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Admin)
-            .unwrap_or_else(|| panic_with_error!(&env, EscrowError::NotInitialized));
-        admin.require_auth();
+        let admin = require_admin(&env);
         if new_admin == admin {
             panic_with_error!(&env, EscrowError::InvalidAdminProposal);
         }
@@ -581,12 +560,7 @@ impl Escrow {
     /// Resume operations after a previous `pause()`. Admin-gated and
     /// idempotent (unpausing an already-unpaused contract is a no-op).
     pub fn unpause(env: Env) {
-        let admin: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Admin)
-            .unwrap_or_else(|| panic_with_error!(&env, EscrowError::NotInitialized));
-        admin.require_auth();
+        require_admin(&env);
         write_flag(&env, &DataKey::Paused, false);
         env.events().publish((symbol_short!("paused"),), false);
     }
@@ -595,12 +569,7 @@ impl Escrow {
     /// panic with [`EscrowError::ContractPaused`]. Admin-gated and
     /// idempotent (pausing an already-paused contract is a no-op write).
     pub fn pause(env: Env) {
-        let admin: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Admin)
-            .unwrap_or_else(|| panic_with_error!(&env, EscrowError::NotInitialized));
-        admin.require_auth();
+        require_admin(&env);
         write_flag(&env, &DataKey::Paused, true);
         env.events().publish((symbol_short!("paused"),), true);
     }
@@ -612,12 +581,7 @@ impl Escrow {
     /// new slots are absent, so the migration body itself only stamps
     /// the new SchemaVersion; no data fan-out is required.
     pub fn migrate_v1_to_v2(env: Env) {
-        let admin: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Admin)
-            .unwrap_or_else(|| panic_with_error!(&env, EscrowError::NotInitialized));
-        admin.require_auth();
+        require_admin(&env);
         let current: u32 = env
             .storage()
             .persistent()
@@ -647,12 +611,7 @@ impl Escrow {
     /// causes `record_usage` to panic with `ServiceDisabled` for that
     /// id; registration and metadata are preserved.
     pub fn set_service_disabled(env: Env, service_id: Symbol, disabled: bool) {
-        let admin: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Admin)
-            .unwrap_or_else(|| panic_with_error!(&env, EscrowError::NotInitialized));
-        admin.require_auth();
+        require_admin(&env);
         write_flag(&env, &DataKey::ServiceDisabled(service_id), disabled);
     }
 
@@ -660,12 +619,7 @@ impl Escrow {
     /// under `DataKey::ServiceMetadata(service_id)`. Description is
     /// capped at 256 UTF-8 bytes to bound storage cost.
     pub fn set_service_metadata(env: Env, service_id: Symbol, description: String, owner: Address) {
-        let admin: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Admin)
-            .unwrap_or_else(|| panic_with_error!(&env, EscrowError::NotInitialized));
-        admin.require_auth();
+        require_admin(&env);
         env.storage().persistent().set(
             &DataKey::ServiceMetadata(service_id),
             &ServiceMetadata { description, owner },
@@ -684,14 +638,7 @@ impl Escrow {
         service_id: Symbol,
         new_owner: Address,
     ) {
-        if env
-            .storage()
-            .persistent()
-            .get(&DataKey::Paused)
-            .unwrap_or(false)
-        {
-            panic_with_error!(&env, EscrowError::ContractPaused);
-        }
+        ensure_not_paused(&env);
         caller.require_auth();
         let admin: Address = env
             .storage()
@@ -724,12 +671,7 @@ impl Escrow {
     /// `meta_clr(service_id)` (topic shortened to satisfy the 9-char
     /// `symbol_short!` limit).
     pub fn clear_service_metadata(env: Env, service_id: Symbol) {
-        let admin: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Admin)
-            .unwrap_or_else(|| panic_with_error!(&env, EscrowError::NotInitialized));
-        admin.require_auth();
+        require_admin(&env);
         env.storage()
             .persistent()
             .remove(&DataKey::ServiceMetadata(service_id.clone()));

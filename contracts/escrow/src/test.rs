@@ -697,3 +697,29 @@ fn test_pause_pause_unpause_ends_unpaused() {
 
     assert!(!client.is_paused());
 }
+
+// Regression coverage for the extracted `require_admin` / `ensure_not_paused`
+// helpers (issue #29): the helper refactor must preserve the exact error
+// codes and gating behaviour of the previously-inlined blocks.
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn test_set_service_price_panics_not_initialized_before_init() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, Escrow);
+    let client = EscrowClient::new(&env, &contract_id);
+    // No init() call: require_admin must still panic NotInitialized (#3).
+    client.set_service_price(&Symbol::new(&env, "infer"), &500i128);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")]
+fn test_record_usage_paused_gate_via_helper() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    client.pause();
+    let agent = Address::generate(&env);
+    // ensure_not_paused must still panic ContractPaused (#4) while paused.
+    client.record_usage(&agent, &Symbol::new(&env, "infer"), &1u32);
+}
