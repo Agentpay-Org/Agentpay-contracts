@@ -124,6 +124,21 @@ pub struct UsageRecord {
     pub requests: u32,
 }
 
+// New persistent boolean flags should be read/written via `read_flag` /
+// `write_flag` so they inherit the `unwrap_or(false)` default convention.
+
+/// Read a persistent boolean flag, defaulting to `false` when unset.
+/// Centralises the `unwrap_or(false)` convention so a new flag can never
+/// accidentally default to `true` or skip a check.
+fn read_flag(env: &Env, key: &DataKey) -> bool {
+    env.storage().persistent().get(key).unwrap_or(false)
+}
+
+/// Write a persistent boolean flag.
+fn write_flag(env: &Env, key: &DataKey, value: bool) {
+    env.storage().persistent().set(key, &value);
+}
+
 #[contract]
 pub struct Escrow;
 
@@ -171,12 +186,7 @@ impl Escrow {
         service_id: Symbol,
         requests: u32,
     ) -> UsageRecord {
-        if env
-            .storage()
-            .persistent()
-            .get(&DataKey::Paused)
-            .unwrap_or(false)
-        {
+        if read_flag(&env, &DataKey::Paused) {
             panic_with_error!(&env, EscrowError::ContractPaused);
         }
         if requests == 0 {
@@ -198,37 +208,16 @@ impl Escrow {
         if requests < min_per_call {
             panic_with_error!(&env, EscrowError::RequestsBelowMinPerCall);
         }
-        if env
-            .storage()
-            .persistent()
-            .get(&DataKey::RequireServiceRegistration)
-            .unwrap_or(false)
-            && !env
-                .storage()
-                .persistent()
-                .get(&DataKey::ServiceRegistered(service_id.clone()))
-                .unwrap_or(false)
+        if read_flag(&env, &DataKey::RequireServiceRegistration)
+            && !read_flag(&env, &DataKey::ServiceRegistered(service_id.clone()))
         {
             panic_with_error!(&env, EscrowError::ServiceNotRegistered);
         }
-        if env
-            .storage()
-            .persistent()
-            .get(&DataKey::ServiceDisabled(service_id.clone()))
-            .unwrap_or(false)
-        {
+        if read_flag(&env, &DataKey::ServiceDisabled(service_id.clone())) {
             panic_with_error!(&env, EscrowError::ServiceDisabled);
         }
-        if env
-            .storage()
-            .persistent()
-            .get(&DataKey::AllowlistEnabled)
-            .unwrap_or(false)
-            && !env
-                .storage()
-                .persistent()
-                .get(&DataKey::AgentAllowed(agent.clone()))
-                .unwrap_or(false)
+        if read_flag(&env, &DataKey::AllowlistEnabled)
+            && !read_flag(&env, &DataKey::AgentAllowed(agent.clone()))
         {
             panic_with_error!(&env, EscrowError::AgentNotAllowed);
         }
@@ -367,12 +356,7 @@ impl Escrow {
     /// transfer the returned amount off-chain or via a paired token
     /// contract call; this contract intentionally holds no balance.
     pub fn settle(env: Env, agent: Address, service_id: Symbol) -> i128 {
-        if env
-            .storage()
-            .persistent()
-            .get(&DataKey::Paused)
-            .unwrap_or(false)
-        {
+        if read_flag(&env, &DataKey::Paused) {
             panic_with_error!(&env, EscrowError::ContractPaused);
         }
         let admin: Address = env
@@ -418,25 +402,17 @@ impl Escrow {
             .get(&DataKey::Admin)
             .unwrap_or_else(|| panic_with_error!(&env, EscrowError::NotInitialized));
         admin.require_auth();
-        env.storage()
-            .persistent()
-            .set(&DataKey::AllowlistEnabled, &enabled);
+        write_flag(&env, &DataKey::AllowlistEnabled, enabled);
     }
 
     /// Read the master allowlist toggle.
     pub fn is_allowlist_enabled(env: Env) -> bool {
-        env.storage()
-            .persistent()
-            .get(&DataKey::AllowlistEnabled)
-            .unwrap_or(false)
+        read_flag(&env, &DataKey::AllowlistEnabled)
     }
 
     /// Read whether an agent is explicitly allowed (false for never-set).
     pub fn is_agent_allowed(env: Env, agent: Address) -> bool {
-        env.storage()
-            .persistent()
-            .get(&DataKey::AgentAllowed(agent))
-            .unwrap_or(false)
+        read_flag(&env, &DataKey::AgentAllowed(agent))
     }
 
     /// Admin sets the allowlist status for a specific agent.
@@ -447,9 +423,7 @@ impl Escrow {
             .get(&DataKey::Admin)
             .unwrap_or_else(|| panic_with_error!(&env, EscrowError::NotInitialized));
         admin.require_auth();
-        env.storage()
-            .persistent()
-            .set(&DataKey::AgentAllowed(agent), &allowed);
+        write_flag(&env, &DataKey::AgentAllowed(agent), allowed);
     }
 
     /// Admin sets the per-call lower bound on `requests` for batched
@@ -499,25 +473,17 @@ impl Escrow {
             .get(&DataKey::Admin)
             .unwrap_or_else(|| panic_with_error!(&env, EscrowError::NotInitialized));
         admin.require_auth();
-        env.storage()
-            .persistent()
-            .set(&DataKey::RequireServiceRegistration, &required);
+        write_flag(&env, &DataKey::RequireServiceRegistration, required);
     }
 
     /// Read the strict-registration flag.
     pub fn is_service_registration_required(env: Env) -> bool {
-        env.storage()
-            .persistent()
-            .get(&DataKey::RequireServiceRegistration)
-            .unwrap_or(false)
+        read_flag(&env, &DataKey::RequireServiceRegistration)
     }
 
     /// Read whether a service has been registered.
     pub fn is_service_registered(env: Env, service_id: Symbol) -> bool {
-        env.storage()
-            .persistent()
-            .get(&DataKey::ServiceRegistered(service_id))
-            .unwrap_or(false)
+        read_flag(&env, &DataKey::ServiceRegistered(service_id))
     }
 
     /// Unregister a service. Admin-gated; idempotent (removing an absent
@@ -545,9 +511,7 @@ impl Escrow {
             .get(&DataKey::Admin)
             .unwrap_or_else(|| panic_with_error!(&env, EscrowError::NotInitialized));
         admin.require_auth();
-        env.storage()
-            .persistent()
-            .set(&DataKey::ServiceRegistered(service_id), &true);
+        write_flag(&env, &DataKey::ServiceRegistered(service_id), true);
     }
 
     /// Cancel a pending admin transfer. Current admin only. No-op when
@@ -603,10 +567,7 @@ impl Escrow {
 
     /// Returns `true` iff the contract is currently paused.
     pub fn is_paused(env: Env) -> bool {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Paused)
-            .unwrap_or(false)
+        read_flag(&env, &DataKey::Paused)
     }
 
     /// Resume operations after a previous `pause()`. Admin-gated and
@@ -618,7 +579,7 @@ impl Escrow {
             .get(&DataKey::Admin)
             .unwrap_or_else(|| panic_with_error!(&env, EscrowError::NotInitialized));
         admin.require_auth();
-        env.storage().persistent().set(&DataKey::Paused, &false);
+        write_flag(&env, &DataKey::Paused, false);
         env.events().publish((symbol_short!("paused"),), false);
     }
 
@@ -632,7 +593,7 @@ impl Escrow {
             .get(&DataKey::Admin)
             .unwrap_or_else(|| panic_with_error!(&env, EscrowError::NotInitialized));
         admin.require_auth();
-        env.storage().persistent().set(&DataKey::Paused, &true);
+        write_flag(&env, &DataKey::Paused, true);
         env.events().publish((symbol_short!("paused"),), true);
     }
 
@@ -669,10 +630,7 @@ impl Escrow {
 
     /// Returns `true` iff the service has been disabled.
     pub fn is_service_disabled(env: Env, service_id: Symbol) -> bool {
-        env.storage()
-            .persistent()
-            .get(&DataKey::ServiceDisabled(service_id))
-            .unwrap_or(false)
+        read_flag(&env, &DataKey::ServiceDisabled(service_id))
     }
 
     /// Admin sets the disabled flag for a service. Disabling a service
@@ -685,9 +643,7 @@ impl Escrow {
             .get(&DataKey::Admin)
             .unwrap_or_else(|| panic_with_error!(&env, EscrowError::NotInitialized));
         admin.require_auth();
-        env.storage()
-            .persistent()
-            .set(&DataKey::ServiceDisabled(service_id), &disabled);
+        write_flag(&env, &DataKey::ServiceDisabled(service_id), disabled);
     }
 
     /// Admin sets human-readable metadata for a service. Persisted
