@@ -119,7 +119,10 @@ fn test_get_service_price_round_trip() {
 fn test_get_service_price_defaults_to_zero() {
     let env = Env::default();
     let (client, _admin) = setup_initialized(&env);
-    assert_eq!(client.get_service_price(&Symbol::new(&env, "never_set")), 0i128);
+    assert_eq!(
+        client.get_service_price(&Symbol::new(&env, "never_set")),
+        0i128
+    );
 }
 
 #[test]

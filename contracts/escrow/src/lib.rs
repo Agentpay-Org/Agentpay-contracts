@@ -162,11 +162,7 @@ impl Escrow {
     /// address still fails. Use a redeploy or a future admin-rotation
     /// entrypoint if the admin needs to change.
     pub fn init(env: Env, admin: Address) {
-        if env
-            .storage()
-            .persistent()
-            .has(&DataKey::Admin)
-        {
+        if env.storage().persistent().has(&DataKey::Admin) {
             panic_with_error!(&env, EscrowError::AlreadyInitialized);
         }
         admin.require_auth();
@@ -273,11 +269,7 @@ impl Escrow {
     /// `(agent, service_id)` pair. Returns `None` for pairs that have
     /// never been settled (vs. `Some(0)`, which would be a genesis-block
     /// settlement and should not be confused with absent).
-    pub fn get_last_settlement(
-        env: Env,
-        agent: Address,
-        service_id: Symbol,
-    ) -> Option<u64> {
+    pub fn get_last_settlement(env: Env, agent: Address, service_id: Symbol) -> Option<u64> {
         env.storage()
             .persistent()
             .get(&DataKey::LastSettlement(agent, service_id))
@@ -634,7 +626,9 @@ impl Escrow {
         if current != 1 {
             panic_with_error!(&env, EscrowError::MigrationVersionMismatch);
         }
-        env.storage().persistent().set(&DataKey::SchemaVersion, &2u32);
+        env.storage()
+            .persistent()
+            .set(&DataKey::SchemaVersion, &2u32);
     }
 
     /// Read the metadata for a service, or `None` if none has been set.
@@ -665,12 +659,7 @@ impl Escrow {
     /// Admin sets human-readable metadata for a service. Persisted
     /// under `DataKey::ServiceMetadata(service_id)`. Description is
     /// capped at 256 UTF-8 bytes to bound storage cost.
-    pub fn set_service_metadata(
-        env: Env,
-        service_id: Symbol,
-        description: String,
-        owner: Address,
-    ) {
+    pub fn set_service_metadata(env: Env, service_id: Symbol, description: String, owner: Address) {
         let admin: Address = env
             .storage()
             .persistent()
