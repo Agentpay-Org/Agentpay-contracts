@@ -711,6 +711,26 @@ impl Escrow {
         );
     }
 
+    /// Admin-gated. Remove a service's metadata (description + owner).
+    /// Idempotent — clearing an absent entry is a no-op. After clearing,
+    /// `get_service_metadata` reads back `None`. Registration and usage
+    /// history live in independent slots and are untouched. Emits
+    /// `meta_clr(service_id)` (topic shortened to satisfy the 9-char
+    /// `symbol_short!` limit).
+    pub fn clear_service_metadata(env: Env, service_id: Symbol) {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, EscrowError::NotInitialized));
+        admin.require_auth();
+        env.storage()
+            .persistent()
+            .remove(&DataKey::ServiceMetadata(service_id.clone()));
+        env.events()
+            .publish((symbol_short!("meta_clr"),), service_id);
+    }
+
     /// Read the on-chain schema version, or `1` (the implicit
     /// pre-migration default) if absent.
     pub fn get_schema_version(env: Env) -> u32 {

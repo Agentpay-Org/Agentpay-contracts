@@ -6,6 +6,13 @@ Soroban smart contracts for the AgentPay protocol: escrow, usage recording, and 
 
 - **escrow** — Records usage and supports settlement logic for machine-to-machine payments.
 
+### Service metadata vs. registration
+
+A service's metadata (`description` + `owner`) and its registration flag live in
+independent storage slots. `clear_service_metadata` (admin-gated, idempotent)
+removes only the metadata; the registration flag and per-(agent, service) usage
+history are untouched.
+
 ## Prerequisites
 
 - [Rust](https://rustup.rs/) (stable, with `rustfmt`)
