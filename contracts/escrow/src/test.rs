@@ -2226,3 +2226,219 @@ fn test_rate_limit_is_per_agent() {
     let rec_b = client.record_usage(&b, &svc, &5u32); // b independent
     assert_eq!(rec_b.requests, 5);
 }
+// ── compute_billing tests ────────────────────────────────────────────────────
+//
+// `compute_billing(agent, service_id)` returns `accumulated_requests * price_per_request`
+// using `saturating_mul`, returns `0` when either operand is zero, and is the
+// read-only mirror of the billing math inside `settle`.
+//
+// Covered scenarios:
+//   1. Zero usage, any price          → 0
+//   2. Zero price (free service)      → 0
+//   3. Unpriced and unused pair       → 0
+//   4. Normal product                 → requests * price
+//   5. Saturation edge                → i128::MAX (no overflow)
+//   6. compute_billing agrees with settle billed value
+
+/// Helper: register a service price for `service_id`.
+fn set_price(client: &EscrowClient, service_id: &Symbol, price: i128) {
+    client.set_service_price(service_id, &price);
+}
+
+/// Helper: record `requests` units of usage for `(agent, service_id)`.
+fn record(client: &EscrowClient, agent: &Address, service_id: &Symbol, requests: u32) {
+    client.record_usage(agent, service_id, &requests);
+}
+
+/// Zero usage with a non-zero price must bill 0.
+#[test]
+fn test_compute_billing_zero_usage() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "infer");
+
+    set_price(&client, &svc, 100);
+    // No record_usage call — accumulated_requests is 0.
+    let bill = client.compute_billing(&agent, &svc);
+    assert_eq!(bill, 0, "zero usage must bill 0 regardless of price");
+}
+
+/// Zero price (free service) with non-zero usage must bill 0.
+#[test]
+fn test_compute_billing_zero_price_free_service() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "free");
+
+    set_price(&client, &svc, 0); // explicitly free
+    record(&client, &agent, &svc, 50);
+    let bill = client.compute_billing(&agent, &svc);
+    assert_eq!(bill, 0, "free service (price=0) must always bill 0");
+}
+
+/// Pair with no price set and no usage recorded must bill 0.
+#[test]
+fn test_compute_billing_unpriced_and_unused() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "ghost");
+
+    // Neither set_service_price nor record_usage called.
+    let bill = client.compute_billing(&agent, &svc);
+    assert_eq!(bill, 0, "unpriced and unused pair must bill 0");
+}
+
+/// Normal product: 10 requests × 250 stroops/request = 2_500 stroops.
+#[test]
+fn test_compute_billing_normal_product() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "embed");
+
+    set_price(&client, &svc, 250);
+    record(&client, &agent, &svc, 10);
+    let bill = client.compute_billing(&agent, &svc);
+    assert_eq!(bill, 2_500, "10 requests × 250 stroops must equal 2500");
+}
+
+/// Accumulated usage across multiple record_usage calls is summed correctly.
+#[test]
+fn test_compute_billing_accumulated_usage() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "chat");
+
+    set_price(&client, &svc, 10);
+    record(&client, &agent, &svc, 5);
+    record(&client, &agent, &svc, 15);
+    // total usage = 20, price = 10 → bill = 200
+    let bill = client.compute_billing(&agent, &svc);
+    assert_eq!(
+        bill, 200,
+        "accumulated usage across calls must sum correctly"
+    );
+}
+
+/// Saturation edge: large requests × large price saturates at i128::MAX.
+#[test]
+fn test_compute_billing_saturation() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "sat");
+
+    // i128::MAX / i128::MAX would overflow without saturating_mul.
+    // Use price = i128::MAX so that even 1 request saturates.
+    set_price(&client, &svc, i128::MAX);
+    record(&client, &agent, &svc, 1);
+    let bill = client.compute_billing(&agent, &svc);
+    assert_eq!(
+        bill,
+        i128::MAX,
+        "1 request × i128::MAX price must saturate at i128::MAX"
+    );
+}
+
+/// Saturation with u32::MAX requests also saturates at i128::MAX.
+#[test]
+fn test_compute_billing_saturation_large_requests() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "sat2");
+
+    // price high enough that u32::MAX * price overflows i128
+    set_price(&client, &svc, i128::MAX);
+    // record_usage caps at u32::MAX via saturating_add, so record in steps
+    record(&client, &agent, &svc, u32::MAX);
+    let bill = client.compute_billing(&agent, &svc);
+    assert_eq!(
+        bill,
+        i128::MAX,
+        "u32::MAX requests × large price must saturate at i128::MAX"
+    );
+}
+
+/// compute_billing agrees with the `billed` value settle returns for the same state.
+#[test]
+fn test_compute_billing_agrees_with_settle() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "agree");
+
+    set_price(&client, &svc, 75);
+    record(&client, &agent, &svc, 8);
+
+    // Read compute_billing BEFORE settle (pre-settle state).
+    let pre_settle_bill = client.compute_billing(&agent, &svc);
+
+    // settle returns the billed amount and drains the counter.
+    let settled = client.settle(&admin, &agent, &svc);
+
+    assert_eq!(
+        pre_settle_bill, settled,
+        "compute_billing must equal the billed value settle returns for the same pre-settle state"
+    );
+    assert_eq!(pre_settle_bill, 600, "8 requests × 75 stroops = 600");
+}
+
+/// After settle drains the counter, compute_billing returns 0.
+#[test]
+fn test_compute_billing_zero_after_settle() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "drain");
+
+    set_price(&client, &svc, 50);
+    record(&client, &agent, &svc, 4);
+    client.settle(&admin, &agent, &svc);
+
+    // Counter is drained — billing must now be 0.
+    let post_settle_bill = client.compute_billing(&agent, &svc);
+    assert_eq!(
+        post_settle_bill, 0,
+        "compute_billing must return 0 after settle drains the counter"
+    );
+}
+
+/// Different agents billed independently for the same service.
+#[test]
+fn test_compute_billing_independent_per_agent() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let a = Address::generate(&env);
+    let b = Address::generate(&env);
+    let svc = Symbol::new(&env, "shared");
+
+    set_price(&client, &svc, 20);
+    record(&client, &a, &svc, 3); // a: 3 × 20 = 60
+    record(&client, &b, &svc, 7); // b: 7 × 20 = 140
+
+    assert_eq!(client.compute_billing(&a, &svc), 60);
+    assert_eq!(client.compute_billing(&b, &svc), 140);
+}
+
+/// Different services billed independently for the same agent.
+#[test]
+fn test_compute_billing_independent_per_service() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let svc1 = Symbol::new(&env, "alpha");
+    let svc2 = Symbol::new(&env, "beta");
+
+    set_price(&client, &svc1, 10);
+    set_price(&client, &svc2, 30);
+    record(&client, &agent, &svc1, 5); // 5 × 10 = 50
+    record(&client, &agent, &svc2, 2); // 2 × 30 = 60
+
+    assert_eq!(client.compute_billing(&agent, &svc1), 50);
+    assert_eq!(client.compute_billing(&agent, &svc2), 60);
+}
