@@ -259,6 +259,7 @@ impl Escrow {
         // Errors MUST fire in this fixed precedence so that client SDKs and
         // off-chain settlement loops can rely on a stable failure ordering:
         //
+        //   0. agent auth        -> Soroban auth error (host-level)
         //   1. Paused            -> #4  ContractPaused
         //   2. requests == 0     -> #2  RequestsMustBePositive
         //   3. requests > max    -> #8  RequestsExceedsMaxPerCall
@@ -267,17 +268,13 @@ impl Escrow {
         //   6. disabled          -> #12 ServiceDisabled
         //   7. allowlist         -> #10 AgentNotAllowed
         //
-        // Read-count note (before/after): the storage reads performed here are
-        // unchanged in the worst case, but several are *conditionally gated* so
-        // they never execute when their controlling flag is off:
-        //   - ServiceRegistered is only read when RequireServiceRegistration is
-        //     true (short-circuited via `&&`).
-        //   - AgentAllowed is only read when AllowlistEnabled is true (ditto).
-        // The Paused flag, the max/min caps, and ServiceDisabled are always
-        // read (unconditional gates). Each key is read at most once: the
-        // max/min caps are cached in locals below, and the usage counter (read
-        // further down) is read exactly once. No value is read twice.
-        // -------------------------------------------------------------------
+        // Auth check position: agent.require_auth() fires before the pause
+        // check so the host rejects unauthorized callers before any storage
+        // is read. A trusted metering operator can record on an agent's
+        // behalf when the agent has pre-authorized it via Soroban's auth
+        // tree (sub-invocation authorization). See README.md for details.
+        // Step 0: agent must authorize this write — prevents usage forgery.
+        agent.require_auth();
         if read_flag(&env, &DataKey::Paused) {
             panic_with_error!(&env, EscrowError::ContractPaused);
         }

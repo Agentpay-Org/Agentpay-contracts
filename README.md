@@ -13,17 +13,20 @@ current owner (or the admin) can reassign the `owner` via
 `transfer_service_ownership(caller, service_id, new_owner)` without touching the
 `description`. The call honours the pause gate and emits `owner_chg` for
 indexers.
+
 ### Service metadata vs. registration
 
 A service's metadata (`description` + `owner`) and its registration flag live in
 independent storage slots. `clear_service_metadata` (admin-gated, idempotent)
 removes only the metadata; the registration flag and per-(agent, service) usage
 history are untouched.
+
 ### Admin proposal validation
 
 `propose_admin_transfer` rejects proposing the current admin as the new admin
 (panics with `InvalidAdminProposal`). This surfaces no-op handovers as caller
 mistakes rather than silently storing a pending entry equal to the active admin.
+
 ### Per-agent rate limiting (fixed window)
 
 `record_usage` supports an optional per-agent rate limit anchored to
@@ -59,11 +62,13 @@ a fresh v2 deploy panics with `MigrationVersionMismatch`.
 ## Setup for contributors
 
 1. **Clone the repo** (or add remote and pull):
+
    ```bash
    git clone <repo-url> && cd agentpay-contracts
    ```
 
 2. **Install Rust** (if needed):
+
    ```bash
    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
    rustup component add rustfmt
@@ -93,12 +98,12 @@ agentpay-contracts/
 
 ## Commands
 
-| Command | Description |
-|--------|-------------|
-| `cargo fmt --all` | Format code |
+| Command                      | Description           |
+| ---------------------------- | --------------------- |
+| `cargo fmt --all`            | Format code           |
 | `cargo fmt --all -- --check` | Check formatting (CI) |
-| `cargo build` | Build |
-| `cargo test` | Run tests |
+| `cargo build`                | Build                 |
+| `cargo test`                 | Run tests             |
 
 ## Documentation
 
@@ -125,3 +130,45 @@ append-only error-code table, event conventions, and the test/coverage gate.
 ## License
 
 MIT
+
+### Agent authorization on `record_usage`
+
+`record_usage` now requires the recorded `agent` to authorize the call via
+`agent.require_auth()`. This closes a usage-forgery vector where any party
+could inflate a competitor agent's counters — and therefore its bill on the
+next `settle` — with no signature from the agent.
+
+#### Validation chain position
+
+Auth is checked at **step 0**, before the pause gate:
+
+| Step | Check                  | Error                          |
+| ---- | ---------------------- | ------------------------------ |
+| 0    | `agent.require_auth()` | Soroban host auth error        |
+| 1    | Contract paused        | `#4 ContractPaused`            |
+| 2    | `requests == 0`        | `#2 RequestsMustBePositive`    |
+| 3    | `requests > max`       | `#8 RequestsExceedsMaxPerCall` |
+| 4    | `requests < min`       | `#9 RequestsBelowMinPerCall`   |
+| 5    | Service not registered | `#7 ServiceNotRegistered`      |
+| 6    | Service disabled       | `#12 ServiceDisabled`          |
+| 7    | Agent not allowed      | `#10 AgentNotAllowed`          |
+
+#### Operator override (metering loop migration)
+
+Soroban's auth tree supports sub-invocation authorization — an agent can
+pre-authorize a trusted metering operator to call `record_usage` on its
+behalf by having the operator's call appear as a sub-invocation of an
+agent-signed outer call. This means existing off-chain settlement loops
+can continue to operate without requiring every agent to sign each
+individual `record_usage` call directly, as long as the operator is
+authorized via the auth tree.
+
+**Migration path for existing metering operators:**
+
+1. The agent signs an outer transaction that authorizes the operator's
+   contract call via Soroban's `authorize_as_current_contract` or
+   sub-invocation auth.
+2. The operator's metering loop submits `record_usage` as a
+   sub-invocation within that authorized context.
+3. Alternatively, agents can sign each `record_usage` call directly
+   (standard path) if the metering loop supports it.
