@@ -2442,3 +2442,192 @@ fn test_compute_billing_independent_per_service() {
     assert_eq!(client.compute_billing(&agent, &svc1), 50);
     assert_eq!(client.compute_billing(&agent, &svc2), 60);
 }
+
+// ── get_contract_config tests ────────────────────────────────────────────────
+//
+// `get_contract_config()` returns a `ContractConfig` snapshot carrying every
+// global setting. Each field must equal the value returned by the corresponding
+// per-field getter for the same storage state. Covered scenarios:
+//
+//   1. Defaults on a fresh contract (all boolean flags false, numeric defaults)
+//   2. Fields match individual getters after config changes
+//   3. After toggling pause / allowlist / strict-registration
+//   4. After setting per-call bounds and rate-limit window
+//   5. Callable while paused (pure read — no pause gate)
+//   6. Callable before init (admin returns None)
+
+/// All fields carry their defaults on a freshly initialised contract.
+#[test]
+fn test_get_contract_config_defaults_on_fresh_contract() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+
+    let cfg = client.get_contract_config();
+
+    assert!(!cfg.paused);
+    assert!(!cfg.allowlist_enabled);
+    assert!(!cfg.require_service_registration);
+    assert_eq!(cfg.max_requests_per_call, u32::MAX);
+    assert_eq!(cfg.min_requests_per_call, 0);
+    assert_eq!(cfg.max_requests_per_window, 0);
+    assert_eq!(cfg.window_seconds, 0);
+    assert_eq!(cfg.schema_version, 2);
+    assert_eq!(cfg.admin, Some(admin));
+}
+
+/// Every field in the snapshot matches the corresponding individual getter.
+#[test]
+fn test_get_contract_config_matches_individual_getters() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+
+    client.set_allowlist_enabled(&true);
+    client.set_require_service_registration(&true);
+    client.set_max_requests_per_call(&200u32);
+    client.set_min_requests_per_call(&5u32);
+    client.set_max_requests_per_window(&50u32);
+    client.set_rate_window_seconds(&120u64);
+
+    let cfg = client.get_contract_config();
+
+    assert_eq!(cfg.paused, client.is_paused());
+    assert_eq!(cfg.allowlist_enabled, client.is_allowlist_enabled());
+    assert_eq!(
+        cfg.require_service_registration,
+        client.is_service_registration_required()
+    );
+    assert_eq!(
+        cfg.max_requests_per_call,
+        client.get_max_requests_per_call()
+    );
+    assert_eq!(
+        cfg.min_requests_per_call,
+        client.get_min_requests_per_call()
+    );
+    assert_eq!(
+        cfg.max_requests_per_window,
+        client.get_max_requests_per_window()
+    );
+    assert_eq!(cfg.window_seconds, client.get_rate_window_seconds());
+    assert_eq!(cfg.schema_version, client.get_schema_version());
+    assert_eq!(cfg.admin, client.get_admin());
+}
+
+/// Pausing the contract is reflected in the snapshot; unpausing clears it.
+#[test]
+fn test_get_contract_config_reflects_pause_toggle() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+
+    assert!(!client.get_contract_config().paused);
+    client.pause();
+    assert!(client.get_contract_config().paused);
+    client.unpause();
+    assert!(!client.get_contract_config().paused);
+}
+
+/// Toggling the allowlist toggle is reflected in the snapshot.
+#[test]
+fn test_get_contract_config_reflects_allowlist_toggle() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+
+    assert!(!client.get_contract_config().allowlist_enabled);
+    client.set_allowlist_enabled(&true);
+    assert!(client.get_contract_config().allowlist_enabled);
+    client.set_allowlist_enabled(&false);
+    assert!(!client.get_contract_config().allowlist_enabled);
+}
+
+/// Toggling the strict-registration flag is reflected in the snapshot.
+#[test]
+fn test_get_contract_config_reflects_strict_registration_toggle() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+
+    assert!(!client.get_contract_config().require_service_registration);
+    client.set_require_service_registration(&true);
+    assert!(client.get_contract_config().require_service_registration);
+    client.set_require_service_registration(&false);
+    assert!(!client.get_contract_config().require_service_registration);
+}
+
+/// Per-call bounds and rate-limit window are reflected correctly.
+#[test]
+fn test_get_contract_config_reflects_bounds_and_window() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+
+    client.set_max_requests_per_call(&500u32);
+    client.set_min_requests_per_call(&10u32);
+    client.set_max_requests_per_window(&100u32);
+    client.set_rate_window_seconds(&300u64);
+
+    let cfg = client.get_contract_config();
+    assert_eq!(cfg.max_requests_per_call, 500);
+    assert_eq!(cfg.min_requests_per_call, 10);
+    assert_eq!(cfg.max_requests_per_window, 100);
+    assert_eq!(cfg.window_seconds, 300);
+}
+
+/// The snapshot is readable while the contract is paused (pure read, no pause gate).
+#[test]
+fn test_get_contract_config_readable_while_paused() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    client.pause();
+
+    let cfg = client.get_contract_config();
+    assert!(cfg.paused);
+    assert_eq!(cfg.admin, Some(admin));
+}
+
+/// Before `init`, `admin` is `None` and all fields carry their defaults.
+#[test]
+fn test_get_contract_config_before_init_admin_is_none() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, Escrow);
+    let client = EscrowClient::new(&env, &contract_id);
+
+    let cfg = client.get_contract_config();
+    assert_eq!(cfg.admin, None);
+    assert!(!cfg.paused);
+    assert!(!cfg.allowlist_enabled);
+    assert!(!cfg.require_service_registration);
+    assert_eq!(cfg.max_requests_per_call, u32::MAX);
+    assert_eq!(cfg.min_requests_per_call, 0);
+    assert_eq!(cfg.max_requests_per_window, 0);
+    assert_eq!(cfg.window_seconds, 0);
+    // schema_version defaults to 1 (implicit pre-migration value) when absent.
+    assert_eq!(cfg.schema_version, 1);
+}
+
+/// The snapshot after an admin handover carries the new admin address.
+#[test]
+fn test_get_contract_config_reflects_admin_after_rotation() {
+    let env = Env::default();
+    let (client, _old_admin) = setup_initialized(&env);
+    let next = Address::generate(&env);
+    client.propose_admin_transfer(&next);
+    client.accept_admin_transfer(&next);
+
+    let cfg = client.get_contract_config();
+    assert_eq!(cfg.admin, Some(next));
+}
+
+/// The snapshot is consistent: all fields come from the same ledger read.
+/// Verify by checking that a second call immediately after returns an
+/// identical struct (no storage mutation between reads).
+#[test]
+fn test_get_contract_config_is_idempotent() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+
+    client.set_allowlist_enabled(&true);
+    client.set_max_requests_per_call(&99u32);
+
+    let first = client.get_contract_config();
+    let second = client.get_contract_config();
+    assert_eq!(first, second);
+}
