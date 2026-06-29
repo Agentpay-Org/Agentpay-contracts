@@ -401,6 +401,55 @@ impl Escrow {
         }
     }
 
+    /// Subtract `amount` from the per-(agent, service_id) usage counter.
+    ///
+    /// Admin-gated and pause-respecting. Uses saturating subtraction so the
+    /// counter clamps at zero and never underflows. Returns the new total.
+    ///
+    /// Rejects `amount == 0` with
+    /// [`EscrowError::RequestsMustBePositive`] to prevent no-op corrections
+    /// in the audit trail.
+    ///
+    /// # Lifetime counters
+    ///
+    /// `TotalUsageByAgent` and `TotalRequestsAllTime` are deliberately **not**
+    /// adjusted. They track raw reported figures for analytics; corrections
+    /// to the per-pair balance should not retroactively distort the lifetime
+    /// signal. Off-chain billing pipelines that need the corrected view
+    /// should subtract the decrement event from the lifetime counter when
+    /// processing the `usage_dec` event.
+    ///
+    /// # Events
+    ///
+    /// Emits `usage_dec(agent, service_id, amount, new_total)` so corrections
+    /// are auditable and distinguishable from `record_usage` and `settle`.
+    pub fn decrement_usage(env: Env, agent: Address, service_id: Symbol, amount: u32) -> u32 {
+        if read_flag(&env, &DataKey::Paused) {
+            panic_with_error!(&env, EscrowError::ContractPaused);
+        }
+        if amount == 0 {
+            panic_with_error!(&env, EscrowError::RequestsMustBePositive);
+        }
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, EscrowError::NotInitialized));
+        admin.require_auth();
+
+        let key = DataKey::Usage(agent.clone(), service_id.clone());
+        let prev: u32 = env.storage().persistent().get(&key).unwrap_or(0);
+        let new_total = prev.saturating_sub(amount);
+        env.storage().persistent().set(&key, &new_total);
+
+        env.events().publish(
+            (symbol_short!("usage_dec"),),
+            (agent, service_id, amount, new_total),
+        );
+
+        new_total
+    }
+
     /// Read the ledger timestamp at which `settle` last drained an
     /// `(agent, service_id)` pair. Returns `None` for pairs that have
     /// never been settled (vs. `Some(0)`, which would be a genesis-block

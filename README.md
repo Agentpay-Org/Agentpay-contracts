@@ -24,6 +24,25 @@ history are untouched.
 `propose_admin_transfer` rejects proposing the current admin as the new admin
 (panics with `InvalidAdminProposal`). This surfaces no-op handovers as caller
 mistakes rather than silently storing a pending entry equal to the active admin.
+### Correction flow: `decrement_usage`
+
+When a metering client over-reports (e.g. double-counts a batch), the
+admin can call `decrement_usage(env, agent, service_id, amount)` to
+subtract the erroneous delta from the per-pair counter without discarding
+the legitimate remainder. The decrement uses saturating arithmetic (clamps
+at zero, never underflows) and emits a distinct `usage_dec` event so
+corrections are auditable and distinguishable from `record_usage` and
+`settle`.
+
+#### Lifetime-counter policy
+
+`TotalUsageByAgent` and `TotalRequestsAllTime` are **not** adjusted by
+`decrement_usage`. These counters track the raw reported figure for
+analytics; correcting the per-pair balance should not retroactively distort
+the lifetime signal. Off-chain billing pipelines that need the corrected
+view should subtract the decrement event amount from the lifetime counter
+when processing the `usage_dec` event.
+
 ### Per-agent rate limiting (fixed window)
 
 `record_usage` supports an optional per-agent rate limit anchored to

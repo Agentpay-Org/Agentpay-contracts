@@ -137,6 +137,181 @@ fn test_compute_billing_basic() {
 }
 
 #[test]
+fn test_decrement_usage_basic() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "weather_api");
+    client.record_usage(&agent, &svc, &100u32);
+
+    let new_total = client.decrement_usage(&agent, &svc, &30u32);
+    assert_eq!(new_total, 70);
+    assert_eq!(client.get_usage(&agent, &svc), 70);
+}
+
+#[test]
+fn test_decrement_usage_past_zero_clamps() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "weather_api");
+    client.record_usage(&agent, &svc, &50u32);
+
+    let new_total = client.decrement_usage(&agent, &svc, &200u32);
+    assert_eq!(new_total, 0);
+    assert_eq!(client.get_usage(&agent, &svc), 0);
+}
+
+#[test]
+fn test_decrement_usage_to_zero() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "weather_api");
+    client.record_usage(&agent, &svc, &100u32);
+
+    let new_total = client.decrement_usage(&agent, &svc, &100u32);
+    assert_eq!(new_total, 0);
+    assert_eq!(client.get_usage(&agent, &svc), 0);
+}
+
+#[test]
+fn test_decrement_usage_never_used_clamps() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "never_used");
+
+    let new_total = client.decrement_usage(&agent, &svc, &50u32);
+    assert_eq!(new_total, 0);
+    assert_eq!(client.get_usage(&agent, &svc), 0);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #2)")]
+fn test_decrement_usage_rejects_zero() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "weather_api");
+    client.record_usage(&agent, &svc, &100u32);
+
+    client.decrement_usage(&agent, &svc, &0u32);
+}
+
+#[test]
+#[should_panic(expected = "Unauthorized")]
+fn test_decrement_usage_rejects_non_admin() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, Escrow);
+    let client = EscrowClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    env.mock_all_auths();
+    client.init(&admin);
+
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "weather_api");
+    client.record_usage(&agent, &svc, &100u32);
+
+    env.set_auths(&[]);
+    client.decrement_usage(&agent, &svc, &10u32);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")]
+fn test_decrement_usage_rejected_while_paused() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "weather_api");
+    client.record_usage(&agent, &svc, &100u32);
+
+    client.pause();
+    client.decrement_usage(&agent, &svc, &10u32);
+}
+
+#[test]
+fn test_decrement_usage_lifetime_counters_unchanged() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "weather_api");
+    client.record_usage(&agent, &svc, &100u32);
+
+    let lifetime_agent_before = client.get_total_usage_by_agent(&agent);
+    let lifetime_all_before = client.get_total_requests_all_time();
+
+    client.decrement_usage(&agent, &svc, &30u32);
+
+    assert_eq!(
+        client.get_total_usage_by_agent(&agent),
+        lifetime_agent_before
+    );
+    assert_eq!(client.get_total_requests_all_time(), lifetime_all_before);
+}
+
+#[test]
+fn test_decrement_usage_emits_event() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "weather_api");
+    client.record_usage(&agent, &svc, &100u32);
+
+    client.decrement_usage(&agent, &svc, &30u32);
+
+    let events = env.events().all();
+    assert!(!events.is_empty());
+    let (_addr, topics, data) = events.last().unwrap();
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("usage_dec"),).into_val(&env);
+    assert_eq!(topics, expected_topics);
+    let decoded: (Address, Symbol, u32, u32) = data.into_val(&env);
+    assert_eq!(decoded, (agent.clone(), svc.clone(), 30u32, 70u32));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")]
+fn test_decrement_usage_paused_beats_zero() {
+    // Paused (#4) must win even when amount == 0 (which would be #2).
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    client.pause();
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "weather_api");
+    client.decrement_usage(&agent, &svc, &0u32);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #2)")]
+fn test_decrement_usage_zero_beats_noauth() {
+    // Zero (#2) must win over auth check. With amount == 0, we reject before
+    // reaching require_auth, so even without admin auth the error is #2.
+    let env = Env::default();
+    let contract_id = env.register_contract(None, Escrow);
+    let client = EscrowClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    env.mock_all_auths();
+    client.init(&admin);
+
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "weather_api");
+
+    // Drop auth so the admin require_auth would fail if reached — but #2
+    // fires first because amount == 0 is checked before auth.
+    env.set_auths(&[]);
+    client.decrement_usage(&agent, &svc, &0u32);
+}
+
+#[test]
 fn test_settle_drains_usage_and_returns_billed() {
     let env = Env::default();
     let (client, admin) = setup_initialized(&env);
