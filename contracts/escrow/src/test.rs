@@ -2531,271 +2531,280 @@ fn test_compute_billing_independent_per_service() {
     assert_eq!(client.compute_billing(&agent, &svc2), 60);
 }
 
-// ── get_agent_services & get_agent_usage_page ────────────────────────────────
+// ── dispute-and-refund tests ─────────────────────────────────────────────────
+//
+// Covered scenarios:
+//   1. open_dispute sets the flag; has_open_dispute returns true.
+//   2. open_dispute blocks settle with DisputeOpen (#18).
+//   3. resolve_dispute (zero refund) clears the flag; settle unblocks.
+//   4. resolve_dispute with refund adjusts usage counter correctly.
+//   5. open_dispute on unused pair succeeds (no usage required).
+//   6. resolve_dispute with refund == usage sets usage to zero.
+//   7. resolve_dispute with zero refund leaves usage untouched.
+//   8. double open_dispute panics DisputeAlreadyOpen (#19).
+//   9. resolve_dispute on a non-open pair panics NoOpenDispute (#20).
+//  10. refund > usage panics RefundExceedsUsage (#21).
+//  11. resolve_dispute requires admin auth (non-admin panics).
+//  12. open_dispute emits the correct "open" event.
+//  13. resolve_dispute emits the correct "resolve" event.
+//  14. pause gate applies to both open_dispute and resolve_dispute.
 
-/// An agent with no usage returns an empty service index.
+/// open_dispute sets the flag and has_open_dispute reads it back as true.
 #[test]
-fn test_get_agent_services_empty_for_new_agent() {
+fn test_dispute_open_sets_flag() {
     let env = Env::default();
     let (client, _admin) = setup_initialized(&env);
     let agent = Address::generate(&env);
-    assert_eq!(client.get_agent_services(&agent).len(), 0);
+    let svc = Symbol::new(&env, "infer");
+
+    assert!(!client.has_open_dispute(&agent, &svc));
+    client.open_dispute(&agent, &svc);
+    assert!(client.has_open_dispute(&agent, &svc));
 }
 
-/// Recording usage for a new service grows the index by one entry.
+/// An open dispute blocks settle with DisputeOpen (#18).
 #[test]
-fn test_get_agent_services_grows_on_new_service() {
+#[should_panic(expected = "Error(Contract, #18)")]
+fn test_dispute_open_blocks_settle() {
     let env = Env::default();
-    let (client, _admin) = setup_initialized(&env);
+    let (client, admin) = setup_initialized(&env);
     let agent = Address::generate(&env);
-    let svc = Symbol::new(&env, "svc1");
-    client.record_usage(&agent, &svc, &1u32);
-    let svcs = client.get_agent_services(&agent);
-    assert_eq!(svcs.len(), 1);
-    assert_eq!(svcs.get(0), Some(svc));
-}
+    let svc = Symbol::new(&env, "infer");
 
-/// Recording usage for the same service multiple times does not create
-/// duplicate index entries.
-#[test]
-fn test_get_agent_services_no_duplicates_on_repeat_usage() {
-    let env = Env::default();
-    let (client, _admin) = setup_initialized(&env);
-    let agent = Address::generate(&env);
-    let svc = Symbol::new(&env, "svc1");
+    client.set_service_price(&svc, &10i128);
     client.record_usage(&agent, &svc, &5u32);
+    client.open_dispute(&agent, &svc);
+    // settle must be blocked while the dispute is open.
+    client.settle(&admin, &agent, &svc);
+}
+
+/// resolve_dispute with zero refund clears the flag so settle can proceed.
+#[test]
+fn test_dispute_resolve_zero_refund_unblocks_settle() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "infer");
+
+    client.set_service_price(&svc, &10i128);
+    client.record_usage(&agent, &svc, &5u32);
+    client.open_dispute(&agent, &svc);
+    assert!(client.has_open_dispute(&agent, &svc));
+
+    // Resolve with no refund.
+    client.resolve_dispute(&agent, &svc, &0u32);
+    assert!(!client.has_open_dispute(&agent, &svc));
+
+    // settle must now succeed.
+    let billed = client.settle(&admin, &agent, &svc);
+    assert_eq!(billed, 50i128);
+    assert_eq!(client.get_usage(&agent, &svc), 0);
+}
+
+/// resolve_dispute with a non-zero refund subtracts from the usage counter.
+#[test]
+fn test_dispute_resolve_with_refund_adjusts_usage() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "infer");
+
+    client.set_service_price(&svc, &10i128);
+    client.record_usage(&agent, &svc, &20u32);
+    assert_eq!(client.get_usage(&agent, &svc), 20);
+
+    client.open_dispute(&agent, &svc);
+    client.resolve_dispute(&agent, &svc, &8u32);
+
+    // Usage reduced by the refund amount.
+    assert_eq!(client.get_usage(&agent, &svc), 12);
+    assert!(!client.has_open_dispute(&agent, &svc));
+    // settle proceeds on the adjusted usage.
+    let billed = client.settle(&admin, &agent, &svc);
+    assert_eq!(billed, 120i128); // 12 × 10
+}
+
+/// open_dispute on a pair with no recorded usage (zero-usage pair) succeeds.
+#[test]
+fn test_dispute_open_on_unused_pair_succeeds() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "never_used");
+
+    // No record_usage ever called; open_dispute should still work.
+    client.open_dispute(&agent, &svc);
+    assert!(client.has_open_dispute(&agent, &svc));
+}
+
+/// resolve_dispute with refund_requests == current usage sets usage to zero.
+#[test]
+fn test_dispute_resolve_full_refund_drains_usage() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "infer");
+
+    client.record_usage(&agent, &svc, &15u32);
+    client.open_dispute(&agent, &svc);
+    // Refund all 15 requests.
+    client.resolve_dispute(&agent, &svc, &15u32);
+    assert_eq!(client.get_usage(&agent, &svc), 0);
+    assert!(!client.has_open_dispute(&agent, &svc));
+}
+
+/// resolve_dispute with zero refund leaves the usage counter untouched.
+#[test]
+fn test_dispute_resolve_zero_refund_leaves_usage_unchanged() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "infer");
+
     client.record_usage(&agent, &svc, &10u32);
-    client.record_usage(&agent, &svc, &3u32);
-    let svcs = client.get_agent_services(&agent);
-    assert_eq!(
-        svcs.len(),
-        1,
-        "repeat calls must not duplicate index entries"
-    );
+    client.open_dispute(&agent, &svc);
+    client.resolve_dispute(&agent, &svc, &0u32);
+    // Usage untouched by a zero-refund resolution.
+    assert_eq!(client.get_usage(&agent, &svc), 10);
 }
 
-/// Each distinct service is indexed exactly once.
+/// Calling open_dispute twice without resolving panics with
+/// DisputeAlreadyOpen (#19).
 #[test]
-fn test_get_agent_services_multiple_services() {
+#[should_panic(expected = "Error(Contract, #19)")]
+fn test_dispute_open_twice_panics() {
     let env = Env::default();
     let (client, _admin) = setup_initialized(&env);
     let agent = Address::generate(&env);
-    let a = Symbol::new(&env, "svc_a");
-    let b = Symbol::new(&env, "svc_b");
-    let c = Symbol::new(&env, "svc_c");
-    client.record_usage(&agent, &a, &1u32);
-    client.record_usage(&agent, &b, &2u32);
-    client.record_usage(&agent, &c, &3u32);
-    assert_eq!(client.get_agent_services(&agent).len(), 3);
+    let svc = Symbol::new(&env, "infer");
+
+    client.open_dispute(&agent, &svc);
+    client.open_dispute(&agent, &svc); // must panic
 }
 
-/// Service indices are per-agent: one agent's index must not bleed into
-/// another's.
+/// resolve_dispute on a pair with no open dispute panics with
+/// NoOpenDispute (#20).
 #[test]
-fn test_get_agent_services_isolated_per_agent() {
+#[should_panic(expected = "Error(Contract, #20)")]
+fn test_dispute_resolve_without_open_dispute_panics() {
     let env = Env::default();
     let (client, _admin) = setup_initialized(&env);
-    let agent_a = Address::generate(&env);
-    let agent_b = Address::generate(&env);
-    let svc = Symbol::new(&env, "shared");
-    client.record_usage(&agent_a, &svc, &1u32);
-    // agent_b has never called record_usage.
-    assert_eq!(client.get_agent_services(&agent_b).len(), 0);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "infer");
+
+    // No open_dispute call — resolve must panic.
+    client.resolve_dispute(&agent, &svc, &0u32);
 }
 
-/// After `settle` drains the usage counter the service is pruned from the
-/// index so `get_agent_services` no longer lists it.
+/// Refunding more than the accumulated usage panics with
+/// RefundExceedsUsage (#21).
 #[test]
-fn test_get_agent_services_pruned_after_settle() {
+#[should_panic(expected = "Error(Contract, #21)")]
+fn test_dispute_resolve_refund_exceeds_usage_panics() {
     let env = Env::default();
-    let (client, admin) = setup_initialized(&env);
+    let (client, _admin) = setup_initialized(&env);
     let agent = Address::generate(&env);
-    let svc = Symbol::new(&env, "svc1");
-    client.record_usage(&agent, &svc, &5u32);
-    assert_eq!(client.get_agent_services(&agent).len(), 1);
-
-    client.settle(&admin, &agent, &svc);
-
-    assert_eq!(
-        client.get_agent_services(&agent).len(),
-        0,
-        "settled service must be pruned from the index"
-    );
-}
-
-/// After settle the service can be re-added by recording new usage.
-#[test]
-fn test_get_agent_services_re_added_after_settle_and_new_usage() {
-    let env = Env::default();
-    let (client, admin) = setup_initialized(&env);
-    let agent = Address::generate(&env);
-    let svc = Symbol::new(&env, "svc1");
+    let svc = Symbol::new(&env, "infer");
 
     client.record_usage(&agent, &svc, &5u32);
-    client.settle(&admin, &agent, &svc);
-    assert_eq!(client.get_agent_services(&agent).len(), 0);
-
-    client.record_usage(&agent, &svc, &3u32);
-    let svcs = client.get_agent_services(&agent);
-    assert_eq!(svcs.len(), 1);
-    assert_eq!(svcs.get(0), Some(svc));
+    client.open_dispute(&agent, &svc);
+    // Attempt to refund 6 > 5 accumulated requests.
+    client.resolve_dispute(&agent, &svc, &6u32);
 }
 
-/// Only the settled service is pruned; others remain in the index.
+/// resolve_dispute is admin-only: a non-admin caller panics (Unauthorized).
 #[test]
-fn test_get_agent_services_only_settled_service_pruned() {
+#[should_panic]
+fn test_dispute_resolve_requires_admin_auth() {
     let env = Env::default();
-    let (client, admin) = setup_initialized(&env);
+    let contract_id = env.register_contract(None, Escrow);
+    let client = EscrowClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
     let agent = Address::generate(&env);
-    let svc_a = Symbol::new(&env, "svc_a");
-    let svc_b = Symbol::new(&env, "svc_b");
-    client.record_usage(&agent, &svc_a, &5u32);
-    client.record_usage(&agent, &svc_b, &7u32);
-
-    client.settle(&admin, &agent, &svc_a);
-
-    let svcs = client.get_agent_services(&agent);
-    assert_eq!(svcs.len(), 1);
-    assert_eq!(svcs.get(0), Some(svc_b));
-}
-
-/// `get_agent_usage_page` with start=0 and a large limit returns all entries.
-#[test]
-fn test_get_agent_usage_page_full_page() {
-    let env = Env::default();
-    let (client, _admin) = setup_initialized(&env);
-    let agent = Address::generate(&env);
-    let a = Symbol::new(&env, "svc_a");
-    let b = Symbol::new(&env, "svc_b");
-    client.record_usage(&agent, &a, &10u32);
-    client.record_usage(&agent, &b, &20u32);
-
-    let page = client.get_agent_usage_page(&agent, &0u32, &100u32);
-    assert_eq!(page.len(), 2);
-    let (s0, u0) = page.get(0).unwrap();
-    let (s1, u1) = page.get(1).unwrap();
-    assert_eq!(s0, a);
-    assert_eq!(u0, 10);
-    assert_eq!(s1, b);
-    assert_eq!(u1, 20);
-}
-
-/// `get_agent_usage_page` with start past the end returns empty.
-#[test]
-fn test_get_agent_usage_page_start_past_end_is_empty() {
-    let env = Env::default();
-    let (client, _admin) = setup_initialized(&env);
-    let agent = Address::generate(&env);
-    let svc = Symbol::new(&env, "svc1");
+    env.mock_all_auths();
+    client.init(&admin);
+    let svc = Symbol::new(&env, "infer");
     client.record_usage(&agent, &svc, &5u32);
+    client.open_dispute(&agent, &svc);
 
-    let page = client.get_agent_usage_page(&agent, &99u32, &10u32);
-    assert_eq!(page.len(), 0);
+    // Drop all mocked auths so the admin.require_auth() inside resolve_dispute
+    // is unsatisfied.
+    env.set_auths(&[]);
+    client.resolve_dispute(&agent, &svc, &0u32);
 }
 
-/// Pagination: limit=1 returns only the first service.
+/// open_dispute emits a `dispute` event with topic "open" and the pair.
 #[test]
-fn test_get_agent_usage_page_limit_one_returns_first() {
+fn test_dispute_open_emits_event() {
     let env = Env::default();
     let (client, _admin) = setup_initialized(&env);
     let agent = Address::generate(&env);
-    let a = Symbol::new(&env, "svc_a");
-    let b = Symbol::new(&env, "svc_b");
-    client.record_usage(&agent, &a, &3u32);
-    client.record_usage(&agent, &b, &7u32);
+    let svc = Symbol::new(&env, "infer");
 
-    let page = client.get_agent_usage_page(&agent, &0u32, &1u32);
-    assert_eq!(page.len(), 1);
-    let (s, u) = page.get(0).unwrap();
-    assert_eq!(s, a);
-    assert_eq!(u, 3);
+    client.open_dispute(&agent, &svc);
+
+    let events = env.events().all();
+    assert!(!events.is_empty());
+    let (_addr, topics, data) = events.last().unwrap();
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("dispute"),).into_val(&env);
+    assert_eq!(topics, expected_topics);
+    let decoded: (Symbol, Address, Symbol) = data.into_val(&env);
+    assert_eq!(decoded.0, symbol_short!("open"));
+    assert_eq!(decoded.1, agent);
+    assert_eq!(decoded.2, svc);
 }
 
-/// Pagination: start=1, limit=1 skips the first entry.
+/// resolve_dispute emits a `dispute` event with topic "resolve" and the
+/// refund amount.
 #[test]
-fn test_get_agent_usage_page_start_one_skips_first() {
+fn test_dispute_resolve_emits_event() {
     let env = Env::default();
     let (client, _admin) = setup_initialized(&env);
     let agent = Address::generate(&env);
-    let a = Symbol::new(&env, "svc_a");
-    let b = Symbol::new(&env, "svc_b");
-    client.record_usage(&agent, &a, &3u32);
-    client.record_usage(&agent, &b, &7u32);
+    let svc = Symbol::new(&env, "infer");
 
-    let page = client.get_agent_usage_page(&agent, &1u32, &1u32);
-    assert_eq!(page.len(), 1);
-    let (s, u) = page.get(0).unwrap();
-    assert_eq!(s, b);
-    assert_eq!(u, 7);
-}
-
-/// limit=0 is treated as MAX_BATCH_READ (returns all entries up to the cap).
-#[test]
-fn test_get_agent_usage_page_zero_limit_returns_all() {
-    let env = Env::default();
-    let (client, _admin) = setup_initialized(&env);
-    let agent = Address::generate(&env);
-    let a = Symbol::new(&env, "svc_a");
-    let b = Symbol::new(&env, "svc_b");
-    client.record_usage(&agent, &a, &1u32);
-    client.record_usage(&agent, &b, &2u32);
-
-    let page = client.get_agent_usage_page(&agent, &0u32, &0u32);
-    assert_eq!(page.len(), 2, "limit=0 must default to MAX_BATCH_READ");
-}
-
-/// limit larger than MAX_BATCH_READ is clamped to MAX_BATCH_READ.
-#[test]
-fn test_get_agent_usage_page_limit_clamped_to_max_batch_read() {
-    let env = Env::default();
-    let (client, _admin) = setup_initialized(&env);
-    let agent = Address::generate(&env);
-    let svc = Symbol::new(&env, "svc1");
-    client.record_usage(&agent, &svc, &5u32);
-
-    // limit >> MAX_BATCH_READ: result still bounded and returns 1 entry.
-    let page = client.get_agent_usage_page(&agent, &0u32, &99999u32);
-    assert_eq!(page.len(), 1);
-}
-
-/// get_agent_usage_page on a never-used agent returns empty.
-#[test]
-fn test_get_agent_usage_page_empty_for_new_agent() {
-    let env = Env::default();
-    let (client, _admin) = setup_initialized(&env);
-    let agent = Address::generate(&env);
-    assert_eq!(client.get_agent_usage_page(&agent, &0u32, &10u32).len(), 0);
-}
-
-/// get_agent_usage_page usage values reflect the current counter, not the
-/// value at the time of indexing.
-#[test]
-fn test_get_agent_usage_page_reflects_accumulated_usage() {
-    let env = Env::default();
-    let (client, _admin) = setup_initialized(&env);
-    let agent = Address::generate(&env);
-    let svc = Symbol::new(&env, "svc1");
-    client.record_usage(&agent, &svc, &5u32);
     client.record_usage(&agent, &svc, &10u32);
+    client.open_dispute(&agent, &svc);
+    client.resolve_dispute(&agent, &svc, &3u32);
 
-    let page = client.get_agent_usage_page(&agent, &0u32, &10u32);
-    assert_eq!(page.len(), 1);
-    let (_, usage) = page.get(0).unwrap();
-    assert_eq!(usage, 15, "page must reflect the accumulated total");
+    let events = env.events().all();
+    assert!(!events.is_empty());
+    let (_addr, topics, data) = events.last().unwrap();
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("dispute"),).into_val(&env);
+    assert_eq!(topics, expected_topics);
+    let decoded: (Symbol, Address, Symbol, u32) = data.into_val(&env);
+    assert_eq!(decoded.0, symbol_short!("resolve"));
+    assert_eq!(decoded.1, agent);
+    assert_eq!(decoded.2, svc);
+    assert_eq!(decoded.3, 3u32);
 }
 
-/// Index consistency: after settle, get_agent_usage_page no longer returns
-/// the settled service and its usage.
+/// The pause gate applies to open_dispute (#4).
 #[test]
-fn test_get_agent_usage_page_consistency_after_settle() {
+#[should_panic(expected = "Error(Contract, #4)")]
+fn test_dispute_open_rejected_while_paused() {
     let env = Env::default();
-    let (client, admin) = setup_initialized(&env);
+    let (client, _admin) = setup_initialized(&env);
     let agent = Address::generate(&env);
-    let svc = Symbol::new(&env, "svc1");
-    client.record_usage(&agent, &svc, &7u32);
+    let svc = Symbol::new(&env, "infer");
 
-    client.settle(&admin, &agent, &svc);
+    client.pause();
+    client.open_dispute(&agent, &svc);
+}
 
-    let page = client.get_agent_usage_page(&agent, &0u32, &10u32);
-    assert_eq!(page.len(), 0, "settled service must not appear in the page");
+/// The pause gate applies to resolve_dispute (#4).
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")]
+fn test_dispute_resolve_rejected_while_paused() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "infer");
+
+    client.record_usage(&agent, &svc, &5u32);
+    client.open_dispute(&agent, &svc);
+    client.pause();
+    client.resolve_dispute(&agent, &svc, &0u32);
 }

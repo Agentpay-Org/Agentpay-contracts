@@ -110,12 +110,11 @@ pub enum DataKey {
     /// Per-agent blocklist flag. When `true`, `record_usage` rejects the
     /// agent with `AgentBlocked`, taking precedence over the allowlist.
     AgentBlocked(Address),
-    /// Per-agent ordered index of service ids that have non-zero (or
-    /// historically non-zero) usage. Updated by `record_usage` when a new
-    /// service id is first seen for the agent, and pruned by `settle` when
-    /// the usage counter drops to zero after settlement. Capped at
-    /// `MAX_AGENT_SERVICE_INDEX` entries to bound storage growth.
-    AgentServiceIndex(Address),
+    /// Open dispute flag for a `(agent, service_id)` pair. When `true`,
+    /// `settle` is blocked for that pair until an admin resolves it via
+    /// `resolve_dispute`. Cleared on resolution; `false` (absent) means
+    /// no dispute is open.
+    Dispute(Address, Symbol),
 }
 
 /// Typed contract errors. Codes are append-only to keep client SDKs stable.
@@ -167,10 +166,20 @@ pub enum EscrowError {
     /// `record_usage` was called by/for an agent on the per-agent
     /// blocklist. Takes precedence over the allowlist.
     AgentBlocked = 17,
-    /// `settle_all` was called for an agent whose active-service index
-    /// exceeds `MAX_SETTLE_ALL`. The caller must drain services individually
-    /// via `settle` when this bound is hit.
-    SettleAllTooLarge = 18,
+    /// `settle` was called for an `(agent, service_id)` pair that has an
+    /// open dispute. The admin must resolve the dispute first via
+    /// `resolve_dispute` before settlement is permitted.
+    DisputeOpen = 18,
+    /// `open_dispute` was called for an `(agent, service_id)` pair that
+    /// already has an open dispute.
+    DisputeAlreadyOpen = 19,
+    /// `resolve_dispute` was called for an `(agent, service_id)` pair
+    /// with no open dispute.
+    NoOpenDispute = 20,
+    /// `resolve_dispute` was called with a `refund_requests` value that
+    /// exceeds the accumulated usage for the pair — cannot refund more
+    /// than was recorded.
+    RefundExceedsUsage = 21,
 }
 
 #[contracttype]
@@ -786,6 +795,13 @@ impl Escrow {
                 panic_with_error!(&env, EscrowError::NotPendingAdmin);
             }
         }
+        // Block settlement while a dispute is open for this pair.
+        if read_flag(
+            &env,
+            &DataKey::Dispute(agent.clone(), service_id.clone()),
+        ) {
+            panic_with_error!(&env, EscrowError::DisputeOpen);
+        }
         let usage_key = DataKey::Usage(agent.clone(), service_id.clone());
         let requests: u32 = env.storage().persistent().get(&usage_key).unwrap_or(0);
         let price: i128 = env
@@ -1326,96 +1342,94 @@ impl Escrow {
         2
     }
 
-    // -------------------------------------------------------------------------
-    // Guarded admin renounce — two-step irreversible finalisation
-    //
-    // **WARNING: renouncing admin is IRREVERSIBLE.** Once `confirm_renounce`
-    // executes, the `DataKey::Admin` slot is permanently removed. All
-    // admin-gated entrypoints will subsequently panic with
-    // `EscrowError::NotInitialized (#3)`. No further price changes,
-    // registrations, pauses, or any other privileged operation can ever be
-    // performed on this contract instance. Any pending `PendingAdmin` entry
-    // is also cleared on confirmation.
-    //
-    // **Recommendation:** ensure the contract is in a known, safe state
-    // (e.g. unpaused, all settlements complete) before renouncing.
-    //
-    // The two-step sequence prevents accidental renounce via a single
-    // fat-fingered call:
-    //   1. `propose_renounce()`  — sets `DataKey::RenouncePending = true`.
-    //   2. `confirm_renounce()` — requires the flag to be set, then removes
-    //      `DataKey::Admin` and `DataKey::PendingAdmin`, and emits `admin_rnc`.
-    //   `cancel_renounce()`    — clears the flag at any point before step 2,
-    //      mirroring `cancel_admin_transfer`.
-    // -------------------------------------------------------------------------
-
-    /// Step 1 of the guarded admin renounce.
+    /// Open a dispute for an `(agent, service_id)` pair.
     ///
-    /// Sets `DataKey::RenouncePending = true`. The current admin must call
-    /// `confirm_renounce` from the same key to finalise. Admin-gated.
+    /// Any caller may contest a charge by flagging the pair; the agent
+    /// does not need admin rights to initiate a dispute. Panics with
+    /// [`EscrowError::DisputeAlreadyOpen`] when a dispute is already open
+    /// for this pair — callers should check [`Escrow::has_open_dispute`]
+    /// first to avoid a wasted call. Honours the pause gate and emits a
+    /// `dispute` event with `("open", agent, service_id)`.
     ///
-    /// **WARNING: this begins an irreversible process. Call `cancel_renounce`
-    /// before `confirm_renounce` if you change your mind.**
-    pub fn propose_renounce(env: Env) {
-        let admin: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Admin)
-            .unwrap_or_else(|| panic_with_error!(&env, EscrowError::NotInitialized));
-        admin.require_auth();
-        write_flag(&env, &DataKey::RenouncePending, true);
-    }
-
-    /// Step 2 of the guarded admin renounce (IRREVERSIBLE).
-    ///
-    /// Requires `propose_renounce` to have been called first; panics with
-    /// [`EscrowError::NoRenouncePending`] (#18) otherwise. On success:
-    /// - removes `DataKey::Admin` (all admin-gated calls will panic #3 from now on),
-    /// - removes `DataKey::PendingAdmin` (clears any in-flight handover),
-    /// - removes `DataKey::RenouncePending`,
-    /// - emits `admin_rnc` for on-chain auditability.
-    ///
-    /// **WARNING: this action is IRREVERSIBLE. The contract cannot be
-    /// administered again after this call.**
-    pub fn confirm_renounce(env: Env) {
-        let admin: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Admin)
-            .unwrap_or_else(|| panic_with_error!(&env, EscrowError::NotInitialized));
-        admin.require_auth();
-        if !read_flag(&env, &DataKey::RenouncePending) {
-            panic_with_error!(&env, EscrowError::NoRenouncePending);
+    /// Dispute lifecycle:
+    /// 1. `open_dispute` — agent/caller flags the pair; `settle` is blocked.
+    /// 2. `resolve_dispute` (admin only) — admin subtracts contested usage
+    ///    (or zero for no refund) and clears the flag; `settle` unblocks.
+    pub fn open_dispute(env: Env, agent: Address, service_id: Symbol) {
+        ensure_not_paused(&env);
+        agent.require_auth();
+        let key = DataKey::Dispute(agent.clone(), service_id.clone());
+        if read_flag(&env, &key) {
+            panic_with_error!(&env, EscrowError::DisputeAlreadyOpen);
         }
-        // Irreversibly remove the admin key.
-        env.storage().persistent().remove(&DataKey::Admin);
-        // Clear any in-flight admin transfer so it cannot be completed later.
-        env.storage().persistent().remove(&DataKey::PendingAdmin);
-        // Clear the pending flag (slot no longer needed).
-        env.storage().persistent().remove(&DataKey::RenouncePending);
-        // Emit an auditable on-chain event signalling finalisation.
-        env.events()
-            .publish((symbol_short!("admin_rnc"),), admin);
+        write_flag(&env, &key, true);
+        env.events().publish(
+            (symbol_short!("dispute"),),
+            (symbol_short!("open"), agent, service_id),
+        );
     }
 
-    /// Cancel a pending renounce. Current admin only. No-op when nothing is pending.
+    /// Returns `true` iff there is currently an open dispute for the
+    /// given `(agent, service_id)` pair. Pure read — no auth, no pause gate.
+    pub fn has_open_dispute(env: Env, agent: Address, service_id: Symbol) -> bool {
+        read_flag(&env, &DataKey::Dispute(agent, service_id))
+    }
+
+    /// Admin-only: resolve a dispute for an `(agent, service_id)` pair.
     ///
-    /// Mirrors `cancel_admin_transfer`. Safe to call even when
-    /// `DataKey::RenouncePending` is not set.
-    pub fn cancel_renounce(env: Env) {
+    /// Subtracts `refund_requests` from the accumulated usage counter
+    /// (clamping at zero), then clears the dispute flag so `settle` can
+    /// proceed. Panics with:
+    /// - [`EscrowError::NoOpenDispute`] when no dispute is open for the pair.
+    /// - [`EscrowError::RefundExceedsUsage`] when `refund_requests` exceeds
+    ///   the current usage (prevents double-refunds and negative counters).
+    ///
+    /// Pass `refund_requests = 0` to acknowledge and dismiss the dispute
+    /// without adjusting usage. Honours the pause gate and emits a
+    /// `dispute` event with `("resolve", agent, service_id, refund_requests)`.
+    ///
+    /// Security notes:
+    /// - Admin-gated: agents cannot self-resolve (`admin.require_auth()`).
+    /// - No double-refund: `RefundExceedsUsage` enforces `refund <= usage`.
+    /// - Dispute must be open: `NoOpenDispute` prevents spurious calls.
+    pub fn resolve_dispute(
+        env: Env,
+        agent: Address,
+        service_id: Symbol,
+        refund_requests: u32,
+    ) {
+        ensure_not_paused(&env);
         let admin: Address = env
             .storage()
             .persistent()
             .get(&DataKey::Admin)
             .unwrap_or_else(|| panic_with_error!(&env, EscrowError::NotInitialized));
         admin.require_auth();
-        env.storage().persistent().remove(&DataKey::RenouncePending);
-    }
-
-    /// Returns `true` iff a renounce is currently pending (i.e. `propose_renounce`
-    /// has been called but `confirm_renounce` / `cancel_renounce` has not yet run).
-    pub fn is_renounce_pending(env: Env) -> bool {
-        read_flag(&env, &DataKey::RenouncePending)
+        let dispute_key = DataKey::Dispute(agent.clone(), service_id.clone());
+        if !read_flag(&env, &dispute_key) {
+            panic_with_error!(&env, EscrowError::NoOpenDispute);
+        }
+        if refund_requests > 0 {
+            let usage_key = DataKey::Usage(agent.clone(), service_id.clone());
+            let current: u32 = env.storage().persistent().get(&usage_key).unwrap_or(0);
+            if refund_requests > current {
+                panic_with_error!(&env, EscrowError::RefundExceedsUsage);
+            }
+            env.storage()
+                .persistent()
+                .set(&usage_key, &(current - refund_requests));
+        }
+        // Clear the dispute flag so settle can proceed.
+        write_flag(&env, &dispute_key, false);
+        env.events().publish(
+            (symbol_short!("dispute"),),
+            (
+                symbol_short!("resolve"),
+                agent,
+                service_id,
+                refund_requests,
+            ),
+        );
     }
 }
 
