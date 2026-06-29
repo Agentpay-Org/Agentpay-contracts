@@ -257,26 +257,28 @@ impl Escrow {
         // ---- Validation chain (order is part of the public contract) ----
         //
         // Errors MUST fire in this fixed precedence so that client SDKs and
-        // off-chain settlement loops can rely on a stable failure ordering:
+        // off-chain settlement loops can rely on a stable failure ordering.
+        // See docs/escrow/validation-order.md for the authoritative reference
+        // table with rationale, conditional-read notes, and stability guarantees.
         //
-        //   1. Paused            -> #4  ContractPaused
-        //   2. requests == 0     -> #2  RequestsMustBePositive
-        //   3. requests > max    -> #8  RequestsExceedsMaxPerCall
-        //   4. requests < min    -> #9  RequestsBelowMinPerCall
-        //   5. registration      -> #7  ServiceNotRegistered
-        //   6. disabled          -> #12 ServiceDisabled
-        //   7. allowlist         -> #10 AgentNotAllowed
+        //   1. Paused            -> #4  ContractPaused          (unconditional)
+        //   2. requests == 0     -> #2  RequestsMustBePositive  (unconditional)
+        //   3. requests > max    -> #8  RequestsExceedsMaxPerCall (unconditional; default u32::MAX)
+        //   4. requests < min    -> #9  RequestsBelowMinPerCall  (unconditional; default 0)
+        //   5. registration      -> #7  ServiceNotRegistered     (conditional: RequireServiceRegistration)
+        //   6. disabled          -> #12 ServiceDisabled          (unconditional)
+        //   7. blocklist         -> #17 AgentBlocked             (unconditional; overrides allowlist)
+        //   8. allowlist         -> #10 AgentNotAllowed          (conditional: AllowlistEnabled)
+        //   9. rate limit        -> #15 RateLimitExceeded        (conditional: MaxRequestsPerWindow > 0 && WindowSeconds > 0)
         //
-        // Read-count note (before/after): the storage reads performed here are
-        // unchanged in the worst case, but several are *conditionally gated* so
-        // they never execute when their controlling flag is off:
-        //   - ServiceRegistered is only read when RequireServiceRegistration is
-        //     true (short-circuited via `&&`).
-        //   - AgentAllowed is only read when AllowlistEnabled is true (ditto).
-        // The Paused flag, the max/min caps, and ServiceDisabled are always
-        // read (unconditional gates). Each key is read at most once: the
-        // max/min caps are cached in locals below, and the usage counter (read
-        // further down) is read exactly once. No value is read twice.
+        // Conditional-read notes: keys are only read when their controlling
+        // flag is active (short-circuited via `&&`):
+        //   - ServiceRegistered  only when RequireServiceRegistration is true.
+        //   - AgentAllowed       only when AllowlistEnabled is true.
+        //   - RateWindow         only when MaxRequestsPerWindow > 0 && WindowSeconds > 0.
+        // Unconditionally read every call: Paused, MaxRequestsPerCall,
+        // MinRequestsPerCall, ServiceDisabled, AgentBlocked. Each key is read
+        // at most once; the max/min caps are cached in locals below.
         // -------------------------------------------------------------------
         if read_flag(&env, &DataKey::Paused) {
             panic_with_error!(&env, EscrowError::ContractPaused);
