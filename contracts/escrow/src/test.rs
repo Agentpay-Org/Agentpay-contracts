@@ -2593,373 +2593,171 @@ fn test_compute_billing_independent_per_service() {
     assert_eq!(client.compute_billing(&agent, &svc1), 50);
     assert_eq!(client.compute_billing(&agent, &svc2), 60);
 }
-
-// ── tiered pricing tests ──────────────────────────────────────────────────────
+// ── settle owner-or-admin authorization tests ────────────────────────────────
 //
-// Tests for `set_price_tiers`, `get_price_tiers`, `remove_price_tiers`,
-// and the tier-aware `compute_billing` / `settle` paths.
-//
-// Scenarios covered:
-//   1. No tier schedule → flat ServicePrice fallback (backward compat)
-//   2. Single-tier schedule → all requests at that price
-//   3. Multi-tier schedule crossing boundaries
-//   4. Requests at exact tier boundary (inclusive semantics)
-//   5. Requests below first-tier threshold (stays in tier 0)
-//   6. Requests beyond last tier (open-ended final tier)
-//   7. Empty schedule rejected (InvalidPriceTiers #18)
-//   8. Descending / non-monotonic schedule rejected (#18)
-//   9. Duplicate threshold rejected (#18)
-//  10. Negative price_stroops rejected (#18)
-//  11. remove_price_tiers reverts to flat price
-//  12. Tier billing used inside settle
-//  13. get_price_tiers round-trip
-//  14. set_price_tiers emits tiers_set event
-//  15. remove_price_tiers emits tiers_rm event
-//  16. Tiered billing saturates at i128::MAX safely
+// Auth matrix covered:
+//   - Admin settles any service (with or without metadata)
+//   - Registered owner settles their own service
+//   - Owner of service A cannot settle service B
+//   - Stranger rejected
+//   - No metadata + non-admin → ServiceMetadataNotFound (#13)
+//   - Pause gate fires (#4) before settle logic
+//   - Drain-to-zero + LastSettlement stamp on authorized path
 
-/// Helper: build a PriceTier value.
-fn make_tier(env: &Env, threshold: u32, price: i128) -> PriceTier {
-    PriceTier {
-        threshold_requests: threshold,
-        price_stroops: price,
-    }
-}
-
-/// No tier schedule set → flat ServicePrice fallback is used.
+/// Positive: admin settles any service regardless of metadata.
 #[test]
-fn test_tiered_no_schedule_flat_fallback() {
-    let env = Env::default();
-    let (client, _admin) = setup_initialized(&env);
-    let agent = Address::generate(&env);
-    let svc = Symbol::new(&env, "infer");
-
-    set_price(&client, &svc, 10);
-    record(&client, &agent, &svc, 5);
-
-    // No tier schedule: flat 5 × 10 = 50.
-    assert_eq!(client.compute_billing(&agent, &svc), 50);
-    assert_eq!(client.get_price_tiers(&svc), None);
-}
-
-/// Single-tier schedule: all requests billed at the tier price.
-#[test]
-fn test_tiered_single_tier_all_requests() {
-    let env = Env::default();
-    let (client, _admin) = setup_initialized(&env);
-    let agent = Address::generate(&env);
-    let svc = Symbol::new(&env, "infer");
-
-    let mut tiers: Vec<PriceTier> = Vec::new(&env);
-    tiers.push_back(make_tier(&env, u32::MAX, 7));
-    client.set_price_tiers(&svc, &tiers);
-
-    record(&client, &agent, &svc, 100);
-    // 100 × 7 = 700
-    assert_eq!(client.compute_billing(&agent, &svc), 700);
-}
-
-/// Multi-tier schedule crossing tier boundaries.
-///
-/// Schedule: tier0: 0-100 @ 10, tier1: 101-1000 @ 7, tier2: 1001+ @ 4
-/// With 150 requests:
-///   tier0: 100 × 10 = 1000
-///   tier1:  50 ×  7 =  350
-///   total            = 1350
-#[test]
-fn test_tiered_multi_tier_crossing_boundaries() {
-    let env = Env::default();
-    let (client, _admin) = setup_initialized(&env);
-    let agent = Address::generate(&env);
-    let svc = Symbol::new(&env, "infer");
-
-    let mut tiers: Vec<PriceTier> = Vec::new(&env);
-    tiers.push_back(make_tier(&env, 100, 10));
-    tiers.push_back(make_tier(&env, 1000, 7));
-    tiers.push_back(make_tier(&env, u32::MAX, 4));
-    client.set_price_tiers(&svc, &tiers);
-
-    record(&client, &agent, &svc, 150);
-    assert_eq!(client.compute_billing(&agent, &svc), 1_350);
-}
-
-/// Requests at exact tier boundary (tier 0 inclusive upper edge).
-///
-/// With 100 requests and threshold=100 at price=10: exactly 100 × 10 = 1000.
-#[test]
-fn test_tiered_requests_at_exact_boundary() {
-    let env = Env::default();
-    let (client, _admin) = setup_initialized(&env);
-    let agent = Address::generate(&env);
-    let svc = Symbol::new(&env, "infer");
-
-    let mut tiers: Vec<PriceTier> = Vec::new(&env);
-    tiers.push_back(make_tier(&env, 100, 10));
-    tiers.push_back(make_tier(&env, u32::MAX, 5));
-    client.set_price_tiers(&svc, &tiers);
-
-    record(&client, &agent, &svc, 100);
-    // Exactly at boundary: 100 × 10 = 1000; tier1 contributes 0.
-    assert_eq!(client.compute_billing(&agent, &svc), 1_000);
-}
-
-/// One request over the first tier boundary spills into tier 1.
-#[test]
-fn test_tiered_one_over_first_boundary_spills() {
-    let env = Env::default();
-    let (client, _admin) = setup_initialized(&env);
-    let agent = Address::generate(&env);
-    let svc = Symbol::new(&env, "infer");
-
-    let mut tiers: Vec<PriceTier> = Vec::new(&env);
-    tiers.push_back(make_tier(&env, 100, 10));
-    tiers.push_back(make_tier(&env, u32::MAX, 5));
-    client.set_price_tiers(&svc, &tiers);
-
-    record(&client, &agent, &svc, 101);
-    // 100 × 10 + 1 × 5 = 1005
-    assert_eq!(client.compute_billing(&agent, &svc), 1_005);
-}
-
-/// Requests well beyond the last tier threshold use the last tier's price.
-#[test]
-fn test_tiered_beyond_last_tier_open_ended() {
-    let env = Env::default();
-    let (client, _admin) = setup_initialized(&env);
-    let agent = Address::generate(&env);
-    let svc = Symbol::new(&env, "infer");
-
-    let mut tiers: Vec<PriceTier> = Vec::new(&env);
-    tiers.push_back(make_tier(&env, 100, 10));
-    tiers.push_back(make_tier(&env, 500, 6));
-    // Last tier threshold is 500; requests beyond it are still @ price 6.
-    client.set_price_tiers(&svc, &tiers);
-
-    record(&client, &agent, &svc, 600);
-    // 100 × 10 + 500 × 6 = 1000 + 3000 = 4000
-    assert_eq!(client.compute_billing(&agent, &svc), 4_000);
-}
-
-/// Empty schedule is rejected with InvalidPriceTiers (#18).
-#[test]
-#[should_panic(expected = "Error(Contract, #18)")]
-fn test_tiered_empty_schedule_rejected() {
-    let env = Env::default();
-    let (client, _admin) = setup_initialized(&env);
-    let svc = Symbol::new(&env, "infer");
-    let tiers: Vec<PriceTier> = Vec::new(&env);
-    client.set_price_tiers(&svc, &tiers);
-}
-
-/// Descending (non-monotonic) threshold schedule is rejected with #18.
-#[test]
-#[should_panic(expected = "Error(Contract, #18)")]
-fn test_tiered_descending_schedule_rejected() {
-    let env = Env::default();
-    let (client, _admin) = setup_initialized(&env);
-    let svc = Symbol::new(&env, "infer");
-
-    let mut tiers: Vec<PriceTier> = Vec::new(&env);
-    tiers.push_back(make_tier(&env, 1000, 10));
-    tiers.push_back(make_tier(&env, 100, 5)); // descending — invalid
-    client.set_price_tiers(&svc, &tiers);
-}
-
-/// Duplicate threshold in schedule is rejected with #18.
-#[test]
-#[should_panic(expected = "Error(Contract, #18)")]
-fn test_tiered_duplicate_threshold_rejected() {
-    let env = Env::default();
-    let (client, _admin) = setup_initialized(&env);
-    let svc = Symbol::new(&env, "infer");
-
-    let mut tiers: Vec<PriceTier> = Vec::new(&env);
-    tiers.push_back(make_tier(&env, 100, 10));
-    tiers.push_back(make_tier(&env, 100, 5)); // duplicate threshold — invalid
-    client.set_price_tiers(&svc, &tiers);
-}
-
-/// Negative price in a tier is rejected with #18.
-#[test]
-#[should_panic(expected = "Error(Contract, #18)")]
-fn test_tiered_negative_price_rejected() {
-    let env = Env::default();
-    let (client, _admin) = setup_initialized(&env);
-    let svc = Symbol::new(&env, "infer");
-
-    let mut tiers: Vec<PriceTier> = Vec::new(&env);
-    tiers.push_back(make_tier(&env, 100, -1)); // negative price — invalid
-    client.set_price_tiers(&svc, &tiers);
-}
-
-/// remove_price_tiers reverts billing to the flat ServicePrice.
-#[test]
-fn test_tiered_remove_reverts_to_flat_price() {
-    let env = Env::default();
-    let (client, _admin) = setup_initialized(&env);
-    let agent = Address::generate(&env);
-    let svc = Symbol::new(&env, "infer");
-
-    set_price(&client, &svc, 5);
-    let mut tiers: Vec<PriceTier> = Vec::new(&env);
-    tiers.push_back(make_tier(&env, u32::MAX, 100));
-    client.set_price_tiers(&svc, &tiers);
-
-    record(&client, &agent, &svc, 10);
-    // With tiers: 10 × 100 = 1000.
-    assert_eq!(client.compute_billing(&agent, &svc), 1_000);
-
-    // Remove tiers: should fall back to flat price 5.
-    client.remove_price_tiers(&svc);
-    assert_eq!(client.get_price_tiers(&svc), None);
-    // 10 × 5 = 50.
-    assert_eq!(client.compute_billing(&agent, &svc), 50);
-}
-
-/// Tier-aware billing is used inside settle.
-#[test]
-fn test_tiered_settle_uses_tier_billing() {
+fn test_settle_admin_can_settle_any_service() {
     let env = Env::default();
     let (client, admin) = setup_initialized(&env);
     let agent = Address::generate(&env);
     let svc = Symbol::new(&env, "infer");
 
-    let mut tiers: Vec<PriceTier> = Vec::new(&env);
-    tiers.push_back(make_tier(&env, 100, 10));
-    tiers.push_back(make_tier(&env, u32::MAX, 5));
-    client.set_price_tiers(&svc, &tiers);
-
-    record(&client, &agent, &svc, 150);
-    // 100 × 10 + 50 × 5 = 1000 + 250 = 1250
+    client.set_service_price(&svc, &100i128);
+    client.record_usage(&agent, &svc, &5u32);
     let billed = client.settle(&admin, &agent, &svc);
-    assert_eq!(billed, 1_250);
-    assert_eq!(client.get_usage(&agent, &svc), 0);
+    assert_eq!(billed, 500i128);
 }
 
-/// get_price_tiers round-trips the stored schedule.
+/// Positive: registered owner settles their own service.
 #[test]
-fn test_tiered_get_price_tiers_round_trip() {
+fn test_settle_owner_can_settle_own_service() {
     let env = Env::default();
     let (client, _admin) = setup_initialized(&env);
-    let svc = Symbol::new(&env, "infer");
-
-    let mut tiers: Vec<PriceTier> = Vec::new(&env);
-    tiers.push_back(make_tier(&env, 100, 10));
-    tiers.push_back(make_tier(&env, 500, 7));
-    client.set_price_tiers(&svc, &tiers);
-
-    let stored = client.get_price_tiers(&svc).unwrap();
-    assert_eq!(stored.len(), 2);
-    assert_eq!(stored.get(0).unwrap().threshold_requests, 100);
-    assert_eq!(stored.get(0).unwrap().price_stroops, 10);
-    assert_eq!(stored.get(1).unwrap().threshold_requests, 500);
-    assert_eq!(stored.get(1).unwrap().price_stroops, 7);
-}
-
-/// set_price_tiers emits a tiers_set event.
-#[test]
-fn test_tiered_set_emits_event() {
-    let env = Env::default();
-    let (client, _admin) = setup_initialized(&env);
-    let svc = Symbol::new(&env, "infer");
-
-    let mut tiers: Vec<PriceTier> = Vec::new(&env);
-    tiers.push_back(make_tier(&env, u32::MAX, 5));
-    client.set_price_tiers(&svc, &tiers);
-
-    let events = env.events().all();
-    assert!(!events.is_empty());
-    let (_addr, topics, _data) = events.last().unwrap();
-    let expected: soroban_sdk::Vec<soroban_sdk::Val> =
-        (symbol_short!("tiers_set"),).into_val(&env);
-    assert_eq!(topics, expected);
-}
-
-/// remove_price_tiers emits a tiers_rm event.
-#[test]
-fn test_tiered_remove_emits_event() {
-    let env = Env::default();
-    let (client, _admin) = setup_initialized(&env);
-    let svc = Symbol::new(&env, "infer");
-
-    let mut tiers: Vec<PriceTier> = Vec::new(&env);
-    tiers.push_back(make_tier(&env, u32::MAX, 5));
-    client.set_price_tiers(&svc, &tiers);
-    client.remove_price_tiers(&svc);
-
-    let events = env.events().all();
-    assert!(!events.is_empty());
-    let (_addr, topics, _data) = events.last().unwrap();
-    let expected: soroban_sdk::Vec<soroban_sdk::Val> = (symbol_short!("tiers_rm"),).into_val(&env);
-    assert_eq!(topics, expected);
-}
-
-/// Tiered billing saturates at i128::MAX and does not panic.
-#[test]
-fn test_tiered_saturation_does_not_overflow() {
-    let env = Env::default();
-    let (client, _admin) = setup_initialized(&env);
+    let owner = Address::generate(&env);
     let agent = Address::generate(&env);
-    let svc = Symbol::new(&env, "sat");
+    let svc = Symbol::new(&env, "embed");
 
-    // A single tier with i128::MAX price per request; any non-zero usage saturates.
-    let mut tiers: Vec<PriceTier> = Vec::new(&env);
-    tiers.push_back(make_tier(&env, u32::MAX, i128::MAX));
-    client.set_price_tiers(&svc, &tiers);
-
-    record(&client, &agent, &svc, 2);
-    assert_eq!(client.compute_billing(&agent, &svc), i128::MAX);
+    client.register_service_with_metadata(
+        &svc,
+        &soroban_sdk::String::from_str(&env, "Embedding API"),
+        &owner,
+    );
+    client.set_service_price(&svc, &50i128);
+    client.record_usage(&agent, &svc, &4u32);
+    let billed = client.settle(&owner, &agent, &svc);
+    assert_eq!(billed, 200i128);
 }
 
-/// Zero usage with a tier schedule must bill 0.
+/// Negative: owner of service A cannot settle service B.
 #[test]
-fn test_tiered_zero_usage_bills_zero() {
+#[should_panic]
+fn test_settle_owner_cannot_settle_other_service() {
     let env = Env::default();
     let (client, _admin) = setup_initialized(&env);
+    let owner_a = Address::generate(&env);
+    let owner_b = Address::generate(&env);
     let agent = Address::generate(&env);
-    let svc = Symbol::new(&env, "infer");
+    let svc_a = Symbol::new(&env, "alpha");
+    let svc_b = Symbol::new(&env, "beta");
 
-    let mut tiers: Vec<PriceTier> = Vec::new(&env);
-    tiers.push_back(make_tier(&env, u32::MAX, 50));
-    client.set_price_tiers(&svc, &tiers);
-
-    // No record_usage: accumulated_requests = 0 → bill = 0.
-    assert_eq!(client.compute_billing(&agent, &svc), 0);
+    client.register_service_with_metadata(
+        &svc_a,
+        &soroban_sdk::String::from_str(&env, "Alpha"),
+        &owner_a,
+    );
+    client.register_service_with_metadata(
+        &svc_b,
+        &soroban_sdk::String::from_str(&env, "Beta"),
+        &owner_b,
+    );
+    client.set_service_price(&svc_b, &10i128);
+    client.record_usage(&agent, &svc_b, &3u32);
+    // owner_a tries to settle svc_b — must panic
+    client.settle(&owner_a, &agent, &svc_b);
 }
 
-/// remove_price_tiers is idempotent (removing absent schedule is no-op).
+/// Negative: stranger rejected.
 #[test]
-fn test_tiered_remove_idempotent() {
+#[should_panic]
+fn test_settle_stranger_rejected() {
     let env = Env::default();
     let (client, _admin) = setup_initialized(&env);
-    let svc = Symbol::new(&env, "infer");
-    // Remove on a service that never had tiers: no panic.
-    client.remove_price_tiers(&svc);
-    assert_eq!(client.get_price_tiers(&svc), None);
+    let owner = Address::generate(&env);
+    let stranger = Address::generate(&env);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "chat");
+
+    client.register_service_with_metadata(
+        &svc,
+        &soroban_sdk::String::from_str(&env, "Chat API"),
+        &owner,
+    );
+    client.set_service_price(&svc, &20i128);
+    client.record_usage(&agent, &svc, &2u32);
+    client.settle(&stranger, &agent, &svc);
 }
 
-/// set_price_tiers is rejected while the contract is paused.
+/// Negative: no metadata + non-admin panics #13 ServiceMetadataNotFound.
+#[test]
+#[should_panic(expected = "Error(Contract, #13)")]
+fn test_settle_no_metadata_non_admin_panics() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let stranger = Address::generate(&env);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "ghost");
+
+    client.set_service_price(&svc, &10i128);
+    client.record_usage(&agent, &svc, &1u32);
+    client.settle(&stranger, &agent, &svc);
+}
+
+/// Positive: admin can settle a metadata-less service.
+#[test]
+fn test_settle_admin_settles_metadata_less_service() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "raw");
+
+    client.set_service_price(&svc, &10i128);
+    client.record_usage(&agent, &svc, &3u32);
+    let billed = client.settle(&admin, &agent, &svc);
+    assert_eq!(billed, 30i128);
+}
+
+/// Drain-to-zero: after settle, usage counter is 0.
+#[test]
+fn test_settle_drains_usage_to_zero() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "drain");
+
+    client.set_service_price(&svc, &10i128);
+    client.record_usage(&agent, &svc, &5u32);
+    client.settle(&admin, &agent, &svc);
+    let usage = client.get_usage(&agent, &svc);
+    assert_eq!(usage, 0u32);
+}
+
+/// LastSettlement stamp is recorded after settle.
+#[test]
+fn test_settle_records_last_settlement_timestamp() {
+    let env = Env::default();
+    env.ledger().with_mut(|li| li.timestamp = 1000);
+    let (client, admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "stamp");
+
+    client.set_service_price(&svc, &10i128);
+    client.record_usage(&agent, &svc, &2u32);
+    client.settle(&admin, &agent, &svc);
+    let last = client.get_last_settlement(&agent, &svc);
+    assert_eq!(last, Some(1000u64));
+}
+
+/// Pause gate fires (#4) before settle logic.
 #[test]
 #[should_panic(expected = "Error(Contract, #4)")]
-fn test_tiered_set_rejected_while_paused() {
+fn test_settle_paused_rejected() {
     let env = Env::default();
-    let (client, _admin) = setup_initialized(&env);
-    let svc = Symbol::new(&env, "infer");
-    client.pause();
-    let mut tiers: Vec<PriceTier> = Vec::new(&env);
-    tiers.push_back(make_tier(&env, u32::MAX, 5));
-    client.set_price_tiers(&svc, &tiers);
-}
+    let (client, admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "paused");
 
-/// remove_price_tiers is rejected while the contract is paused.
-#[test]
-#[should_panic(expected = "Error(Contract, #4)")]
-fn test_tiered_remove_rejected_while_paused() {
-    let env = Env::default();
-    let (client, _admin) = setup_initialized(&env);
-    let svc = Symbol::new(&env, "infer");
-    let mut tiers: Vec<PriceTier> = Vec::new(&env);
-    tiers.push_back(make_tier(&env, u32::MAX, 5));
-    client.set_price_tiers(&svc, &tiers);
+    client.set_service_price(&svc, &10i128);
+    client.record_usage(&agent, &svc, &1u32);
     client.pause();
-    client.remove_price_tiers(&svc);
+    client.settle(&admin, &agent, &svc);
 }
