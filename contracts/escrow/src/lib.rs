@@ -129,6 +129,12 @@ pub enum DataKey {
     /// Per-agent blocklist flag. When `true`, `record_usage` rejects the
     /// agent with `AgentBlocked`, taking precedence over the allowlist.
     AgentBlocked(Address),
+    /// Admin-configurable threshold for the usage-alert event. When non-zero,
+    /// `record_usage` emits a `usage_hi(agent, service_id, total)` event the
+    /// first time the per-pair counter crosses this level (edge-triggered: fires
+    /// once per settlement window, re-arms after the counter drops below the
+    /// threshold via `settle`). `0` (the default) disables the feature entirely.
+    UsageAlertThreshold,
 }
 
 /// Typed contract errors. Codes are append-only to keep client SDKs stable.
@@ -442,6 +448,33 @@ impl Escrow {
             (symbol_short!("usage"),),
             (agent.clone(), service_id.clone(), requests, total),
         );
+
+        // Usage-alert threshold: emit `usage_hi` on the crossing edge only.
+        //
+        // Edge-trigger semantics:
+        // - Fires exactly once per settlement window, on the call where the
+        //   per-pair total crosses from below-threshold to at/above-threshold.
+        // - Does NOT fire on subsequent calls while already above the threshold,
+        //   preventing event spam regardless of how many requests accumulate.
+        // - Re-arms automatically after `settle` (or `reset_usage`) drains the
+        //   counter below the threshold, allowing the next crossing to fire again.
+        // - When the threshold is 0 (the default) the block is skipped entirely;
+        //   the feature is disabled by default and adds no overhead in that case.
+        //
+        // Security note: the event payload exposes only data that `record_usage`
+        // already returns (agent, service_id, new total) — no additional
+        // information is disclosed.
+        let threshold: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UsageAlertThreshold)
+            .unwrap_or(0);
+        if threshold > 0 && prev < threshold && total >= threshold {
+            env.events().publish(
+                (symbol_short!("usage_hi"),),
+                (agent.clone(), service_id.clone(), total),
+            );
+        }
 
         UsageRecord {
             agent,
@@ -1076,6 +1109,38 @@ impl Escrow {
             .remove(&DataKey::ServiceMetadata(service_id.clone()));
         env.events()
             .publish((symbol_short!("meta_clr"),), service_id);
+    }
+
+    /// Read the configured usage-alert threshold, or `0` (feature disabled)
+    /// when unset. A non-zero threshold causes `record_usage` to emit a
+    /// `usage_hi` event the first time the per-pair counter crosses that level
+    /// within a settlement window (edge-triggered; re-arms after `settle`).
+    pub fn get_usage_alert_threshold(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::UsageAlertThreshold)
+            .unwrap_or(0)
+    }
+
+    /// Admin sets the usage-alert threshold. When non-zero, `record_usage`
+    /// will emit a `usage_hi(agent, service_id, total)` event on the call
+    /// where a per-pair counter first reaches or exceeds this value. Passing
+    /// `0` disables the feature (no `usage_hi` events will be emitted).
+    ///
+    /// The event is edge-triggered: it fires once per settlement window, not on
+    /// every subsequent call while above the threshold. The trigger re-arms
+    /// after `settle` (or `reset_usage`) drains the counter below the level.
+    pub fn set_usage_alert_threshold(env: Env, threshold: u32) {
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, EscrowError::NotInitialized));
+        admin.require_auth();
+        ensure_not_paused(&env);
+        env.storage()
+            .persistent()
+            .set(&DataKey::UsageAlertThreshold, &threshold);
     }
 
     /// Read the on-chain schema version, or `1` (the implicit

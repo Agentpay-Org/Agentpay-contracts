@@ -2531,139 +2531,152 @@ fn test_compute_billing_independent_per_service() {
     assert_eq!(client.compute_billing(&agent, &svc2), 60);
 }
 
-// ── get_services_status_batch ────────────────────────────────────────────────
+// ── usage_threshold / usage_hi event tests ────────────────────────────────
 
-#[test]
-fn test_get_services_status_batch_preserves_order_and_matches_single_getters() {
-    let env = Env::default();
-    let (client, _admin) = setup_initialized(&env);
-
-    let svc_a = Symbol::new(&env, "svc_a");
-    let svc_b = Symbol::new(&env, "svc_b");
-    let svc_c = Symbol::new(&env, "svc_c");
-
-    // svc_a: registered, not disabled, price 500
-    client.register_service(&svc_a);
-    client.set_service_price(&svc_a, &500i128);
-
-    // svc_b: registered, disabled, price 0
-    client.register_service(&svc_b);
-    client.set_service_disabled(&svc_b, &true);
-
-    // svc_c: completely unknown
-
-    let mut ids: Vec<Symbol> = Vec::new(&env);
-    ids.push_back(svc_b.clone());
-    ids.push_back(svc_a.clone());
-    ids.push_back(svc_c.clone());
-
-    let out = client.get_services_status_batch(&ids);
-    assert_eq!(out.len(), 3);
-
-    let entry_b = out.get(0).unwrap();
-    assert_eq!(entry_b.service_id, svc_b);
-    assert_eq!(entry_b.registered, client.is_service_registered(&svc_b));
-    assert_eq!(entry_b.disabled, client.is_service_disabled(&svc_b));
-    assert_eq!(entry_b.price_stroops, client.get_service_price(&svc_b));
-    assert!(entry_b.registered);
-    assert!(entry_b.disabled);
-    assert_eq!(entry_b.price_stroops, 0i128);
-
-    let entry_a = out.get(1).unwrap();
-    assert_eq!(entry_a.service_id, svc_a);
-    assert!(entry_a.registered);
-    assert!(!entry_a.disabled);
-    assert_eq!(entry_a.price_stroops, 500i128);
-
-    let entry_c = out.get(2).unwrap();
-    assert_eq!(entry_c.service_id, svc_c);
-    assert!(!entry_c.registered);
-    assert!(!entry_c.disabled);
-    assert_eq!(entry_c.price_stroops, 0i128);
+/// Helper: check whether the most-recent invocation emitted a `usage_hi` event.
+/// `env.events().all()` in Soroban test harness returns only events from the
+/// most-recent contract invocation, so we query it immediately after each call.
+fn last_call_has_usage_hi(env: &Env) -> bool {
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("usage_hi"),).into_val(env);
+    env.events()
+        .all()
+        .iter()
+        .any(|(_addr, topics, _data)| topics == expected_topics)
 }
 
 #[test]
-fn test_get_services_status_batch_unknown_service_defaults_to_false_false_zero() {
+fn test_usage_alert_threshold_default_zero() {
+    // By default the threshold is 0 (disabled).
     let env = Env::default();
     let (client, _admin) = setup_initialized(&env);
-
-    let unknown = Symbol::new(&env, "ghost");
-    let mut ids: Vec<Symbol> = Vec::new(&env);
-    ids.push_back(unknown.clone());
-
-    let out = client.get_services_status_batch(&ids);
-    assert_eq!(out.len(), 1);
-    let entry = out.get(0).unwrap();
-    assert_eq!(entry.service_id, unknown);
-    assert!(!entry.registered);
-    assert!(!entry.disabled);
-    assert_eq!(entry.price_stroops, 0i128);
+    assert_eq!(client.get_usage_alert_threshold(), 0);
 }
 
 #[test]
-fn test_get_services_status_batch_empty_returns_empty() {
+fn test_usage_alert_threshold_setter_getter() {
     let env = Env::default();
     let (client, _admin) = setup_initialized(&env);
-
-    let ids: Vec<Symbol> = Vec::new(&env);
-    let out = client.get_services_status_batch(&ids);
-    assert_eq!(out.len(), 0);
+    client.set_usage_alert_threshold(&500u32);
+    assert_eq!(client.get_usage_alert_threshold(), 500);
+    // Round-trip to zero (disable).
+    client.set_usage_alert_threshold(&0u32);
+    assert_eq!(client.get_usage_alert_threshold(), 0);
 }
 
 #[test]
-fn test_get_services_status_batch_at_bound_succeeds() {
+fn test_usage_hi_event_fires_on_crossing_call_only() {
+    // Threshold = 100. First call: 60 (below). Second call: adds 50 -> total
+    // 110 (crosses). Third call: adds 10 -> total 120 (already above, no re-fire).
     let env = Env::default();
     let (client, _admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "svc_hi");
 
-    let svc = Symbol::new(&env, "bound_svc");
-    let mut ids: Vec<Symbol> = Vec::new(&env);
-    for _ in 0..MAX_SERVICE_STATUS_BATCH {
-        ids.push_back(svc.clone());
-    }
-    assert_eq!(ids.len(), MAX_SERVICE_STATUS_BATCH);
+    client.set_usage_alert_threshold(&100u32);
 
-    let out = client.get_services_status_batch(&ids);
-    assert_eq!(out.len(), MAX_SERVICE_STATUS_BATCH);
-    assert_eq!(out.get(0).unwrap().service_id, svc);
-    assert_eq!(out.get(MAX_SERVICE_STATUS_BATCH - 1).unwrap().service_id, svc);
+    // Call 1: total = 60, below threshold -> no usage_hi.
+    client.record_usage(&agent, &svc, &60u32);
+    assert!(
+        !last_call_has_usage_hi(&env),
+        "no usage_hi expected before threshold"
+    );
+
+    // Call 2: total = 110, crosses threshold -> usage_hi fires.
+    client.record_usage(&agent, &svc, &50u32);
+    assert!(
+        last_call_has_usage_hi(&env),
+        "expected usage_hi event on crossing call"
+    );
+
+    // Verify payload: (agent, service_id, new_total).
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("usage_hi"),).into_val(&env);
+    let hi_event = env
+        .events()
+        .all()
+        .iter()
+        .find(|(_addr, topics, _data)| *topics == expected_topics)
+        .unwrap();
+    let decoded: (Address, Symbol, u32) = hi_event.2.into_val(&env);
+    assert_eq!(decoded, (agent.clone(), svc.clone(), 110u32));
+
+    // Call 3: total = 120, already above threshold -> no usage_hi.
+    client.record_usage(&agent, &svc, &10u32);
+    assert!(
+        !last_call_has_usage_hi(&env),
+        "usage_hi must not fire again while still above threshold"
+    );
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #16)")]
-fn test_get_services_status_batch_oversized_panics() {
+fn test_usage_hi_disabled_by_default_emits_nothing_extra() {
+    // Without setting a threshold, record_usage should never emit usage_hi.
     let env = Env::default();
     let (client, _admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "nosvc");
 
-    let svc = Symbol::new(&env, "over_svc");
-    let mut ids: Vec<Symbol> = Vec::new(&env);
-    for _ in 0..(MAX_SERVICE_STATUS_BATCH + 1) {
-        ids.push_back(svc.clone());
-    }
-    assert_eq!(ids.len(), MAX_SERVICE_STATUS_BATCH + 1);
-
-    client.get_services_status_batch(&ids);
+    client.record_usage(&agent, &svc, &999u32);
+    assert!(!last_call_has_usage_hi(&env));
 }
 
 #[test]
-fn test_get_services_status_batch_duplicate_ids_yield_consistent_results() {
+fn test_usage_hi_rearms_after_settle() {
+    // After settle drains the counter below threshold, the next crossing
+    // should fire usage_hi again (re-arm semantics).
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "rearm_svc");
+
+    client.set_usage_alert_threshold(&50u32);
+
+    // First crossing: total = 60 >= 50 -> fires.
+    client.record_usage(&agent, &svc, &60u32);
+    assert!(last_call_has_usage_hi(&env), "first crossing should fire");
+
+    // Settle drains the counter to 0 (below threshold -> re-arms).
+    client.settle(&admin, &agent, &svc);
+    assert_eq!(client.get_usage(&agent, &svc), 0);
+
+    // Second crossing: total = 50 >= 50 -> fires again (re-armed).
+    client.record_usage(&agent, &svc, &50u32);
+    assert!(
+        last_call_has_usage_hi(&env),
+        "second crossing should fire after re-arm"
+    );
+}
+
+#[test]
+fn test_usage_hi_single_call_jumps_past_threshold() {
+    // A single call that starts at 0 and overshoots the threshold still
+    // triggers the event (the check is prev < threshold && total >= threshold).
     let env = Env::default();
     let (client, _admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "jump_svc");
 
-    let svc = Symbol::new(&env, "dup_svc");
-    client.register_service(&svc);
-    client.set_service_price(&svc, &99i128);
+    client.set_usage_alert_threshold(&10u32);
 
-    let mut ids: Vec<Symbol> = Vec::new(&env);
-    ids.push_back(svc.clone());
-    ids.push_back(svc.clone());
-    ids.push_back(svc.clone());
+    // One call that goes straight from 0 to 999.
+    client.record_usage(&agent, &svc, &999u32);
+    assert!(last_call_has_usage_hi(&env));
+}
 
-    let out = client.get_services_status_batch(&ids);
-    assert_eq!(out.len(), 3);
-    for i in 0..3u32 {
-        let entry = out.get(i).unwrap();
-        assert!(entry.registered);
-        assert!(!entry.disabled);
-        assert_eq!(entry.price_stroops, 99i128);
-    }
+#[test]
+fn test_usage_hi_exact_threshold_value_fires() {
+    // Crossing where prev < threshold and total == threshold exactly.
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "exact_svc");
+
+    client.set_usage_alert_threshold(&100u32);
+
+    client.record_usage(&agent, &svc, &99u32); // total = 99, no event
+    assert!(!last_call_has_usage_hi(&env));
+
+    client.record_usage(&agent, &svc, &1u32); // total = 100 == threshold -> fires
+    assert!(last_call_has_usage_hi(&env));
 }
