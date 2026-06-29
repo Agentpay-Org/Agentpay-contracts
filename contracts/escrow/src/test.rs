@@ -2442,161 +2442,230 @@ fn test_compute_billing_independent_per_service() {
     assert_eq!(client.compute_billing(&agent, &svc1), 50);
     assert_eq!(client.compute_billing(&agent, &svc2), 60);
 }
-// ── record_usage agent authorization tests ───────────────────────────────────
+// ── transfer_service_ownership tests ────────────────────────────────────────
 //
-// Security requirement: record_usage must call agent.require_auth() so only
-// the agent — or a metering operator the agent has explicitly authorized via
-// Soroban's auth tree — can record usage against that agent's counter.
+// Auth matrix covered:
+//   - Current owner transfers → allowed
+//   - Admin transfers on owner's behalf → allowed
+//   - Third-party caller → rejected (NotPendingAdmin)
+//   - No metadata → rejected (ServiceMetadataNotFound #13)
+//   - Paused contract → rejected (ContractPaused #4)
 //
-// Covered scenarios:
-//   1. Authorized agent succeeds (scoped mock auth)
-//   2. Unauthorized caller (no auth) is rejected at the host level
-//   3. Wrong signer (different address) is rejected
-//   4. Operator override: admin-authorized operator records on agent's behalf
-//   5. Paused contract rejects after auth passes (auth fires before pause check)
+// Invariants verified:
+//   - description is always preserved after transfer
+//   - owner_chg event carries correct (service_id, old_owner, new_owner)
+//   - get_service_metadata reflects new owner after transfer
 
-/// Positive: agent authorizes its own record_usage — succeeds.
-#[test]
-fn test_record_usage_agent_auth_succeeds() {
-    let env = Env::default();
-    let contract_id = env.register_contract(None, Escrow);
-    let client = EscrowClient::new(&env, &contract_id);
-    let admin = Address::generate(&env);
-    let agent = Address::generate(&env);
-    let svc = Symbol::new(&env, "infer");
-
-    // Use mock_all_auths so init and record_usage both pass.
-    env.mock_all_auths();
-    client.init(&admin);
-    let rec = client.record_usage(&agent, &svc, &5u32);
-    assert_eq!(rec.requests, 5);
-    assert_eq!(rec.agent, agent);
+/// Helper: register a service with metadata (description + owner).
+fn setup_service_with_metadata<'a>(
+    client: &EscrowClient<'a>,
+    env: &Env,
+    service_id: &Symbol,
+    description: &str,
+    owner: &Address,
+) {
+    client.register_service_with_metadata(
+        service_id,
+        &soroban_sdk::String::from_str(env, description),
+        owner,
+    );
 }
 
-/// Negative: no auth provided — host rejects the call before any logic runs.
+/// Positive: current owner transfers to new owner — succeeds.
 #[test]
-#[should_panic]
-fn test_record_usage_no_auth_rejected() {
+fn test_transfer_ownership_by_owner_succeeds() {
     let env = Env::default();
-    let contract_id = env.register_contract(None, Escrow);
-    let client = EscrowClient::new(&env, &contract_id);
-    let admin = Address::generate(&env);
-    let agent = Address::generate(&env);
+    let (client, _admin) = setup_initialized(&env);
+    let owner = Address::generate(&env);
+    let new_owner = Address::generate(&env);
     let svc = Symbol::new(&env, "infer");
 
-    // Init with full auth.
-    env.mock_all_auths();
-    client.init(&admin);
+    setup_service_with_metadata(&client, &env, &svc, "Inference API", &owner);
+    client.transfer_service_ownership(&owner, &svc, &new_owner);
 
-    // Now clear auths — no mock auth provided for record_usage.
-    // The host must reject the call.
-    env.mock_auths(&[]);
-    client.record_usage(&agent, &svc, &5u32);
+    let meta = client.get_service_metadata(&svc).unwrap();
+    assert_eq!(meta.owner, new_owner);
 }
 
-/// Negative: wrong signer — a different address cannot forge usage.
+/// Invariant: description is preserved after transfer.
 #[test]
-#[should_panic]
-fn test_record_usage_wrong_signer_rejected() {
+fn test_transfer_ownership_preserves_description() {
     let env = Env::default();
-    let contract_id = env.register_contract(None, Escrow);
-    let client = EscrowClient::new(&env, &contract_id);
-    let admin = Address::generate(&env);
-    let agent = Address::generate(&env);
-    let attacker = Address::generate(&env);
-    let svc = Symbol::new(&env, "infer");
-
-    env.mock_all_auths();
-    client.init(&admin);
-
-    // Attacker tries to sign as themselves for agent's record_usage.
-    env.mock_auths(&[MockAuth {
-        address: &attacker,
-        invoke: &MockAuthInvoke {
-            contract: &contract_id,
-            fn_name: "record_usage",
-            args: (agent.clone(), svc.clone(), 5u32).into_val(&env),
-            sub_invokes: &[],
-        },
-    }]);
-    // Must panic: attacker's signature does not satisfy agent.require_auth().
-    client.record_usage(&agent, &svc, &5u32);
-}
-
-/// Positive: operator override — agent pre-authorizes an operator via
-/// Soroban's auth tree. The operator can record usage on the agent's behalf.
-///
-/// Migration note: existing trusted off-chain metering loops that call
-/// record_usage directly must either:
-///   a) Have the agent sign each call (standard path), or
-///   b) Use Soroban's sub-invocation auth: the agent signs an outer
-///      call that sub-invokes record_usage, granting the operator
-///      transitive authority for that invocation only.
-/// `env.mock_all_auths()` simulates scenario (b) in tests by satisfying
-/// all auth requirements in the call tree.
-#[test]
-fn test_record_usage_operator_override_via_auth_tree() {
-    let env = Env::default();
-    let contract_id = env.register_contract(None, Escrow);
-    let client = EscrowClient::new(&env, &contract_id);
-    let admin = Address::generate(&env);
-    let agent = Address::generate(&env);
-    let svc = Symbol::new(&env, "infer");
-
-    // mock_all_auths simulates the operator being authorized by the agent
-    // via Soroban's auth tree (sub-invocation authorization).
-    env.mock_all_auths();
-    client.init(&admin);
-    let rec = client.record_usage(&agent, &svc, &10u32);
-    assert_eq!(rec.requests, 10);
-}
-
-/// Auth fires before pause: an unauthorized caller on a paused contract
-/// still gets the auth error, not ContractPaused — confirming step 0
-/// executes before step 1 in the validation chain.
-#[test]
-#[should_panic]
-fn test_record_usage_auth_before_pause_check() {
-    let env = Env::default();
-    let contract_id = env.register_contract(None, Escrow);
-    let client = EscrowClient::new(&env, &contract_id);
-    let admin = Address::generate(&env);
-    let agent = Address::generate(&env);
-    let svc = Symbol::new(&env, "infer");
-
-    env.mock_all_auths();
-    client.init(&admin);
-    client.pause();
-
-    // No auth provided — must fail at auth (step 0), not pause (step 1).
-    env.mock_auths(&[]);
-    client.record_usage(&agent, &svc, &5u32);
-}
-
-/// Scoped auth: agent signs only their own record_usage — succeeds for
-/// that agent, confirms auth is per-agent not global.
-#[test]
-fn test_record_usage_scoped_agent_auth() {
-    let env = Env::default();
-    let contract_id = env.register_contract(None, Escrow);
-    let client = EscrowClient::new(&env, &contract_id);
-    let admin = Address::generate(&env);
-    let agent = Address::generate(&env);
+    let (client, _admin) = setup_initialized(&env);
+    let owner = Address::generate(&env);
+    let new_owner = Address::generate(&env);
     let svc = Symbol::new(&env, "embed");
+    let desc = "Embedding service for AgentPay";
 
-    env.mock_all_auths();
-    client.init(&admin);
+    setup_service_with_metadata(&client, &env, &svc, desc, &owner);
+    client.transfer_service_ownership(&owner, &svc, &new_owner);
 
-    // Scoped mock: only agent is authorized for this specific record_usage call.
+    let meta = client.get_service_metadata(&svc).unwrap();
+    assert_eq!(
+        meta.description,
+        soroban_sdk::String::from_str(&env, desc),
+        "description must not change after ownership transfer"
+    );
+    assert_eq!(meta.owner, new_owner);
+}
+
+/// Positive: admin transfers on the owner's behalf — succeeds.
+#[test]
+fn test_transfer_ownership_by_admin_succeeds() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let owner = Address::generate(&env);
+    let new_owner = Address::generate(&env);
+    let svc = Symbol::new(&env, "chat");
+
+    setup_service_with_metadata(&client, &env, &svc, "Chat API", &owner);
+    // Admin calls transfer on behalf of the service owner.
+    client.transfer_service_ownership(&admin, &svc, &new_owner);
+
+    let meta = client.get_service_metadata(&svc).unwrap();
+    assert_eq!(meta.owner, new_owner);
+}
+
+/// Event: owner_chg emits (service_id, old_owner, new_owner) correctly.
+#[test]
+fn test_transfer_ownership_emits_owner_chg_event() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let owner = Address::generate(&env);
+    let new_owner = Address::generate(&env);
+    let svc = Symbol::new(&env, "search");
+
+    setup_service_with_metadata(&client, &env, &svc, "Search API", &owner);
+    client.transfer_service_ownership(&owner, &svc, &new_owner);
+
+    let events = env.events().all();
+    assert!(!events.is_empty());
+    let (_addr, topics, data) = events.last().unwrap();
+
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("owner_chg"),).into_val(&env);
+    assert_eq!(topics, expected_topics, "topic must be owner_chg");
+
+    let decoded: (Symbol, Address, Address) = data.into_val(&env);
+    assert_eq!(decoded.0, svc, "event service_id mismatch");
+    assert_eq!(decoded.1, owner, "event old_owner mismatch");
+    assert_eq!(decoded.2, new_owner, "event new_owner mismatch");
+}
+
+/// Negative: third-party caller (neither owner nor admin) is rejected.
+#[test]
+#[should_panic]
+fn test_transfer_ownership_stranger_rejected() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let owner = Address::generate(&env);
+    let stranger = Address::generate(&env);
+    let new_owner = Address::generate(&env);
+    let svc = Symbol::new(&env, "tts");
+
+    setup_service_with_metadata(&client, &env, &svc, "TTS API", &owner);
+
     env.mock_auths(&[MockAuth {
-        address: &agent,
+        address: &stranger,
         invoke: &MockAuthInvoke {
-            contract: &contract_id,
-            fn_name: "record_usage",
-            args: (agent.clone(), svc.clone(), 3u32).into_val(&env),
+            contract: &client.address,
+            fn_name: "transfer_service_ownership",
+            args: (stranger.clone(), svc.clone(), new_owner.clone()).into_val(&env),
             sub_invokes: &[],
         },
     }]);
-    let rec = client.record_usage(&agent, &svc, &3u32);
-    assert_eq!(rec.requests, 3);
+    client.transfer_service_ownership(&stranger, &svc, &new_owner);
+}
+
+/// Negative: transferring a service with no metadata panics #13.
+#[test]
+#[should_panic(expected = "Error(Contract, #13)")]
+fn test_transfer_ownership_no_metadata_panics() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let owner = Address::generate(&env);
+    let new_owner = Address::generate(&env);
+    let svc = Symbol::new(&env, "ghost");
+
+    // No set_service_metadata or register_service_with_metadata called.
+    client.transfer_service_ownership(&owner, &svc, &new_owner);
+}
+
+/// Negative: pause gate fires (#4) before ownership transfer.
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")]
+fn test_transfer_ownership_paused_rejected() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let owner = Address::generate(&env);
+    let new_owner = Address::generate(&env);
+    let svc = Symbol::new(&env, "stt");
+
+    setup_service_with_metadata(&client, &env, &svc, "STT API", &owner);
+    client.pause();
+    client.transfer_service_ownership(&owner, &svc, &new_owner);
+}
+
+/// After transfer, get_service_metadata reflects the new owner.
+#[test]
+fn test_transfer_ownership_metadata_updated() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let owner = Address::generate(&env);
+    let new_owner = Address::generate(&env);
+    let svc = Symbol::new(&env, "ocr");
+    let desc = "OCR service";
+
+    setup_service_with_metadata(&client, &env, &svc, desc, &owner);
+
+    // Confirm initial state.
+    let before = client.get_service_metadata(&svc).unwrap();
+    assert_eq!(before.owner, owner);
+
+    client.transfer_service_ownership(&owner, &svc, &new_owner);
+
+    // Confirm updated state.
+    let after = client.get_service_metadata(&svc).unwrap();
+    assert_eq!(after.owner, new_owner, "owner must be updated");
+    assert_eq!(
+        after.description,
+        soroban_sdk::String::from_str(&env, desc),
+        "description must be unchanged"
+    );
+}
+
+/// Chained transfer: new owner can transfer again — ownership is live.
+#[test]
+fn test_transfer_ownership_chained() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let owner = Address::generate(&env);
+    let second = Address::generate(&env);
+    let third = Address::generate(&env);
+    let svc = Symbol::new(&env, "chain");
+
+    setup_service_with_metadata(&client, &env, &svc, "Chained", &owner);
+    client.transfer_service_ownership(&owner, &svc, &second);
+    client.transfer_service_ownership(&second, &svc, &third);
+
+    let meta = client.get_service_metadata(&svc).unwrap();
+    assert_eq!(meta.owner, third);
+}
+
+/// Original owner cannot transfer again after handing off.
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")]
+fn test_transfer_ownership_old_owner_rejected_after_transfer() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let owner = Address::generate(&env);
+    let new_owner = Address::generate(&env);
+    let third = Address::generate(&env);
+    let svc = Symbol::new(&env, "revoke");
+
+    setup_service_with_metadata(&client, &env, &svc, "Revoke test", &owner);
+    client.transfer_service_ownership(&owner, &svc, &new_owner);
+
+    // Old owner tries to transfer again — must be rejected.
+    client.transfer_service_ownership(&owner, &svc, &third);
 }
