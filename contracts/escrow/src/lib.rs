@@ -16,6 +16,14 @@ const CURRENT_SCHEMA: u32 = 2;
 /// Callers needing more pairs should page the requests.
 pub const MAX_BATCH_READ: u32 = 100;
 
+/// Hard cap on the per-agent service index length. Capped at 256 to prevent
+/// unbounded storage growth: an adversary recording usage across an ever-growing
+/// set of service ids would otherwise increase the `AgentServiceIndex` vector
+/// indefinitely. At 256 the index write on a new service costs at most one
+/// additional persistent read/write; callers that genuinely need more than 256
+/// services per agent should enumerate them off-chain from event logs.
+pub const MAX_AGENT_SERVICE_INDEX: u32 = 256;
+
 /// Free-form metadata about a service. Stored under
 /// `DataKey::ServiceMetadata(service_id)` so dashboards and clients can
 /// resolve a service to a human-readable description and owner without
@@ -102,6 +110,12 @@ pub enum DataKey {
     /// Per-agent blocklist flag. When `true`, `record_usage` rejects the
     /// agent with `AgentBlocked`, taking precedence over the allowlist.
     AgentBlocked(Address),
+    /// Per-agent ordered index of service ids that have non-zero (or
+    /// historically non-zero) usage. Updated by `record_usage` when a new
+    /// service id is first seen for the agent, and pruned by `settle` when
+    /// the usage counter drops to zero after settlement. Capped at
+    /// `MAX_AGENT_SERVICE_INDEX` entries to bound storage growth.
+    AgentServiceIndex(Address),
 }
 
 /// Typed contract errors. Codes are append-only to keep client SDKs stable.
@@ -206,6 +220,54 @@ fn read_usage(env: &Env, agent: &Address, service_id: &Symbol) -> u32 {
         .persistent()
         .get(&DataKey::Usage(agent.clone(), service_id.clone()))
         .unwrap_or(0)
+}
+
+/// Add `service_id` to the per-agent service index if it is not already
+/// present and the index has not yet hit `MAX_AGENT_SERVICE_INDEX`. This
+/// is called unconditionally from `record_usage` on the hot path, so it
+/// must be cheap: it reads the index once, scans for duplicates, and
+/// writes only when a new entry is appended.
+///
+/// Security: the cap prevents a malicious caller from growing the index
+/// indefinitely by recycling novel `service_id` values.
+fn index_agent_service(env: &Env, agent: &Address, service_id: &Symbol) {
+    let key = DataKey::AgentServiceIndex(agent.clone());
+    let mut index: Vec<Symbol> = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or_else(|| Vec::new(env));
+    // Already indexed — nothing to do.
+    for existing in index.iter() {
+        if existing == *service_id {
+            return;
+        }
+    }
+    // Silently skip when the cap is reached to keep the write cost bounded.
+    if index.len() >= MAX_AGENT_SERVICE_INDEX {
+        return;
+    }
+    index.push_back(service_id.clone());
+    env.storage().persistent().set(&key, &index);
+}
+
+/// Remove `service_id` from the per-agent service index. Called by
+/// `settle` after the usage counter for the pair has been reset to zero.
+/// Scan-and-remove is O(n) in the index length; at a cap of 256 this is
+/// always bounded. Idempotent — removing an absent entry is a no-op.
+fn deindex_agent_service(env: &Env, agent: &Address, service_id: &Symbol) {
+    let key = DataKey::AgentServiceIndex(agent.clone());
+    let index: Vec<Symbol> = match env.storage().persistent().get(&key) {
+        Some(v) => v,
+        None => return,
+    };
+    let mut new_index: Vec<Symbol> = Vec::new(env);
+    for existing in index.iter() {
+        if existing != *service_id {
+            new_index.push_back(existing);
+        }
+    }
+    env.storage().persistent().set(&key, &new_index);
 }
 
 #[contract]
@@ -369,6 +431,12 @@ impl Escrow {
         let total = prev.saturating_add(requests);
         env.storage().persistent().set(&key, &total);
 
+        // Maintain per-agent service index. index_agent_service is idempotent
+        // (no-op when the service is already indexed), so it is safe to call on
+        // every record_usage regardless of whether this is the first call for
+        // the (agent, service_id) pair.
+        index_agent_service(&env, &agent, &service_id);
+
         // Cross-service lifetime counter for the agent. Saturates at u32::MAX.
         let total_key = DataKey::TotalUsageByAgent(agent.clone());
         let prev_total: u32 = env.storage().persistent().get(&total_key).unwrap_or(0);
@@ -456,6 +524,80 @@ impl Escrow {
             results.push_back(read_usage(&env, &agent, &service_id));
         }
         results
+    }
+
+    /// Return all service ids in the per-agent service index.
+    ///
+    /// Pure read — no `require_auth`, no pause gate. The returned `Vec`
+    /// contains every service id for which this agent has (or had) non-zero
+    /// usage since the last time the entry was pruned by `settle`. Services
+    /// that have been fully settled are removed from the index, so the result
+    /// reflects *currently active* services rather than the full historical
+    /// set.
+    ///
+    /// An agent with no usage history returns an empty vector.
+    ///
+    /// Callers that only need a bounded slice should prefer
+    /// [`Escrow::get_agent_usage_page`].
+    pub fn get_agent_services(env: Env, agent: Address) -> Vec<Symbol> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AgentServiceIndex(agent))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Return a paginated slice of `(service_id, usage)` pairs for an agent.
+    ///
+    /// Pure read — no `require_auth`, no pause gate. Reads at most `limit`
+    /// entries from the per-agent service index starting at position `start`
+    /// (zero-based). Each entry is a `(Symbol, u32)` pair of the service id
+    /// and its current accumulated request count.
+    ///
+    /// Pagination rules:
+    /// - `start` past the end of the index returns an empty vector.
+    /// - `limit` is clamped to [`MAX_BATCH_READ`]; pass `MAX_BATCH_READ` or
+    ///   `0` to get the largest page. A zero `limit` is treated as
+    ///   `MAX_BATCH_READ` so callers do not have to special-case it.
+    /// - The caller can detect the last page when the returned length is
+    ///   less than `limit` (or the result is empty).
+    ///
+    /// This entrypoint bounds the response size and keeps storage-read cost
+    /// predictable, unlike `get_agent_services` which returns the full index.
+    pub fn get_agent_usage_page(
+        env: Env,
+        agent: Address,
+        start: u32,
+        limit: u32,
+    ) -> Vec<(Symbol, u32)> {
+        let index: Vec<Symbol> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AgentServiceIndex(agent.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let effective_limit = if limit == 0 || limit > MAX_BATCH_READ {
+            MAX_BATCH_READ
+        } else {
+            limit
+        };
+
+        let total = index.len();
+        let mut result: Vec<(Symbol, u32)> = Vec::new(&env);
+        let mut pos: u32 = 0;
+        for service_id in index.iter() {
+            if pos < start {
+                pos = pos.saturating_add(1);
+                continue;
+            }
+            if result.len() >= effective_limit {
+                break;
+            }
+            let usage = read_usage(&env, &agent, &service_id);
+            result.push_back((service_id, usage));
+            pos = pos.saturating_add(1);
+        }
+        let _ = total;
+        result
     }
 
     /// Set the per-request price (in stroops) for a service.
@@ -621,6 +763,11 @@ impl Escrow {
         // panicking; off-chain loop treats saturation as an error signal.
         let billed = (requests as i128).saturating_mul(price);
         env.storage().persistent().set(&usage_key, &0u32);
+        // Prune the service from the agent's index since usage is now zero.
+        // This keeps the index consistent with the underlying counters and
+        // prevents the index from accumulating services that have been fully
+        // settled, which would skew `get_agent_services` results.
+        deindex_agent_service(&env, &agent, &service_id);
         env.storage().persistent().set(
             &DataKey::LastSettlement(agent.clone(), service_id.clone()),
             &env.ledger().timestamp(),

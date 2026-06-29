@@ -2442,3 +2442,272 @@ fn test_compute_billing_independent_per_service() {
     assert_eq!(client.compute_billing(&agent, &svc1), 50);
     assert_eq!(client.compute_billing(&agent, &svc2), 60);
 }
+
+// ── get_agent_services & get_agent_usage_page ────────────────────────────────
+
+/// An agent with no usage returns an empty service index.
+#[test]
+fn test_get_agent_services_empty_for_new_agent() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    assert_eq!(client.get_agent_services(&agent).len(), 0);
+}
+
+/// Recording usage for a new service grows the index by one entry.
+#[test]
+fn test_get_agent_services_grows_on_new_service() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "svc1");
+    client.record_usage(&agent, &svc, &1u32);
+    let svcs = client.get_agent_services(&agent);
+    assert_eq!(svcs.len(), 1);
+    assert_eq!(svcs.get(0), Some(svc));
+}
+
+/// Recording usage for the same service multiple times does not create
+/// duplicate index entries.
+#[test]
+fn test_get_agent_services_no_duplicates_on_repeat_usage() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "svc1");
+    client.record_usage(&agent, &svc, &5u32);
+    client.record_usage(&agent, &svc, &10u32);
+    client.record_usage(&agent, &svc, &3u32);
+    let svcs = client.get_agent_services(&agent);
+    assert_eq!(
+        svcs.len(),
+        1,
+        "repeat calls must not duplicate index entries"
+    );
+}
+
+/// Each distinct service is indexed exactly once.
+#[test]
+fn test_get_agent_services_multiple_services() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let a = Symbol::new(&env, "svc_a");
+    let b = Symbol::new(&env, "svc_b");
+    let c = Symbol::new(&env, "svc_c");
+    client.record_usage(&agent, &a, &1u32);
+    client.record_usage(&agent, &b, &2u32);
+    client.record_usage(&agent, &c, &3u32);
+    assert_eq!(client.get_agent_services(&agent).len(), 3);
+}
+
+/// Service indices are per-agent: one agent's index must not bleed into
+/// another's.
+#[test]
+fn test_get_agent_services_isolated_per_agent() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let agent_a = Address::generate(&env);
+    let agent_b = Address::generate(&env);
+    let svc = Symbol::new(&env, "shared");
+    client.record_usage(&agent_a, &svc, &1u32);
+    // agent_b has never called record_usage.
+    assert_eq!(client.get_agent_services(&agent_b).len(), 0);
+}
+
+/// After `settle` drains the usage counter the service is pruned from the
+/// index so `get_agent_services` no longer lists it.
+#[test]
+fn test_get_agent_services_pruned_after_settle() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "svc1");
+    client.record_usage(&agent, &svc, &5u32);
+    assert_eq!(client.get_agent_services(&agent).len(), 1);
+
+    client.settle(&admin, &agent, &svc);
+
+    assert_eq!(
+        client.get_agent_services(&agent).len(),
+        0,
+        "settled service must be pruned from the index"
+    );
+}
+
+/// After settle the service can be re-added by recording new usage.
+#[test]
+fn test_get_agent_services_re_added_after_settle_and_new_usage() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "svc1");
+
+    client.record_usage(&agent, &svc, &5u32);
+    client.settle(&admin, &agent, &svc);
+    assert_eq!(client.get_agent_services(&agent).len(), 0);
+
+    client.record_usage(&agent, &svc, &3u32);
+    let svcs = client.get_agent_services(&agent);
+    assert_eq!(svcs.len(), 1);
+    assert_eq!(svcs.get(0), Some(svc));
+}
+
+/// Only the settled service is pruned; others remain in the index.
+#[test]
+fn test_get_agent_services_only_settled_service_pruned() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let svc_a = Symbol::new(&env, "svc_a");
+    let svc_b = Symbol::new(&env, "svc_b");
+    client.record_usage(&agent, &svc_a, &5u32);
+    client.record_usage(&agent, &svc_b, &7u32);
+
+    client.settle(&admin, &agent, &svc_a);
+
+    let svcs = client.get_agent_services(&agent);
+    assert_eq!(svcs.len(), 1);
+    assert_eq!(svcs.get(0), Some(svc_b));
+}
+
+/// `get_agent_usage_page` with start=0 and a large limit returns all entries.
+#[test]
+fn test_get_agent_usage_page_full_page() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let a = Symbol::new(&env, "svc_a");
+    let b = Symbol::new(&env, "svc_b");
+    client.record_usage(&agent, &a, &10u32);
+    client.record_usage(&agent, &b, &20u32);
+
+    let page = client.get_agent_usage_page(&agent, &0u32, &100u32);
+    assert_eq!(page.len(), 2);
+    let (s0, u0) = page.get(0).unwrap();
+    let (s1, u1) = page.get(1).unwrap();
+    assert_eq!(s0, a);
+    assert_eq!(u0, 10);
+    assert_eq!(s1, b);
+    assert_eq!(u1, 20);
+}
+
+/// `get_agent_usage_page` with start past the end returns empty.
+#[test]
+fn test_get_agent_usage_page_start_past_end_is_empty() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "svc1");
+    client.record_usage(&agent, &svc, &5u32);
+
+    let page = client.get_agent_usage_page(&agent, &99u32, &10u32);
+    assert_eq!(page.len(), 0);
+}
+
+/// Pagination: limit=1 returns only the first service.
+#[test]
+fn test_get_agent_usage_page_limit_one_returns_first() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let a = Symbol::new(&env, "svc_a");
+    let b = Symbol::new(&env, "svc_b");
+    client.record_usage(&agent, &a, &3u32);
+    client.record_usage(&agent, &b, &7u32);
+
+    let page = client.get_agent_usage_page(&agent, &0u32, &1u32);
+    assert_eq!(page.len(), 1);
+    let (s, u) = page.get(0).unwrap();
+    assert_eq!(s, a);
+    assert_eq!(u, 3);
+}
+
+/// Pagination: start=1, limit=1 skips the first entry.
+#[test]
+fn test_get_agent_usage_page_start_one_skips_first() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let a = Symbol::new(&env, "svc_a");
+    let b = Symbol::new(&env, "svc_b");
+    client.record_usage(&agent, &a, &3u32);
+    client.record_usage(&agent, &b, &7u32);
+
+    let page = client.get_agent_usage_page(&agent, &1u32, &1u32);
+    assert_eq!(page.len(), 1);
+    let (s, u) = page.get(0).unwrap();
+    assert_eq!(s, b);
+    assert_eq!(u, 7);
+}
+
+/// limit=0 is treated as MAX_BATCH_READ (returns all entries up to the cap).
+#[test]
+fn test_get_agent_usage_page_zero_limit_returns_all() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let a = Symbol::new(&env, "svc_a");
+    let b = Symbol::new(&env, "svc_b");
+    client.record_usage(&agent, &a, &1u32);
+    client.record_usage(&agent, &b, &2u32);
+
+    let page = client.get_agent_usage_page(&agent, &0u32, &0u32);
+    assert_eq!(page.len(), 2, "limit=0 must default to MAX_BATCH_READ");
+}
+
+/// limit larger than MAX_BATCH_READ is clamped to MAX_BATCH_READ.
+#[test]
+fn test_get_agent_usage_page_limit_clamped_to_max_batch_read() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "svc1");
+    client.record_usage(&agent, &svc, &5u32);
+
+    // limit >> MAX_BATCH_READ: result still bounded and returns 1 entry.
+    let page = client.get_agent_usage_page(&agent, &0u32, &99999u32);
+    assert_eq!(page.len(), 1);
+}
+
+/// get_agent_usage_page on a never-used agent returns empty.
+#[test]
+fn test_get_agent_usage_page_empty_for_new_agent() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    assert_eq!(client.get_agent_usage_page(&agent, &0u32, &10u32).len(), 0);
+}
+
+/// get_agent_usage_page usage values reflect the current counter, not the
+/// value at the time of indexing.
+#[test]
+fn test_get_agent_usage_page_reflects_accumulated_usage() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "svc1");
+    client.record_usage(&agent, &svc, &5u32);
+    client.record_usage(&agent, &svc, &10u32);
+
+    let page = client.get_agent_usage_page(&agent, &0u32, &10u32);
+    assert_eq!(page.len(), 1);
+    let (_, usage) = page.get(0).unwrap();
+    assert_eq!(usage, 15, "page must reflect the accumulated total");
+}
+
+/// Index consistency: after settle, get_agent_usage_page no longer returns
+/// the settled service and its usage.
+#[test]
+fn test_get_agent_usage_page_consistency_after_settle() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "svc1");
+    client.record_usage(&agent, &svc, &7u32);
+
+    client.settle(&admin, &agent, &svc);
+
+    let page = client.get_agent_usage_page(&agent, &0u32, &10u32);
+    assert_eq!(page.len(), 0, "settled service must not appear in the page");
+}
