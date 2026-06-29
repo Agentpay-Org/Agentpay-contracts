@@ -1,12 +1,51 @@
 #![cfg(test)]
 #![allow(deprecated)]
 
+//! # Escrow contract test suite
+//!
+//! ## Test-harness conventions
+//!
+//! Every test that needs a fully-initialised contract should call one of the
+//! two primary setup helpers defined at the top of this module:
+//!
+//! * [`setup_initialized`] — blanket-mocked auths, contract registered and
+//!   `init`-ed with a generated admin.  Use this for the vast majority of
+//!   tests.
+//! * [`setup_scoped_auth`] — only the `init` call is auth-mocked; all
+//!   subsequent privileged calls will fail unless the test wires up its own
+//!   `mock_auths`.  Use this when a test needs to assert that a specific
+//!   entrypoint enforces `require_auth`.
+//!
+//! Convenience helpers are also available:
+//!
+//! * [`make_agent`] — generate a fresh [`Address`] to act as an agent.
+//! * [`make_service`] — create a short [`Symbol`] representing a service id.
+//! * [`advance_ledger`] — bump the ledger timestamp by a given number of
+//!   seconds (useful for rate-window and settlement-timestamp tests).
+//! * [`set_price`] — one-liner to call `set_service_price` on a client.
+//! * [`record`]    — one-liner to call `record_usage` on a client.
+//!
+//! ### Security note
+//! Tests that use `setup_initialized` rely on `mock_all_auths`, which
+//! satisfies every `require_auth` call unconditionally.  When a test needs to
+//! verify that auth *is* enforced, use `setup_scoped_auth` or call
+//! `env.set_auths(&[])` to drop mock authorisations before the call under
+//! test.
+
 use super::*;
 use soroban_sdk::{
     testutils::{Address as _, Events, Ledger, MockAuth, MockAuthInvoke},
     Address, IntoVal, Symbol,
 };
 
+// ── Primary setup helpers ────────────────────────────────────────────────────
+
+/// Create a fully-initialised escrow contract with blanket auth mocking.
+///
+/// Returns `(client, admin)` where `admin` is the address passed to `init`.
+/// All subsequent `require_auth` calls are automatically satisfied by
+/// `mock_all_auths`, so most tests can start from this helper without any
+/// additional auth wiring.
 fn setup_initialized(env: &Env) -> (EscrowClient<'_>, Address) {
     env.mock_all_auths();
     let contract_id = env.register_contract(None, Escrow);
@@ -14,6 +53,43 @@ fn setup_initialized(env: &Env) -> (EscrowClient<'_>, Address) {
     let admin = Address::generate(env);
     client.init(&admin);
     (client, admin)
+}
+
+// ── Convenience address / symbol helpers ─────────────────────────────────────
+
+/// Generate a fresh [`Address`] to use as an agent in tests.
+///
+/// Each call returns a distinct address, so you can create independent agents
+/// without any naming collision:
+/// ```ignore
+/// let agent_a = make_agent(&env);
+/// let agent_b = make_agent(&env);
+/// ```
+fn make_agent(env: &Env) -> Address {
+    Address::generate(env)
+}
+
+/// Build a [`Symbol`] from a static string slice to use as a service id.
+///
+/// The `name` must be a valid Soroban symbol (≤ 32 alphanumeric / `_` chars).
+/// ```ignore
+/// let svc = make_service(&env, "weather_api");
+/// ```
+fn make_service(env: &Env, name: &'static str) -> Symbol {
+    Symbol::new(env, name)
+}
+
+// ── Ledger-clock helper ───────────────────────────────────────────────────────
+
+/// Advance the ledger timestamp by `seconds`.
+///
+/// Useful for rate-window rollover tests and settlement-timestamp assertions
+/// without having to repeat the `env.ledger().with_mut(…)` boilerplate:
+/// ```ignore
+/// advance_ledger(&env, 100); // move 100 s into the future
+/// ```
+fn advance_ledger(env: &Env, seconds: u64) {
+    env.ledger().with_mut(|li| li.timestamp += seconds);
 }
 
 #[test]
@@ -1784,9 +1860,15 @@ fn test_i21_total_requests_all_time_accumulates_large_values() {
     assert_eq!(client.get_total_requests_all_time(), (u32::MAX as u64) * 2);
 }
 
+// ── Scoped-auth setup helper ──────────────────────────────────────────────────
+
 /// Register and `init` the contract authorising only `admin` for the `init`
-/// call. Subsequent privileged calls are intentionally left unauthorised so
-/// their `require_auth` fails.
+/// call.
+///
+/// Subsequent privileged calls are **intentionally left unauthorised** so
+/// their `require_auth` fails.  Use this helper (instead of
+/// [`setup_initialized`]) when a test needs to assert that a specific
+/// entrypoint enforces the admin signature.
 fn setup_scoped_auth(env: &Env) -> EscrowClient<'_> {
     let contract_id = env.register_contract(None, Escrow);
     let client = EscrowClient::new(env, &contract_id);
@@ -2240,12 +2322,18 @@ fn test_rate_limit_is_per_agent() {
 //   5. Saturation edge                → i128::MAX (no overflow)
 //   6. compute_billing agrees with settle billed value
 
-/// Helper: register a service price for `service_id`.
+// ── Billing / usage one-liners ────────────────────────────────────────────────
+
+/// Set the per-request price for `service_id`.
+///
+/// Thin wrapper around `set_service_price` to keep billing tests concise.
 fn set_price(client: &EscrowClient, service_id: &Symbol, price: i128) {
     client.set_service_price(service_id, &price);
 }
 
-/// Helper: record `requests` units of usage for `(agent, service_id)`.
+/// Record `requests` units of usage for `(agent, service_id)`.
+///
+/// Thin wrapper around `record_usage` to keep billing tests concise.
 fn record(client: &EscrowClient, agent: &Address, service_id: &Symbol, requests: u32) {
     client.record_usage(agent, service_id, &requests);
 }
@@ -2441,4 +2529,58 @@ fn test_compute_billing_independent_per_service() {
 
     assert_eq!(client.compute_billing(&agent, &svc1), 50);
     assert_eq!(client.compute_billing(&agent, &svc2), 60);
+}
+
+// ── Harness-helper smoke tests ────────────────────────────────────────────────
+//
+// These tests exercise `make_agent`, `make_service`, and `advance_ledger`
+// directly so reviewers can confirm the helpers work and existing tests can
+// be migrated to them incrementally.
+
+/// `make_agent` returns distinct addresses on each call.
+#[test]
+fn test_harness_make_agent_returns_distinct_addresses() {
+    let env = Env::default();
+    let a = make_agent(&env);
+    let b = make_agent(&env);
+    assert_ne!(a, b, "make_agent must return a different address each call");
+}
+
+/// `make_service` round-trips through `Symbol::new`.
+#[test]
+fn test_harness_make_service_symbol_round_trip() {
+    let env = Env::default();
+    let svc = make_service(&env, "infer");
+    assert_eq!(svc, Symbol::new(&env, "infer"));
+}
+
+/// `advance_ledger` increments the ledger timestamp by the requested delta.
+#[test]
+fn test_harness_advance_ledger_increments_timestamp() {
+    let env = Env::default();
+    env.ledger().with_mut(|li| li.timestamp = 1_000);
+    advance_ledger(&env, 250);
+    assert_eq!(env.ledger().timestamp(), 1_250);
+}
+
+/// A rate-window rollover written with all three new helpers to demonstrate
+/// idiomatic harness usage.
+#[test]
+fn test_harness_rate_window_rollover_using_helpers() {
+    let env = Env::default();
+    env.ledger().with_mut(|li| li.timestamp = 500);
+    let (client, _admin) = setup_initialized(&env);
+    client.set_max_requests_per_window(&10u32);
+    client.set_rate_window_seconds(&100u64);
+
+    let agent = make_agent(&env);
+    let svc = make_service(&env, "infer");
+
+    record(&client, &agent, &svc, 10); // fills the window
+
+    // Advance past the 100-second window; the rate counter should reset.
+    advance_ledger(&env, 100);
+    let rec = client.record_usage(&agent, &svc, &5u32);
+    // Cumulative usage = 15, but the rate window accepted the fresh 5.
+    assert_eq!(rec.requests, 15);
 }
