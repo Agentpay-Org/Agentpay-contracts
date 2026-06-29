@@ -2442,3 +2442,140 @@ fn test_compute_billing_independent_per_service() {
     assert_eq!(client.compute_billing(&agent, &svc1), 50);
     assert_eq!(client.compute_billing(&agent, &svc2), 60);
 }
+
+// ── get_services_status_batch ────────────────────────────────────────────────
+
+#[test]
+fn test_get_services_status_batch_preserves_order_and_matches_single_getters() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+
+    let svc_a = Symbol::new(&env, "svc_a");
+    let svc_b = Symbol::new(&env, "svc_b");
+    let svc_c = Symbol::new(&env, "svc_c");
+
+    // svc_a: registered, not disabled, price 500
+    client.register_service(&svc_a);
+    client.set_service_price(&svc_a, &500i128);
+
+    // svc_b: registered, disabled, price 0
+    client.register_service(&svc_b);
+    client.set_service_disabled(&svc_b, &true);
+
+    // svc_c: completely unknown
+
+    let mut ids: Vec<Symbol> = Vec::new(&env);
+    ids.push_back(svc_b.clone());
+    ids.push_back(svc_a.clone());
+    ids.push_back(svc_c.clone());
+
+    let out = client.get_services_status_batch(&ids);
+    assert_eq!(out.len(), 3);
+
+    let entry_b = out.get(0).unwrap();
+    assert_eq!(entry_b.service_id, svc_b);
+    assert_eq!(entry_b.registered, client.is_service_registered(&svc_b));
+    assert_eq!(entry_b.disabled, client.is_service_disabled(&svc_b));
+    assert_eq!(entry_b.price_stroops, client.get_service_price(&svc_b));
+    assert!(entry_b.registered);
+    assert!(entry_b.disabled);
+    assert_eq!(entry_b.price_stroops, 0i128);
+
+    let entry_a = out.get(1).unwrap();
+    assert_eq!(entry_a.service_id, svc_a);
+    assert!(entry_a.registered);
+    assert!(!entry_a.disabled);
+    assert_eq!(entry_a.price_stroops, 500i128);
+
+    let entry_c = out.get(2).unwrap();
+    assert_eq!(entry_c.service_id, svc_c);
+    assert!(!entry_c.registered);
+    assert!(!entry_c.disabled);
+    assert_eq!(entry_c.price_stroops, 0i128);
+}
+
+#[test]
+fn test_get_services_status_batch_unknown_service_defaults_to_false_false_zero() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+
+    let unknown = Symbol::new(&env, "ghost");
+    let mut ids: Vec<Symbol> = Vec::new(&env);
+    ids.push_back(unknown.clone());
+
+    let out = client.get_services_status_batch(&ids);
+    assert_eq!(out.len(), 1);
+    let entry = out.get(0).unwrap();
+    assert_eq!(entry.service_id, unknown);
+    assert!(!entry.registered);
+    assert!(!entry.disabled);
+    assert_eq!(entry.price_stroops, 0i128);
+}
+
+#[test]
+fn test_get_services_status_batch_empty_returns_empty() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+
+    let ids: Vec<Symbol> = Vec::new(&env);
+    let out = client.get_services_status_batch(&ids);
+    assert_eq!(out.len(), 0);
+}
+
+#[test]
+fn test_get_services_status_batch_at_bound_succeeds() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+
+    let svc = Symbol::new(&env, "bound_svc");
+    let mut ids: Vec<Symbol> = Vec::new(&env);
+    for _ in 0..MAX_SERVICE_STATUS_BATCH {
+        ids.push_back(svc.clone());
+    }
+    assert_eq!(ids.len(), MAX_SERVICE_STATUS_BATCH);
+
+    let out = client.get_services_status_batch(&ids);
+    assert_eq!(out.len(), MAX_SERVICE_STATUS_BATCH);
+    assert_eq!(out.get(0).unwrap().service_id, svc);
+    assert_eq!(out.get(MAX_SERVICE_STATUS_BATCH - 1).unwrap().service_id, svc);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #16)")]
+fn test_get_services_status_batch_oversized_panics() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+
+    let svc = Symbol::new(&env, "over_svc");
+    let mut ids: Vec<Symbol> = Vec::new(&env);
+    for _ in 0..(MAX_SERVICE_STATUS_BATCH + 1) {
+        ids.push_back(svc.clone());
+    }
+    assert_eq!(ids.len(), MAX_SERVICE_STATUS_BATCH + 1);
+
+    client.get_services_status_batch(&ids);
+}
+
+#[test]
+fn test_get_services_status_batch_duplicate_ids_yield_consistent_results() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+
+    let svc = Symbol::new(&env, "dup_svc");
+    client.register_service(&svc);
+    client.set_service_price(&svc, &99i128);
+
+    let mut ids: Vec<Symbol> = Vec::new(&env);
+    ids.push_back(svc.clone());
+    ids.push_back(svc.clone());
+    ids.push_back(svc.clone());
+
+    let out = client.get_services_status_batch(&ids);
+    assert_eq!(out.len(), 3);
+    for i in 0..3u32 {
+        let entry = out.get(i).unwrap();
+        assert!(entry.registered);
+        assert!(!entry.disabled);
+        assert_eq!(entry.price_stroops, 99i128);
+    }
+}
