@@ -1149,6 +1149,44 @@ impl Escrow {
         write_flag(&env, &DataKey::ServiceRegistered(service_id), true);
     }
 
+    /// Register a service and set its metadata in a single admin-gated,
+    /// pause-respecting call.
+    ///
+    /// Atomically sets `ServiceRegistered(service_id) = true` and writes
+    /// `ServiceMetadata(service_id)` so that after one invocation both
+    /// `is_service_registered` and `get_service_metadata` return the new
+    /// state. Emits `svc_reg(service_id, owner)` for indexers.
+    ///
+    /// Idempotent overwrite: re-registering an existing id overwrites its
+    /// metadata. An empty description is accepted.
+    ///
+    /// # Security
+    /// - Admin-gated (`require_admin + require_auth`).
+    /// - Honours the pause gate (`ensure_not_paused`).
+    /// - Both slots land together — there is no window where a service is
+    ///   registered but has no metadata, or vice versa.
+    pub fn register_service_with_metadata(
+        env: Env,
+        service_id: Symbol,
+        description: String,
+        owner: Address,
+    ) {
+        ensure_not_paused(&env);
+        require_admin(&env);
+        write_flag(&env, &DataKey::ServiceRegistered(service_id.clone()), true);
+        env.storage().persistent().set(
+            &DataKey::ServiceMetadata(service_id.clone()),
+            &ServiceMetadata {
+                description,
+                owner: owner.clone(),
+            },
+        );
+        env.events().publish(
+            (symbol_short!("svc_reg"),),
+            (service_id, owner),
+        );
+    }
+
     /// Cancel a pending admin transfer. Current admin only. No-op when
     /// nothing is pending.
     pub fn cancel_admin_transfer(env: Env) {
@@ -1311,7 +1349,9 @@ impl Escrow {
         require_admin(&env);
         env.storage()
             .persistent()
-            .set(&DataKey::UsageAlertThreshold, &threshold);
+            .remove(&DataKey::ServiceMetadata(service_id.clone()));
+        env.events()
+            .publish((symbol_short!("meta_clr"),), service_id);
     }
 
     /// Read the on-chain schema version, or `1` (the implicit
