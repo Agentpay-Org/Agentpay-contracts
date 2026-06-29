@@ -25,6 +25,20 @@
 //! * [`set_price`] — one-liner to call `set_service_price` on a client.
 //! * [`record`]    — one-liner to call `record_usage` on a client.
 //!
+//! ### Covered contracts (record_usage)
+//!
+//! The tests in the `record_usage_contract_*` group verify the documented
+//! return-value and event-payload semantics:
+//!
+//! * **`UsageRecord.requests`** carries the accumulated total, not the
+//!   per-call delta (so callers can skip an extra `get_usage` read).
+//! * **Event payload** `(agent, svc, delta, total)` — the third position is
+//!   the amount added *this* call, the fourth is the running total.
+//! * **Exactly one** `usage` event is emitted per successful invocation.
+//! * **Lifetime counters** (`get_total_usage_by_agent`,
+//!   `get_total_requests_all_time`) advance by the delta, not the total.
+//! * **Multi-service isolation** and **large-delta** behaviour are covered.
+//!
 //! ### Security note
 //! Tests that use `setup_initialized` rely on `mock_all_auths`, which
 //! satisfies every `require_auth` call unconditionally.  When a test needs to
@@ -53,6 +67,45 @@ fn setup_initialized(env: &Env) -> (EscrowClient<'_>, Address) {
     let admin = Address::generate(env);
     client.init(&admin);
     (client, admin)
+}
+
+/// Assert that the most recently emitted event is the expected `usage` event.
+fn assert_latest_usage_event(
+    env: &Env,
+    agent: &Address,
+    service_id: &Symbol,
+    expected_delta: u32,
+    expected_total: u32,
+) {
+    let events = env.events().all();
+    assert!(!events.is_empty(), "expected a usage event to be emitted");
+    let (_addr, topics, data) = events.last().unwrap();
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("usage"),).into_val(env);
+    assert_eq!(topics, expected_topics);
+    let decoded: (Address, Symbol, u32, u32) = data.into_val(env);
+    assert_eq!(
+        decoded,
+        (
+            agent.clone(),
+            service_id.clone(),
+            expected_delta,
+            expected_total,
+        )
+    );
+}
+
+/// Assert that the event stream contains exactly `expected_count` `usage` events.
+fn assert_usage_event_count(env: &Env, expected_count: usize) {
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("usage"),).into_val(env);
+    let count = env
+        .events()
+        .all()
+        .iter()
+        .filter(|(_, topics, _)| *topics == expected_topics)
+        .count();
+    assert_eq!(count, expected_count);
 }
 
 // ── Convenience address / symbol helpers ─────────────────────────────────────
@@ -142,12 +195,152 @@ fn test_record_usage_accumulates_across_calls() {
 
     let first = client.record_usage(&agent, &service_id, &40u32);
     assert_eq!(first.requests, 40);
+    assert_usage_event_count(&env, 1);
+    assert_latest_usage_event(&env, &agent, &service_id, 40, 40);
+
     let second = client.record_usage(&agent, &service_id, &60u32);
     assert_eq!(second.requests, 100);
+    assert_usage_event_count(&env, 2);
+    assert_latest_usage_event(&env, &agent, &service_id, 60, 100);
+
     let third = client.record_usage(&agent, &service_id, &1u32);
     assert_eq!(third.requests, 101);
+    assert_usage_event_count(&env, 3);
+    assert_latest_usage_event(&env, &agent, &service_id, 1, 101);
 
     assert_eq!(client.get_usage(&agent, &service_id), 101);
+    assert_eq!(client.get_total_usage_by_agent(&agent), 101);
+    assert_eq!(client.get_total_requests_all_time(), 101);
+}
+
+// ── record_usage return-value contract and event-payload semantics ──────
+//
+// `record_usage` documents that the returned `UsageRecord.requests` is the
+// *new total* (not the per-call delta) so the caller can confirm the
+// post-write state without a second storage read. The `usage` event carries
+// *both* the per-call delta (payload position 2) and the running total
+// (payload position 3) so off-chain loops can reconstruct the counter
+// sequence without ambiguity.
+
+/// Returns the accumulated total, **not** the per-call delta.
+///
+/// After `record_usage(agent, svc, 3)` and `record_usage(agent, svc, 5)`,
+/// the second `UsageRecord.requests` is `8` (the sum), never `5` (the
+/// second delta). This is the documented contract and the reason callers
+/// can skip an extra `get_usage` read after recording.
+#[test]
+fn test_record_usage_contract_return_is_new_total() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+
+    let agent = make_agent(&env);
+    let svc = make_service(&env, "billing_api");
+
+    // First call: accumulated = delta = 3.
+    let r1 = client.record_usage(&agent, &svc, &3u32);
+    assert_eq!(r1.requests, 3, "first call: total equals the delta");
+
+    // Second call: accumulated = 3 + 5 = 8.  The field must NOT be 5.
+    let r2 = client.record_usage(&agent, &svc, &5u32);
+    assert_eq!(
+        r2.requests, 8,
+        "second call: requests carries the new total (8), not the delta (5)"
+    );
+    assert_ne!(r2.requests, 5, "the field must not be the per-call delta");
+
+    // Verify the stored counter agrees.
+    assert_eq!(client.get_usage(&agent, &svc), 8);
+}
+
+/// Event payload: `requests` is the per-call delta, `total` is the running total.
+///
+/// The `usage` event publishes `(agent, service_id, delta, total)` where the
+/// third tuple element is the amount added in *this* call (not the counter)
+/// and the fourth element is the counter after applying the delta. This
+/// lets off-chain consumers distinguish "how much was just added" from
+/// "where does the counter stand now" in a single event scan.
+#[test]
+fn test_record_usage_contract_event_fields() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+
+    let agent = make_agent(&env);
+    let svc = make_service(&env, "svc_a");
+
+    // Call one: delta=3, total=3.
+    client.record_usage(&agent, &svc, &3u32);
+    assert_latest_usage_event(&env, &agent, &svc, 3, 3);
+
+    // Call two: delta=5, total=8.
+    client.record_usage(&agent, &svc, &5u32);
+    assert_latest_usage_event(&env, &agent, &svc, 5, 8);
+
+    // Call three: delta=1, total=9.
+    client.record_usage(&agent, &svc, &1u32);
+    assert_latest_usage_event(&env, &agent, &svc, 1, 9);
+}
+
+/// Exactly one `usage` event is emitted per successful `record_usage` call.
+///
+/// Verifies that the event stream contains the correct count of `usage`
+/// topic events — no duplicates, no missing events — which is critical
+/// for off-chain consumers that tally deltas from the event log.
+#[test]
+fn test_record_usage_contract_exactly_one_event_per_call() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+
+    let agent = make_agent(&env);
+    let svc = make_service(&env, "svc_a");
+
+    // No usage events yet.
+    assert_usage_event_count(&env, 0);
+
+    // Single call produces exactly one event.
+    client.record_usage(&agent, &svc, &1u32);
+    assert_usage_event_count(&env, 1);
+
+    // Second call produces a second event (total count = 2).
+    client.record_usage(&agent, &svc, &2u32);
+    assert_usage_event_count(&env, 2);
+
+    // Third call produces a third event (total count = 3).
+    client.record_usage(&agent, &svc, &3u32);
+    assert_usage_event_count(&env, 3);
+}
+
+/// Lifetime counters advance by exactly the delta on each call.
+///
+/// `get_total_usage_by_agent` and `get_total_requests_all_time` are
+/// monotonically increasing counters that aggregate every `record_usage`
+/// delta. This test verifies they grow by the per-call delta, not the
+/// running total, and that they remain consistent across multiple calls.
+#[test]
+fn test_record_usage_contract_lifetime_counters() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+
+    let agent = make_agent(&env);
+    let svc = make_service(&env, "svc_a");
+
+    // Baseline: zero.
+    assert_eq!(client.get_total_usage_by_agent(&agent), 0);
+    assert_eq!(client.get_total_requests_all_time(), 0u64);
+
+    // Delta 3 → lifetime counters advance by 3.
+    client.record_usage(&agent, &svc, &3u32);
+    assert_eq!(client.get_total_usage_by_agent(&agent), 3);
+    assert_eq!(client.get_total_requests_all_time(), 3u64);
+
+    // Delta 5 → lifetime counters advance by 5 (now 8).
+    client.record_usage(&agent, &svc, &5u32);
+    assert_eq!(client.get_total_usage_by_agent(&agent), 8);
+    assert_eq!(client.get_total_requests_all_time(), 8u64);
+
+    // Delta 2 → lifetime counters advance by 2 (now 10).
+    client.record_usage(&agent, &svc, &2u32);
+    assert_eq!(client.get_total_usage_by_agent(&agent), 10);
+    assert_eq!(client.get_total_requests_all_time(), 10u64);
 }
 
 #[test]
@@ -770,18 +963,33 @@ fn test_record_usage_emits_usage_event_with_payload() {
 
     let record = client.record_usage(&agent, &svc, &25u32);
 
-    let events = env.events().all();
-    assert!(!events.is_empty());
-    let (_addr, topics, data) = events.last().unwrap();
-    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
-        (symbol_short!("usage"),).into_val(&env);
-    assert_eq!(topics, expected_topics);
-    // Payload is (agent, service_id, requests_delta, new_total).
-    let decoded: (Address, Symbol, u32, u32) = data.into_val(&env);
-    assert_eq!(
-        decoded,
-        (agent.clone(), svc.clone(), 25u32, record.requests)
-    );
+    assert_eq!(record.requests, 25);
+    assert_usage_event_count(&env, 1);
+    assert_latest_usage_event(&env, &agent, &svc, 25, 25);
+}
+
+#[test]
+fn test_record_usage_isolates_services_and_large_deltas() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let svc_a = Symbol::new(&env, "svc_a");
+    let svc_b = Symbol::new(&env, "svc_b");
+
+    let first = client.record_usage(&agent, &svc_a, &1_000_000_000u32);
+    assert_eq!(first.requests, 1_000_000_000u32);
+    assert_eq!(client.get_usage(&agent, &svc_a), 1_000_000_000u32);
+    assert_eq!(client.get_usage(&agent, &svc_b), 0u32);
+    assert_eq!(client.get_total_usage_by_agent(&agent), 1_000_000_000u32);
+    assert_eq!(client.get_total_requests_all_time(), 1_000_000_000u64);
+
+    let second = client.record_usage(&agent, &svc_b, &7u32);
+    assert_eq!(second.requests, 7u32);
+    assert_eq!(client.get_usage(&agent, &svc_a), 1_000_000_000u32);
+    assert_eq!(client.get_usage(&agent, &svc_b), 7u32);
+    assert_eq!(client.get_total_usage_by_agent(&agent), 1_000_000_007u32);
+    assert_eq!(client.get_total_requests_all_time(), 1_000_000_007u64);
+    assert_latest_usage_event(&env, &agent, &svc_b, 7, 7);
 }
 
 #[test]
