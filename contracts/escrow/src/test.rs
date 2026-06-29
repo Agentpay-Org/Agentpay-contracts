@@ -25,19 +25,18 @@
 //! * [`set_price`] — one-liner to call `set_service_price` on a client.
 //! * [`record`]    — one-liner to call `record_usage` on a client.
 //!
-//! ### Covered contracts (record_usage)
+//! ### `register_service_with_metadata` coverage
 //!
-//! The tests in the `record_usage_contract_*` group verify the documented
-//! return-value and event-payload semantics:
-//!
-//! * **`UsageRecord.requests`** carries the accumulated total, not the
-//!   per-call delta (so callers can skip an extra `get_usage` read).
-//! * **Event payload** `(agent, svc, delta, total)` — the third position is
-//!   the amount added *this* call, the fourth is the running total.
-//! * **Exactly one** `usage` event is emitted per successful invocation.
-//! * **Lifetime counters** (`get_total_usage_by_agent`,
-//!   `get_total_requests_all_time`) advance by the delta, not the total.
-//! * **Multi-service isolation** and **large-delta** behaviour are covered.
+//! The combined registration-plus-metadata entrypoint is tested for:
+//! * **Atomicity** — after one call `is_service_registered` is `true` and
+//!   `get_service_metadata` returns the exact description and owner.
+//! * **Event emission** — `svc_reg(service_id, owner)` is published.
+//! * **Idempotent overwrite** — re-registering an existing id replaces its
+//!   metadata; an empty description is accepted.
+//! * **Admin gate** — a non-admin caller is rejected (`Unauthorized`).
+//! * **Pause gate** — calling while paused panics with `ContractPaused` (#4).
+//! * **Equivalence** — the combined call produces the same post-state as the
+//!   two-step `register_service + set_service_metadata` sequence.
 //!
 //! ### Security note
 //! Tests that use `setup_initialized` rely on `mock_all_auths`, which
@@ -1143,6 +1142,162 @@ fn test_service_slot_toggle_matrix_is_independent() {
     client.set_service_disabled(&svc, &false);
     assert!(client.is_service_registered(&svc));
     assert!(!client.is_service_disabled(&svc));
+}
+
+// ── register_service_with_metadata ───────────────────────────────────────────
+//
+// `register_service_with_metadata` atomically sets `ServiceRegistered` and
+// `ServiceMetadata` in a single admin-gated call, emits `svc_reg(service_id,
+// owner)`, honours the pause gate, and is idempotent (overwrites metadata on
+// re-registration). The combined call must produce the same resulting state as
+// calling `register_service` followed by `set_service_metadata`.
+
+/// After a single `register_service_with_metadata` call, both
+/// `is_service_registered` returns `true` and `get_service_metadata`
+/// returns the exact description and owner that were passed.
+#[test]
+fn test_register_with_metadata_atomicity() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let svc = Symbol::new(&env, "infer");
+    let owner = Address::generate(&env);
+    let desc = String::from_str(&env, "GPU inference endpoint");
+
+    client.register_service_with_metadata(&svc, &desc, &owner);
+
+    // Both slots are set atomically by the single call.
+    assert!(client.is_service_registered(&svc));
+    let meta = client.get_service_metadata(&svc).unwrap();
+    assert_eq!(meta.description, desc);
+    assert_eq!(meta.owner, owner);
+}
+
+/// The call emits a `svc_reg(service_id, owner)` event that can be
+/// decoded from `env.events().all()`.
+#[test]
+fn test_register_with_metadata_emits_svc_reg_event() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let svc = Symbol::new(&env, "infer");
+    let owner = Address::generate(&env);
+    let desc = String::from_str(&env, "GPU inference endpoint");
+
+    client.register_service_with_metadata(&svc, &desc, &owner);
+
+    let events = env.events().all();
+    assert!(!events.is_empty());
+    let (_addr, topics, data) = events.last().unwrap();
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("svc_reg"),).into_val(&env);
+    assert_eq!(topics, expected_topics);
+    let decoded: (Symbol, Address) = data.into_val(&env);
+    assert_eq!(decoded, (svc, owner));
+}
+
+/// Re-registering an existing service id overwrites the stored metadata
+/// (idempotent overwrite).
+#[test]
+fn test_register_with_metadata_overwrite() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let svc = Symbol::new(&env, "infer");
+    let owner1 = Address::generate(&env);
+    let desc1 = String::from_str(&env, "first description");
+    let owner2 = Address::generate(&env);
+    let desc2 = String::from_str(&env, "second description");
+
+    // First registration.
+    client.register_service_with_metadata(&svc, &desc1, &owner1);
+    let meta = client.get_service_metadata(&svc).unwrap();
+    assert_eq!(meta.description, desc1);
+    assert_eq!(meta.owner, owner1);
+
+    // Overwrite with different metadata.
+    client.register_service_with_metadata(&svc, &desc2, &owner2);
+    let meta = client.get_service_metadata(&svc).unwrap();
+    assert_eq!(meta.description, desc2);
+    assert_eq!(meta.owner, owner2);
+    // Registration flag stays true (idempotent).
+    assert!(client.is_service_registered(&svc));
+}
+
+/// An empty description string is accepted by the entrypoint.
+#[test]
+fn test_register_with_metadata_empty_description_accepted() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let svc = Symbol::new(&env, "infer");
+    let owner = Address::generate(&env);
+    let empty = String::from_str(&env, "");
+
+    client.register_service_with_metadata(&svc, &empty, &owner);
+
+    assert!(client.is_service_registered(&svc));
+    let meta = client.get_service_metadata(&svc).unwrap();
+    assert_eq!(meta.description, empty);
+    assert_eq!(meta.owner, owner);
+}
+
+/// A non-admin caller is rejected with `Unauthorized` (the auth framework's
+/// panic, not a typed error).
+#[test]
+#[should_panic(expected = "Unauthorized")]
+fn test_register_with_metadata_requires_admin() {
+    let env = Env::default();
+    let client = setup_scoped_auth(&env);
+    let svc = Symbol::new(&env, "infer");
+    let owner = Address::generate(&env);
+    let desc = String::from_str(&env, "some service");
+    // No admin auth is wired up beyond init, so require_admin will fail.
+    client.register_service_with_metadata(&svc, &desc, &owner);
+}
+
+/// Calling while the contract is paused panics with `ContractPaused` (#4).
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")]
+fn test_register_with_metadata_rejected_while_paused() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    client.pause();
+    let svc = Symbol::new(&env, "infer");
+    let owner = Address::generate(&env);
+    let desc = String::from_str(&env, "some service");
+    client.register_service_with_metadata(&svc, &desc, &owner);
+}
+
+/// The combined call produces the same resulting state as calling
+/// `register_service` then `set_service_metadata` separately, proving
+/// the atomic entrypoint is semantically equivalent to the two-step
+/// sequence.
+#[test]
+fn test_register_with_metadata_equivalent_to_separate_calls() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let svc = Symbol::new(&env, "infer");
+    let owner = Address::generate(&env);
+    let desc = String::from_str(&env, "GPU inference endpoint");
+
+    // Combined call.
+    client.register_service_with_metadata(&svc, &desc, &owner);
+
+    // Capture state produced by the combined call.
+    let registered_combined = client.is_service_registered(&svc);
+    let meta_combined = client.get_service_metadata(&svc).unwrap();
+
+    // Fresh contract, separate calls.
+    let env2 = Env::default();
+    let (client2, _admin2) = setup_initialized(&env2);
+    let svc2 = Symbol::new(&env2, "infer");
+    let owner2 = Address::generate(&env2);
+    let desc2 = String::from_str(&env2, "GPU inference endpoint");
+
+    client2.register_service(&svc2);
+    client2.set_service_metadata(&svc2, &desc2, &owner2);
+
+    // State must be identical.
+    assert_eq!(client2.is_service_registered(&svc2), registered_combined);
+    let meta_separate = client2.get_service_metadata(&svc2).unwrap();
+    assert_eq!(meta_separate, meta_combined);
 }
 
 #[test]
