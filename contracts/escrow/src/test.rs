@@ -2442,3 +2442,171 @@ fn test_compute_billing_independent_per_service() {
     assert_eq!(client.compute_billing(&agent, &svc1), 50);
     assert_eq!(client.compute_billing(&agent, &svc2), 60);
 }
+// ── settle owner-or-admin authorization tests ────────────────────────────────
+//
+// Auth matrix covered:
+//   - Admin settles any service (with or without metadata)
+//   - Registered owner settles their own service
+//   - Owner of service A cannot settle service B
+//   - Stranger rejected
+//   - No metadata + non-admin → ServiceMetadataNotFound (#13)
+//   - Pause gate fires (#4) before settle logic
+//   - Drain-to-zero + LastSettlement stamp on authorized path
+
+/// Positive: admin settles any service regardless of metadata.
+#[test]
+fn test_settle_admin_can_settle_any_service() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "infer");
+
+    client.set_service_price(&svc, &100i128);
+    client.record_usage(&agent, &svc, &5u32);
+    let billed = client.settle(&admin, &agent, &svc);
+    assert_eq!(billed, 500i128);
+}
+
+/// Positive: registered owner settles their own service.
+#[test]
+fn test_settle_owner_can_settle_own_service() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let owner = Address::generate(&env);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "embed");
+
+    client.register_service_with_metadata(
+        &svc,
+        &soroban_sdk::String::from_str(&env, "Embedding API"),
+        &owner,
+    );
+    client.set_service_price(&svc, &50i128);
+    client.record_usage(&agent, &svc, &4u32);
+    let billed = client.settle(&owner, &agent, &svc);
+    assert_eq!(billed, 200i128);
+}
+
+/// Negative: owner of service A cannot settle service B.
+#[test]
+#[should_panic]
+fn test_settle_owner_cannot_settle_other_service() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let owner_a = Address::generate(&env);
+    let owner_b = Address::generate(&env);
+    let agent = Address::generate(&env);
+    let svc_a = Symbol::new(&env, "alpha");
+    let svc_b = Symbol::new(&env, "beta");
+
+    client.register_service_with_metadata(
+        &svc_a,
+        &soroban_sdk::String::from_str(&env, "Alpha"),
+        &owner_a,
+    );
+    client.register_service_with_metadata(
+        &svc_b,
+        &soroban_sdk::String::from_str(&env, "Beta"),
+        &owner_b,
+    );
+    client.set_service_price(&svc_b, &10i128);
+    client.record_usage(&agent, &svc_b, &3u32);
+    // owner_a tries to settle svc_b — must panic
+    client.settle(&owner_a, &agent, &svc_b);
+}
+
+/// Negative: stranger rejected.
+#[test]
+#[should_panic]
+fn test_settle_stranger_rejected() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let owner = Address::generate(&env);
+    let stranger = Address::generate(&env);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "chat");
+
+    client.register_service_with_metadata(
+        &svc,
+        &soroban_sdk::String::from_str(&env, "Chat API"),
+        &owner,
+    );
+    client.set_service_price(&svc, &20i128);
+    client.record_usage(&agent, &svc, &2u32);
+    client.settle(&stranger, &agent, &svc);
+}
+
+/// Negative: no metadata + non-admin panics #13 ServiceMetadataNotFound.
+#[test]
+#[should_panic(expected = "Error(Contract, #13)")]
+fn test_settle_no_metadata_non_admin_panics() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let stranger = Address::generate(&env);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "ghost");
+
+    client.set_service_price(&svc, &10i128);
+    client.record_usage(&agent, &svc, &1u32);
+    client.settle(&stranger, &agent, &svc);
+}
+
+/// Positive: admin can settle a metadata-less service.
+#[test]
+fn test_settle_admin_settles_metadata_less_service() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "raw");
+
+    client.set_service_price(&svc, &10i128);
+    client.record_usage(&agent, &svc, &3u32);
+    let billed = client.settle(&admin, &agent, &svc);
+    assert_eq!(billed, 30i128);
+}
+
+/// Drain-to-zero: after settle, usage counter is 0.
+#[test]
+fn test_settle_drains_usage_to_zero() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "drain");
+
+    client.set_service_price(&svc, &10i128);
+    client.record_usage(&agent, &svc, &5u32);
+    client.settle(&admin, &agent, &svc);
+    let usage = client.get_usage(&agent, &svc);
+    assert_eq!(usage, 0u32);
+}
+
+/// LastSettlement stamp is recorded after settle.
+#[test]
+fn test_settle_records_last_settlement_timestamp() {
+    let env = Env::default();
+    env.ledger().with_mut(|li| li.timestamp = 1000);
+    let (client, admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "stamp");
+
+    client.set_service_price(&svc, &10i128);
+    client.record_usage(&agent, &svc, &2u32);
+    client.settle(&admin, &agent, &svc);
+    let last = client.get_last_settlement(&agent, &svc);
+    assert_eq!(last, Some(1000u64));
+}
+
+/// Pause gate fires (#4) before settle logic.
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")]
+fn test_settle_paused_rejected() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "paused");
+
+    client.set_service_price(&svc, &10i128);
+    client.record_usage(&agent, &svc, &1u32);
+    client.pause();
+    client.settle(&admin, &agent, &svc);
+}
