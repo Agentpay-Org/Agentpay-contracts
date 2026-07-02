@@ -1023,6 +1023,110 @@ fn test_settle_zero_usage_returns_zero_stamps_and_emits_event() {
 }
 
 #[test]
+fn test_total_settled_getters_default_to_zero() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+
+    assert_eq!(client.get_total_settled_by_agent(&agent), 0i128);
+    assert_eq!(client.get_total_settled_all_time(), 0i128);
+}
+
+#[test]
+fn test_total_settled_counters_sum_across_settles_and_agents() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let agent_a = Address::generate(&env);
+    let agent_b = Address::generate(&env);
+    let inference = Symbol::new(&env, "infer");
+    let storage = Symbol::new(&env, "storage");
+
+    client.set_service_price(&inference, &10i128);
+    client.set_service_price(&storage, &7i128);
+
+    client.record_usage(&agent_a, &inference, &4u32);
+    assert_eq!(client.settle(&agent_a, &inference), 40i128);
+    assert_eq!(client.get_total_settled_by_agent(&agent_a), 40i128);
+    assert_eq!(client.get_total_settled_by_agent(&agent_b), 0i128);
+    assert_eq!(client.get_total_settled_all_time(), 40i128);
+
+    client.record_usage(&agent_a, &storage, &3u32);
+    assert_eq!(client.settle(&agent_a, &storage), 21i128);
+    assert_eq!(client.get_total_settled_by_agent(&agent_a), 61i128);
+    assert_eq!(client.get_total_settled_all_time(), 61i128);
+
+    client.record_usage(&agent_b, &inference, &8u32);
+    assert_eq!(client.settle(&agent_b, &inference), 80i128);
+    assert_eq!(client.get_total_settled_by_agent(&agent_a), 61i128);
+    assert_eq!(client.get_total_settled_by_agent(&agent_b), 80i128);
+    assert_eq!(client.get_total_settled_all_time(), 141i128);
+}
+
+#[test]
+fn test_total_settled_counters_ignore_zero_billed_settles() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let free = Symbol::new(&env, "free");
+    let paid = Symbol::new(&env, "paid");
+
+    client.record_usage(&agent, &free, &5u32);
+    assert_eq!(client.settle(&agent, &free), 0i128);
+    assert_eq!(client.get_total_settled_by_agent(&agent), 0i128);
+    assert_eq!(client.get_total_settled_all_time(), 0i128);
+
+    client.set_service_price(&paid, &9i128);
+    client.record_usage(&agent, &paid, &2u32);
+    assert_eq!(client.settle(&agent, &paid), 18i128);
+
+    assert_eq!(client.settle(&agent, &paid), 0i128);
+    assert_eq!(client.get_total_settled_by_agent(&agent), 18i128);
+    assert_eq!(client.get_total_settled_all_time(), 18i128);
+}
+
+#[test]
+fn test_total_settled_counters_include_settle_all() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let inference = Symbol::new(&env, "infer");
+    let storage = Symbol::new(&env, "storage");
+
+    client.set_service_price(&inference, &10i128);
+    client.set_service_price(&storage, &25i128);
+    client.record_usage(&agent, &inference, &2u32);
+    client.record_usage(&agent, &storage, &3u32);
+
+    let settled = client.settle_all(&admin, &agent);
+    assert_eq!(settled.len(), 2);
+    assert_eq!(settled.get(0), Some((inference.clone(), 20i128)));
+    assert_eq!(settled.get(1), Some((storage.clone(), 75i128)));
+    assert_eq!(client.get_total_settled_by_agent(&agent), 95i128);
+    assert_eq!(client.get_total_settled_all_time(), 95i128);
+}
+
+#[test]
+fn test_total_settled_counters_saturate_at_i128_max() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let svc_a = Symbol::new(&env, "svc_a");
+    let svc_b = Symbol::new(&env, "svc_b");
+
+    client.set_service_price(&svc_a, &i128::MAX);
+    client.record_usage(&agent, &svc_a, &1u32);
+    assert_eq!(client.settle(&agent, &svc_a), i128::MAX);
+    assert_eq!(client.get_total_settled_by_agent(&agent), i128::MAX);
+    assert_eq!(client.get_total_settled_all_time(), i128::MAX);
+
+    client.set_service_price(&svc_b, &i128::MAX);
+    client.record_usage(&agent, &svc_b, &1u32);
+    assert_eq!(client.settle(&agent, &svc_b), i128::MAX);
+    assert_eq!(client.get_total_settled_by_agent(&agent), i128::MAX);
+    assert_eq!(client.get_total_settled_all_time(), i128::MAX);
+}
+
+#[test]
 fn test_init_stamps_schema_version() {
     let env = Env::default();
     let (client, admin) = setup_initialized(&env);

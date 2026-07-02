@@ -22,7 +22,8 @@ Soroban offers three storage tiers — `instance`, `temporary`, and `persistent`
 
 The escrow contract stores everything in `persistent()` because:
 
-1. Usage counters (`Usage`, `TotalUsageByAgent`, `TotalRequestsAllTime`) must
+1. Usage and settlement counters (`Usage`, `TotalUsageByAgent`,
+   `TotalRequestsAllTime`, `TotalSettledByAgent`, `TotalSettledAllTime`) must
    survive between the moment usage is recorded and the moment the off-chain
    settlement loop reads and drains them — a window that can span many ledger
    TTL cycles.
@@ -68,6 +69,7 @@ per-pair counters regularly to keep storage costs bounded.
 | `MaxRequestsPerWindow` | `u32` | `0` (limiter disabled) | `set_max_requests_per_window` | No — lifetime |
 | `WindowSeconds` | `u64` | `0` (limiter disabled) | `set_rate_window_seconds` | No — lifetime |
 | `TotalRequestsAllTime` | `u64` | `0` | `record_usage` | No — lifetime (never reset) |
+| `TotalSettledAllTime` | `i128` (stroops) | `0` | `settle`, `settle_all` | No — lifetime (never reset) |
 
 ### Per-service slots — cardinality O(S)
 
@@ -85,6 +87,7 @@ per-pair counters regularly to keep storage costs bounded.
 | `AgentAllowed(agent)` | `Address` | `bool` | `false` | `set_agent_allowed` | No — lifetime |
 | `AgentBlocked(agent)` | `Address` | `bool` | `false` | `set_agent_blocked` | No — lifetime |
 | `TotalUsageByAgent(agent)` | `Address` | `u32` | `0` | `record_usage` | No — lifetime (never reset by `settle`) |
+| `TotalSettledByAgent(agent)` | `Address` | `i128` (stroops) | `0` | `settle`, `settle_all` | No — lifetime (never reset by `settle`) |
 | `RateWindow(agent)` | `Address` | `(u64, u32)` = `(window_start, count)` | `(0, 0)` | `record_usage` (rate-limit path) | No — rolls forward on next call when window expires |
 
 ### Per-(agent, service) pair slots — cardinality O(A × S)
@@ -111,6 +114,16 @@ stamps `LastSettlement`. This is the **only** key drained by `settle`.
 touch it — it accumulates forever (saturating at `u32::MAX`). It is intended for
 analytics and SLA tiering, not for billing. The per-pair `Usage` counter is the
 billing source of truth.
+
+### `TotalSettledByAgent(agent)` and `TotalSettledAllTime`
+
+These counters track lifetime settled value in stroops. `settle` and
+`settle_all` add each non-zero billed amount via saturating arithmetic and never
+subtract from the counters. `get_total_settled_by_agent(agent)` and
+`get_total_settled_all_time()` return `0` when the corresponding slot is absent.
+Unlike `Usage`, these counters are never drained by settlement and are intended
+for credit limits, loyalty pricing, and protocol-level settled-value analytics
+without replaying historical `settled` events.
 
 ### `RateWindow(agent)` — fixed-window semantics
 
@@ -149,8 +162,12 @@ default) for pre-migration contracts.
   Settlement accounting relies on `Usage` starting at `0` after each `settle`
   call; any code path that writes `Usage` outside of `record_usage` and `settle`
   would break billing invariants.
-- **`TotalUsageByAgent` and `TotalRequestsAllTime` are never reset.** Downstream
-  analytics must not treat these as settlement-cycle deltas.
+- **Lifetime counters are never reset.** `TotalUsageByAgent`,
+  `TotalRequestsAllTime`, `TotalSettledByAgent`, and `TotalSettledAllTime`
+  must not be treated as settlement-cycle deltas by downstream analytics.
+- **Settled-value counters are monotonic.** Non-positive bills leave
+  `TotalSettledByAgent` and `TotalSettledAllTime` unchanged, and positive bills
+  use saturating addition so overflow clamps at `i128::MAX`.
 - **`AgentBlocked` takes precedence over `AgentAllowed`.** An agent that is both
   blocked and allow-listed is rejected. Implementations relying on the allowlist
   gate must ensure the blocklist is not populated with the same address.

@@ -66,6 +66,20 @@ the lifetime signal. Off-chain billing pipelines that need the corrected
 view should subtract the decrement event amount from the lifetime counter
 when processing the `usage_dec` event.
 
+### Lifetime settled-amount counters
+
+In addition to lifetime request counters, the escrow contract tracks lifetime
+settled value in stroops:
+
+- `get_total_settled_by_agent(agent)` returns the cross-service amount ever
+  settled for one agent.
+- `get_total_settled_all_time()` returns the protocol-wide amount ever settled.
+
+These counters are updated by settlement drains, use saturating arithmetic, and
+are never reset or decremented by later `settle` calls. They default to `0`
+before the first billable settlement, so dashboards can read them without
+special-casing new agents or fresh deployments.
+
 ### Per-agent rate limiting (fixed window)
 
 `record_usage` supports an optional per-agent rate limit anchored to

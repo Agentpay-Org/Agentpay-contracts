@@ -38,7 +38,8 @@ contract is paused.
 
 `get_admin`, `get_pending_admin`, `get_usage`, `get_service_price`,
 `compute_billing`, `get_last_settlement`, `get_total_requests_all_time`,
-`get_total_usage_by_agent`, `get_min_requests_per_call`,
+`get_total_usage_by_agent`, `get_total_settled_by_agent`,
+`get_total_settled_all_time`, `get_min_requests_per_call`,
 `get_max_requests_per_call`, `is_allowlist_enabled`, `is_agent_allowed`,
 `is_service_registration_required`, `is_service_registered`,
 `is_service_disabled`, `is_paused`, `get_service_metadata`,

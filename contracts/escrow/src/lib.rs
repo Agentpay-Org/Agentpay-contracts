@@ -109,6 +109,13 @@ pub enum DataKey {
     /// Protocol-wide lifetime request counter, written by every
     /// successful `record_usage`. Useful as a single grafana gauge.
     TotalRequestsAllTime,
+    /// Cross-service lifetime settled amount, in stroops, for a given
+    /// agent. Settlement does NOT reset this counter; it is the lifetime
+    /// value signal for credit limits, loyalty pricing, and SLA tiering.
+    TotalSettledByAgent(Address),
+    /// Protocol-wide lifetime settled amount, in stroops, written by every
+    /// successful settlement drain. Saturates at `i128::MAX`.
+    TotalSettledAllTime,
     /// Ledger timestamp (seconds since unix epoch) at which the last
     /// `settle` call drained this `(agent, service_id)` pair. Lets
     /// off-chain SLA monitoring catch stuck settlement cycles.
@@ -413,6 +420,32 @@ fn compute_billing_tiered(requests: u32, tiers: &Vec<PriceTier>) -> i128 {
 
     total
 }
+
+/// Add a successful settlement bill to the lifetime settled-amount counters.
+///
+/// Non-positive bills leave the counters untouched, preserving the monotonic
+/// lifetime invariant while avoiding unnecessary zero-value storage slots.
+fn add_settled_totals(env: &Env, agent: &Address, billed: i128) {
+    if billed <= 0 {
+        return;
+    }
+
+    let agent_key = DataKey::TotalSettledByAgent(agent.clone());
+    let agent_prev: i128 = env.storage().persistent().get(&agent_key).unwrap_or(0);
+    env.storage()
+        .persistent()
+        .set(&agent_key, &agent_prev.saturating_add(billed));
+
+    let all_prev: i128 = env
+        .storage()
+        .persistent()
+        .get(&DataKey::TotalSettledAllTime)
+        .unwrap_or(0);
+    env.storage().persistent().set(
+        &DataKey::TotalSettledAllTime,
+        &all_prev.saturating_add(billed),
+    );
+}
 #[contract]
 pub struct Escrow;
 
@@ -686,6 +719,28 @@ impl Escrow {
         env.storage()
             .persistent()
             .get(&DataKey::TotalUsageByAgent(agent))
+            .unwrap_or(0)
+    }
+
+    /// Read the cross-service lifetime settled amount for an agent, in stroops.
+    ///
+    /// This counter is written by settlement drains and never decremented or
+    /// reset by later `settle` calls.
+    pub fn get_total_settled_by_agent(env: Env, agent: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::TotalSettledByAgent(agent))
+            .unwrap_or(0)
+    }
+
+    /// Read the protocol-wide lifetime settled amount, in stroops.
+    ///
+    /// Defaults to `0` before the first billable settlement and saturates at
+    /// `i128::MAX` instead of overflowing.
+    pub fn get_total_settled_all_time(env: Env) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::TotalSettledAllTime)
             .unwrap_or(0)
     }
 
@@ -1016,6 +1071,7 @@ impl Escrow {
             // panicking; off-chain loop treats saturation as an error signal.
             (requests as i128).saturating_mul(price)
         };
+        add_settled_totals(&env, &agent, billed);
         env.storage().persistent().set(&usage_key, &0u32);
         // Prune the service from the agent's index since usage is now zero.
         // This keeps the index consistent with the underlying counters and
@@ -1108,6 +1164,8 @@ impl Escrow {
                 .unwrap_or(0);
             // saturate: mirrors single-settle semantics.
             let billed = (requests as i128).saturating_mul(price);
+
+            add_settled_totals(&env, &agent, billed);
 
             // Drain and stamp even when usage is zero (consistent with
             // single-settle: every drain updates LastSettlement).
