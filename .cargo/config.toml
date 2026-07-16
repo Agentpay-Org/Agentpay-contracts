@@ -1,0 +1,4 @@
+# Workaround for ethnum 1.5.2 Rust 1.91.1 compatibility issue
+# Cap lints to warn to allow compilation despite ethnum incompatibility
+[build]
+rustflags = ["--cap-lints", "warn"]
