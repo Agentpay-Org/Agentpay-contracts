@@ -232,6 +232,14 @@ pub enum EscrowError {
     /// `resolve_dispute` was called with `refund_requests` exceeding the
     /// current accumulated usage — prevents double-refunds.
     RefundExceedsUsage = 22,
+    /// `set_min_requests_per_call` was called with a `min` that exceeds the
+    /// currently-stored `MaxRequestsPerCall`, or `set_max_requests_per_call`
+    /// was called with a `max` that is below the currently-stored
+    /// `MinRequestsPerCall`. Either configuration would make the
+    /// `min <= max` invariant unsatisfiable, permanently bricking metering
+    /// until corrected. An equal value (`min == max`) is accepted — it
+    /// enforces an exact per-call request count.
+    InvalidRequestBounds = 23,
 }
 
 #[contracttype]
@@ -1233,10 +1241,41 @@ impl Escrow {
     /// Admin sets the per-call lower bound on `requests` for batched
     /// writes. Pass `0` to disable the floor.
     ///
+    /// # Invariant: `min <= max`
+    ///
+    /// Rejects a `min_requests` that exceeds the currently-stored
+    /// `MaxRequestsPerCall` (defaulting to `u32::MAX` when unset) with
+    /// [`EscrowError::InvalidRequestBounds`]. This prevents a contradictory
+    /// configuration that would make every `record_usage` call unsatisfiable —
+    /// no value could pass both the ceiling check (#8) and the floor check (#9)
+    /// simultaneously.
+    ///
+    /// `min == max` (an exact-count requirement) is explicitly allowed:
+    /// every `record_usage` call must supply precisely that many requests.
+    ///
+    /// # Setting order
+    ///
+    /// When both bounds need to change, set the ceiling first via
+    /// [`Self::set_max_requests_per_call`] and then the floor via this
+    /// entrypoint. Doing it in the reverse order risks a transient
+    /// `InvalidRequestBounds` rejection if the new floor temporarily
+    /// exceeds the old ceiling.
+    ///
     /// Emits a `cfg_set` event with data `(min_call, min_requests)` after
     /// the storage write so indexers can observe every floor change on-chain.
     pub fn set_min_requests_per_call(env: Env, min_requests: u32) {
         require_admin(&env);
+        // Cross-bound guard: reject a floor that exceeds the current ceiling.
+        // Default the ceiling to u32::MAX (no cap) when it has never been set,
+        // which means any min value is valid against an unset ceiling.
+        let current_max: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MaxRequestsPerCall)
+            .unwrap_or(u32::MAX);
+        if min_requests > current_max {
+            panic_with_error!(&env, EscrowError::InvalidRequestBounds);
+        }
         env.storage()
             .persistent()
             .set(&DataKey::MinRequestsPerCall, &min_requests);
@@ -1312,10 +1351,41 @@ impl Escrow {
     /// Admin sets the per-call upper bound on `requests` accepted by
     /// `record_usage`. Pass `u32::MAX` to effectively disable the cap.
     ///
+    /// # Invariant: `min <= max`
+    ///
+    /// Rejects a `max_requests` that is below the currently-stored
+    /// `MinRequestsPerCall` (defaulting to `0` when unset) with
+    /// [`EscrowError::InvalidRequestBounds`]. This prevents a contradictory
+    /// configuration that would make every `record_usage` call unsatisfiable —
+    /// no value could pass both the ceiling check (#8) and the floor check (#9)
+    /// simultaneously.
+    ///
+    /// `max == min` (an exact-count requirement) is explicitly allowed:
+    /// every `record_usage` call must supply precisely that many requests.
+    ///
+    /// # Setting order
+    ///
+    /// When both bounds need to change, set the ceiling first via this
+    /// entrypoint and then the floor via
+    /// [`Self::set_min_requests_per_call`]. Doing it in the reverse order
+    /// risks a transient `InvalidRequestBounds` rejection if the new floor
+    /// temporarily exceeds the old ceiling.
+    ///
     /// Emits a `cfg_set` event with data `(max_call, max_requests)` after
     /// the storage write so indexers can observe every cap change on-chain.
     pub fn set_max_requests_per_call(env: Env, max_requests: u32) {
         require_admin(&env);
+        // Cross-bound guard: reject a ceiling that falls below the current floor.
+        // Default the floor to 0 (no floor) when it has never been set, which
+        // means any max value is valid against an unset floor.
+        let current_min: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MinRequestsPerCall)
+            .unwrap_or(0);
+        if max_requests < current_min {
+            panic_with_error!(&env, EscrowError::InvalidRequestBounds);
+        }
         env.storage()
             .persistent()
             .set(&DataKey::MaxRequestsPerCall, &max_requests);
