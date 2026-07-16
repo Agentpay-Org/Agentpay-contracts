@@ -1,11 +1,4 @@
 [toolchain]
-# Pinned to 1.81.0: soroban-env-host v22.1.x depends on ethnum v1.5.2, which
-# uses a transmute trick to construct `TryFromIntError` that Rust 1.82 made a
-# hard error (E0512: transmute between types of different sizes).  This pin
-# holds CI on the last toolchain that compiles the soroban-sdk v22 dependency
-# tree correctly.  When soroban-sdk v22 is superseded by a version that no
-# longer pulls in ethnum v1.5.2 (or uses a patched ethnum ≥ 1.5.3), this
-# pin can be widened back to "stable".
-channel = "1.81.0"
+channel = "stable"
 targets = ["wasm32-unknown-unknown"]
 components = ["rustfmt", "clippy"]
