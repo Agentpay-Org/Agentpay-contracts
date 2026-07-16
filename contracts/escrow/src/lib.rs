@@ -601,7 +601,7 @@ impl Escrow {
             .persistent()
             .get(&DataKey::TotalRequestsAllTime)
             .unwrap_or(0);
-        // u64 horizon; saturate not panic. 
+        // u64 horizon; saturate not panic.
         env.storage().persistent().set(
             &DataKey::TotalRequestsAllTime,
             &proto_prev.saturating_add(requests as u64),
