@@ -209,12 +209,12 @@ fn test_record_usage_accumulates_across_calls() {
 
     let second = client.record_usage(&agent, &service_id, &60u32);
     assert_eq!(second.requests, 100);
-    assert_usage_event_count(&env, 2);
+    assert_usage_event_count(&env, 1);
     assert_latest_usage_event(&env, &agent, &service_id, 60, 100);
 
     let third = client.record_usage(&agent, &service_id, &1u32);
     assert_eq!(third.requests, 101);
-    assert_usage_event_count(&env, 3);
+    assert_usage_event_count(&env, 1);
     assert_latest_usage_event(&env, &agent, &service_id, 1, 101);
 
     assert_eq!(client.get_usage(&agent, &service_id), 101);
@@ -309,13 +309,13 @@ fn test_record_usage_contract_exactly_one_event_per_call() {
     client.record_usage(&agent, &svc, &1u32);
     assert_usage_event_count(&env, 1);
 
-    // Second call produces a second event (total count = 2).
+    // Each invocation leaves one usage event in the current event buffer.
     client.record_usage(&agent, &svc, &2u32);
-    assert_usage_event_count(&env, 2);
+    assert_usage_event_count(&env, 1);
 
-    // Third call produces a third event (total count = 3).
+    // The buffer still reflects the latest invocation only.
     client.record_usage(&agent, &svc, &3u32);
-    assert_usage_event_count(&env, 3);
+    assert_usage_event_count(&env, 1);
 }
 
 /// Lifetime counters advance by exactly the delta on each call.
@@ -994,11 +994,11 @@ fn test_record_usage_isolates_services_and_large_deltas() {
 
     let second = client.record_usage(&agent, &svc_b, &7u32);
     assert_eq!(second.requests, 7u32);
+    assert_latest_usage_event(&env, &agent, &svc_b, 7, 7);
     assert_eq!(client.get_usage(&agent, &svc_a), 1_000_000_000u32);
     assert_eq!(client.get_usage(&agent, &svc_b), 7u32);
     assert_eq!(client.get_total_usage_by_agent(&agent), 1_000_000_007u32);
     assert_eq!(client.get_total_requests_all_time(), 1_000_000_007u64);
-    assert_latest_usage_event(&env, &agent, &svc_b, 7, 7);
 }
 
 #[test]
@@ -2658,8 +2658,7 @@ fn test_set_price_flag_toggled_mid_life() {
     client.set_service_price(&svc, &200i128); // strict + unregistered: rejected
 }
 
-/// The registered service owner can settle their own service without the
-/// admin key.
+/// A service owner can settle their own service via `settle_all`.
 #[test]
 fn test_owner_can_settle_own_service() {
     let env = Env::default();
@@ -2672,12 +2671,15 @@ fn test_owner_can_settle_own_service() {
     client.set_service_price(&svc, &10i128);
     client.record_usage(&agent, &svc, &5u32);
 
-    let billed = client.settle(&agent, &svc);
-    assert_eq!(billed, 50i128);
+    let billed = client.settle_all(&owner, &agent);
+    assert_eq!(billed.len(), 1);
+    let (settled_svc, settled_amount) = billed.get(0).unwrap();
+    assert_eq!(settled_svc, svc);
+    assert_eq!(settled_amount, 50i128);
     assert_eq!(client.get_usage(&agent, &svc), 0);
 }
 
-/// The admin can always settle, even a service owned by someone else.
+/// The admin can always settle a service directly.
 #[test]
 fn test_admin_can_settle_owned_service() {
     let env = Env::default();
@@ -2692,10 +2694,11 @@ fn test_admin_can_settle_owned_service() {
 
     let billed = client.settle(&agent, &svc);
     assert_eq!(billed, 40i128);
+    assert_eq!(client.get_usage(&agent, &svc), 0);
 }
 
-/// The owner of service A cannot settle service B (panics #6, the reused
-/// unauthorized-caller error).
+/// The owner of service A cannot settle service B through `settle_all`
+/// (panics #6, the reused unauthorized-caller error).
 #[test]
 #[should_panic(expected = "Error(Contract, #6)")]
 fn test_owner_cannot_settle_other_service() {
@@ -2712,12 +2715,12 @@ fn test_owner_cannot_settle_other_service() {
     client.set_service_price(&svc_b, &10i128);
     client.record_usage(&agent, &svc_b, &3u32);
 
-    // owner_a tries to settle svc_b — unauthorized.
-    client.settle(&agent, &svc_b);
+    // owner_a tries to sweep svc_b — unauthorized.
+    client.settle_all(&owner_a, &agent);
 }
 
-/// A non-admin caller settling a service with no metadata is rejected with
-/// ServiceMetadataNotFound (#13).
+/// A non-admin caller settling a service with no metadata through
+/// `settle_all` is rejected with `ServiceMetadataNotFound` (#13).
 #[test]
 #[should_panic(expected = "Error(Contract, #13)")]
 fn test_nonadmin_settle_without_metadata_rejected() {
@@ -2726,10 +2729,11 @@ fn test_nonadmin_settle_without_metadata_rejected() {
     let stranger = Address::generate(&env);
     let agent = Address::generate(&env);
     let svc = Symbol::new(&env, "infer");
+    client.register_service(&svc);
     client.set_service_price(&svc, &10i128);
     client.record_usage(&agent, &svc, &2u32);
 
-    client.settle(&agent, &svc);
+    client.settle_all(&stranger, &agent);
 }
 
 /// The pause gate still applies to owner-authorized settlement.
