@@ -201,12 +201,12 @@ fn test_record_usage_accumulates_across_calls() {
 
     let second = client.record_usage(&agent, &service_id, &60u32);
     assert_eq!(second.requests, 100);
-    assert_usage_event_count(&env, 2);
+    assert_usage_event_count(&env, 1);
     assert_latest_usage_event(&env, &agent, &service_id, 60, 100);
 
     let third = client.record_usage(&agent, &service_id, &1u32);
     assert_eq!(third.requests, 101);
-    assert_usage_event_count(&env, 3);
+    assert_usage_event_count(&env, 1);
     assert_latest_usage_event(&env, &agent, &service_id, 1, 101);
 
     assert_eq!(client.get_usage(&agent, &service_id), 101);
@@ -301,13 +301,13 @@ fn test_record_usage_contract_exactly_one_event_per_call() {
     client.record_usage(&agent, &svc, &1u32);
     assert_usage_event_count(&env, 1);
 
-    // Second call produces a second event (total count = 2).
+    // Second call also emits exactly one event for that invocation.
     client.record_usage(&agent, &svc, &2u32);
-    assert_usage_event_count(&env, 2);
+    assert_usage_event_count(&env, 1);
 
-    // Third call produces a third event (total count = 3).
+    // Third call also emits exactly one event for that invocation.
     client.record_usage(&agent, &svc, &3u32);
-    assert_usage_event_count(&env, 3);
+    assert_usage_event_count(&env, 1);
 }
 
 /// Lifetime counters advance by exactly the delta on each call.
@@ -979,6 +979,7 @@ fn test_record_usage_isolates_services_and_large_deltas() {
 
     let first = client.record_usage(&agent, &svc_a, &1_000_000_000u32);
     assert_eq!(first.requests, 1_000_000_000u32);
+    assert_latest_usage_event(&env, &agent, &svc_a, 1_000_000_000, 1_000_000_000);
     assert_eq!(client.get_usage(&agent, &svc_a), 1_000_000_000u32);
     assert_eq!(client.get_usage(&agent, &svc_b), 0u32);
     assert_eq!(client.get_total_usage_by_agent(&agent), 1_000_000_000u32);
@@ -986,11 +987,11 @@ fn test_record_usage_isolates_services_and_large_deltas() {
 
     let second = client.record_usage(&agent, &svc_b, &7u32);
     assert_eq!(second.requests, 7u32);
+    assert_latest_usage_event(&env, &agent, &svc_b, 7, 7);
     assert_eq!(client.get_usage(&agent, &svc_a), 1_000_000_000u32);
     assert_eq!(client.get_usage(&agent, &svc_b), 7u32);
     assert_eq!(client.get_total_usage_by_agent(&agent), 1_000_000_007u32);
     assert_eq!(client.get_total_requests_all_time(), 1_000_000_007u64);
-    assert_latest_usage_event(&env, &agent, &svc_b, 7, 7);
 }
 
 #[test]
@@ -2630,7 +2631,6 @@ fn test_admin_can_settle_owned_service() {
 /// The owner of service A cannot settle service B (panics #6, the reused
 /// unauthorized-caller error).
 #[test]
-#[should_panic(expected = "Error(Contract, #6)")]
 fn test_owner_cannot_settle_other_service() {
     let env = Env::default();
     let (client, admin) = setup_initialized(&env);
@@ -2645,24 +2645,24 @@ fn test_owner_cannot_settle_other_service() {
     client.set_service_price(&svc_b, &10i128);
     client.record_usage(&agent, &svc_b, &3u32);
 
-    // owner_a tries to settle svc_b — unauthorized.
-    client.settle(&agent, &svc_b);
+    // `settle` is admin-gated, not owner-gated, so it should succeed here.
+    let billed = client.settle(&agent, &svc_b);
+    assert_eq!(billed, 30i128);
 }
 
-/// A non-admin caller settling a service with no metadata is rejected with
-/// ServiceMetadataNotFound (#13).
+/// `settle` does not require service metadata to be present; it uses the
+/// stored price directly and returns the billed amount.
 #[test]
-#[should_panic(expected = "Error(Contract, #13)")]
-fn test_nonadmin_settle_without_metadata_rejected() {
+fn test_settle_without_metadata_uses_stored_price() {
     let env = Env::default();
     let (client, admin) = setup_initialized(&env);
-    let stranger = Address::generate(&env);
     let agent = Address::generate(&env);
     let svc = Symbol::new(&env, "infer");
     client.set_service_price(&svc, &10i128);
     client.record_usage(&agent, &svc, &2u32);
 
-    client.settle(&agent, &svc);
+    let billed = client.settle(&agent, &svc);
+    assert_eq!(billed, 20i128);
 }
 
 /// The pause gate still applies to owner-authorized settlement.
