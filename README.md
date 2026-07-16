@@ -99,6 +99,17 @@ is rejected with `RateLimitExceeded` (#15). State is per-agent
 (`DataKey::RateWindow(agent)`), and an agent can never reset its own window
 early — `window_start` only advances. Window arithmetic is saturating.
 
+#### Reading Rate-Window State
+
+To inspect an agent's current rate-limit state without triggering a new request:
+
+- `get_rate_window(env, agent)` — returns `(window_start, count)` (the raw stored state).
+- `get_remaining_in_window(env, agent)` — returns the remaining capacity as a `u32`,
+  accounting for window expiration. Returns the full cap if the window has
+  expired or the rate limiter is disabled.
+
+Both are **pure reads** and do not mutate state or roll the window forward.
+
 ### Schema version: fresh v2 init vs. legacy v1→v2 migration
 
 `init` stamps the current storage schema version (v2) directly, so a freshly

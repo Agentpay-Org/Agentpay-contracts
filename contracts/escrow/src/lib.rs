@@ -744,11 +744,57 @@ impl Escrow {
             .unwrap_or(0)
     }
 
-    /// Returns the accumulated request count for an `(agent, service_id)`
+    /// Return the accumulated request count for an `(agent, service_id)`
     /// pair, or `0` if no usage has been recorded yet.
     pub fn get_usage(env: Env, agent: Address, service_id: Symbol) -> u32 {
         read_usage(&env, &agent, &service_id)
     }
+
+    /// Return the raw per-agent fixed-window rate-limit state:
+    /// `(window_start, count)` where `window_start` is the ledger timestamp
+    /// the current window opened and `count` is the requests accumulated.
+    /// Returns `(0, 0)` if no window has opened.
+    ///
+    /// Pure read — no window advance on read.
+    pub fn get_rate_window(env: Env, agent: Address) -> (u64, u32) {
+        env.storage()
+            .persistent()
+            .get(&DataKey::RateWindow(agent))
+            .unwrap_or((0, 0))
+    }
+
+    /// Return the remaining capacity for an agent in the current rate-limit
+    /// window, accounting for window expiration. Returns `MaxRequestsPerWindow`
+    /// if the window has expired or the limiter is disabled (window_seconds=0
+    /// or max_requests_per_window=0).
+    ///
+    /// Note: `env.ledger().timestamp()` is used to determine window expiration.
+    pub fn get_remaining_in_window(env: Env, agent: Address) -> u32 {
+        let max_per_window: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MaxRequestsPerWindow)
+            .unwrap_or(0);
+        let window_seconds: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::WindowSeconds)
+            .unwrap_or(0);
+
+        if max_per_window == 0 || window_seconds == 0 {
+            return max_per_window;
+        }
+
+        let (window_start, count): (u64, u32) = Self::get_rate_window(env.clone(), agent);
+        let now = env.ledger().timestamp();
+
+        if now >= window_start.saturating_add(window_seconds) {
+            max_per_window
+        } else {
+            max_per_window.saturating_sub(count)
+        }
+    }
+
 
     /// Batched usage read: returns the accumulated request count for each
     /// input `(agent, service_id)` pair, in the same order as `pairs`.
