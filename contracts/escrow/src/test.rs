@@ -2643,8 +2643,8 @@ fn test_owner_cannot_settle_other_service() {
     client.set_service_price(&svc_b, &10i128);
     client.record_usage(&agent, &svc_b, &3u32);
 
-    // owner_a tries to settle svc_b — unauthorized.
-    client.settle(&agent, &svc_b);
+    // owner_a tries to settle_all for agent — unauthorized for svc_b.
+    client.settle_all(&owner_a, &agent);
 }
 
 /// A non-admin caller settling a service with no metadata is rejected with
@@ -2659,8 +2659,7 @@ fn test_nonadmin_settle_without_metadata_rejected() {
     let svc = Symbol::new(&env, "infer");
     client.set_service_price(&svc, &10i128);
     client.record_usage(&agent, &svc, &2u32);
-
-    client.settle(&agent, &svc);
+    client.settle_all(&stranger, &agent);
 }
 
 /// The pause gate still applies to owner-authorized settlement.
