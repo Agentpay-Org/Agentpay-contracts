@@ -1195,9 +1195,16 @@ impl Escrow {
 
     /// Admin enables or disables the agent allowlist gate. While
     /// disabled, `record_usage` does not consult the per-agent entries.
+    ///
+    /// Emits a `cfg_set` event with data `(allowlist, enabled)` after the
+    /// storage write so indexers can observe every toggle on-chain.
     pub fn set_allowlist_enabled(env: Env, enabled: bool) {
         require_admin(&env);
         write_flag(&env, &DataKey::AllowlistEnabled, enabled);
+        env.events().publish(
+            (symbol_short!("cfg_set"),),
+            (symbol_short!("allowlist"), enabled),
+        );
     }
 
     /// Read the master allowlist toggle.
@@ -1328,9 +1335,16 @@ impl Escrow {
     /// Admin toggles strict-registration mode. When enabled,
     /// `record_usage` rejects unknown services with
     /// EscrowError::ServiceNotRegistered.
+    ///
+    /// Emits a `cfg_set` event with data `(req_reg, required)` after the
+    /// storage write so indexers can observe every toggle on-chain.
     pub fn set_require_service_registration(env: Env, required: bool) {
         require_admin(&env);
         write_flag(&env, &DataKey::RequireServiceRegistration, required);
+        env.events().publish(
+            (symbol_short!("cfg_set"),),
+            (symbol_short!("req_reg"), required),
+        );
     }
 
     /// Read the strict-registration flag.

@@ -131,6 +131,38 @@ The struct fields and their defaults when the storage slot is absent:
 The per-field getters remain available and always return values identical to
 the corresponding fields in this struct. `ContractConfig` is a convenience
 snapshot only and does not replace any existing getter.
+### Configuration-change events: `cfg_set`
+
+Every rate-limit and per-call bound setter publishes a `cfg_set` event
+after the storage write succeeds, so indexers and security monitors can
+observe policy changes on-chain instead of only inferring them from
+storage diffs. All six setters share one decodable schema: topic
+`(symbol_short!("cfg_set"),)`, data `(name: Symbol, value)`.
+
+| Setter | `name` | `value` type |
+|---|---|---|
+| `set_max_requests_per_call` | `max_call` | `u32` |
+| `set_min_requests_per_call` | `min_call` | `u32` |
+| `set_max_requests_per_window` | `max_win` | `u32` |
+| `set_rate_window_seconds` | `win_sec` | `u64` |
+| `set_allowlist_enabled` | `allowlist` | `bool` |
+| `set_require_service_registration` | `req_reg` | `bool` |
+
+A single subscriber can decode every config event with one schema:
+match on the first tuple element (`Symbol`) to route to the right
+handler, then decode the second element as `u32`, `u64`, or `bool`
+per the table above.
+
+Notes:
+- Events fire even when the new value equals the current stored value
+  — setters are not short-circuited by an equality check, so every
+  call is observable.
+- This is purely additive: `price_set`, `paused`, and all other
+  existing event payloads are unchanged.
+- Events expose no more information than was already readable via the
+  corresponding getter (`get_max_requests_per_call`,
+  `is_allowlist_enabled`, etc.) — `cfg_set` only makes an existing,
+  publicly-readable state change observable in real time.
 
 ## Prerequisites
 
