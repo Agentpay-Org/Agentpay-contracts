@@ -3333,14 +3333,10 @@ fn test_register_service_with_metadata_equivalent_to_separate_calls() {
     assert_eq!(combined_meta, client2.get_service_metadata(&service_id2));
 }
 
-// =============================
-// get_usage_batch test coverage
-// =============================
-
 #[test]
 fn test_get_usage_batch_agrees_with_single_get_usage() {
     let env = Env::default();
-    let (client, _admin) = setup_initialized(&env);
+    let (client, admin) = setup_initialized(&env);
 
     let agent_a = make_agent(&env);
     let agent_b = make_agent(&env);
@@ -3353,7 +3349,7 @@ fn test_get_usage_batch_agrees_with_single_get_usage() {
     let mut pairs: Vec<(Address, Symbol)> = Vec::new(&env);
     pairs.push_back((agent_a.clone(), svc_a.clone()));
     pairs.push_back((agent_b.clone(), svc_b.clone()));
-    pairs.push_back((agent_a.clone(), svc_b.clone())); // unknown pair (should be 0)
+    pairs.push_back((agent_a.clone(), svc_b.clone()));
 
     let batch_out = client.get_usage_batch(&pairs);
 
@@ -3361,4 +3357,3 @@ fn test_get_usage_batch_agrees_with_single_get_usage() {
     assert_eq!(batch_out.get(1), Some(client.get_usage(&agent_b, &svc_b)));
     assert_eq!(batch_out.get(2), Some(client.get_usage(&agent_a, &svc_b)));
 }
-
