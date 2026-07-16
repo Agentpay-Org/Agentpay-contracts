@@ -132,6 +132,57 @@ The per-field getters remain available and always return values identical to
 the corresponding fields in this struct. `ContractConfig` is a convenience
 snapshot only and does not replace any existing getter.
 
+### Global price bounds for `set_service_price`
+
+Admins can configure a global **price band** `[min_stroops, max_stroops]`
+that every subsequent `set_service_price` call must respect.  By default the
+band is unbounded (`0` to `i128::MAX`), so existing behaviour is unchanged.
+
+#### Entrypoints
+
+| Entrypoint | Signature | Description |
+|---|---|---|
+| `set_price_bounds` | `(min_stroops: i128, max_stroops: i128)` | Admin-gated. Persist the floor and ceiling. Emits `bnd_set(min, max)`. |
+| `get_min_service_price` | `() → i128` | Read the floor; returns `0` if never set. |
+| `get_max_service_price` | `() → i128` | Read the ceiling; returns `i128::MAX` if never set. |
+
+#### How the check works
+
+After passing the existing negative-price gate and the registration/disabled
+gates, `set_service_price` reads `MinServicePrice` (default `0`) and
+`MaxServicePrice` (default `i128::MAX`) and rejects any price outside
+`[floor, ceiling]` with `PriceOutOfBounds` (#23).
+
+#### Zero-is-free semantics
+
+A price of `0` means **free service** — usage is still recorded but settlement
+bills nothing.  The price bounds interact with this as follows:
+
+- When `min_stroops == 0` (the default), a zero price is permitted as usual.
+- When `min_stroops > 0`, free services are **explicitly forbidden**:
+  `set_service_price(svc, 0)` is rejected with `PriceOutOfBounds` until the
+  floor is lowered back to `0`.
+
+This is intentional policy: a positive floor expresses that all services in
+the band must have a non-zero cost.  Admins who want to allow free services
+alongside bounded paid services should keep `min_stroops = 0`.
+
+#### Error codes (new, append-only)
+
+| Code | Variant | Trigger |
+|---|---|---|
+| `#23` | `PriceOutOfBounds` | `set_service_price` price falls outside `[floor, ceiling]`. |
+| `#24` | `InvertedPriceBand` | `set_price_bounds` called with `min_stroops > max_stroops`. |
+
+#### Security
+
+- `set_price_bounds` is admin-gated: a non-admin call panics with
+  Soroban's host auth error before any storage is touched.
+- `get_min_service_price` / `get_max_service_price` are pure reads (no auth
+  required), so dashboards can query the current band without signing.
+- An inverted band (`min > max`) is rejected immediately, so the stored
+  bounds are always a valid interval `min ≤ max`.
+
 ## Prerequisites
 
 - [Rust](https://rustup.rs/) (stable, with `rustfmt`)

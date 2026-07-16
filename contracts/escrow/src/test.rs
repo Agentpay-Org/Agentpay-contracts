@@ -1,5 +1,5 @@
 #![cfg(test)]
-#![allow(deprecated)]
+#![allow(deprecated, unused_variables, dead_code)]
 
 //! # Escrow contract test suite
 //!
@@ -3331,4 +3331,259 @@ fn test_register_service_with_metadata_equivalent_to_separate_calls() {
         client2.is_service_registered(&service_id2)
     );
     assert_eq!(combined_meta, client2.get_service_metadata(&service_id2));
+}
+
+// ── Price-bounds tests ────────────────────────────────────────────────────────
+
+/// Default state: no bounds configured → getters return 0 and i128::MAX.
+#[test]
+fn test_price_bounds_defaults() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+
+    assert_eq!(client.get_min_service_price(), 0i128);
+    assert_eq!(client.get_max_service_price(), i128::MAX);
+}
+
+/// set_price_bounds persists floor and ceiling; getters reflect them.
+#[test]
+fn test_set_price_bounds_persists_values() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+
+    client.set_price_bounds(&100i128, &5_000i128);
+
+    assert_eq!(client.get_min_service_price(), 100i128);
+    assert_eq!(client.get_max_service_price(), 5_000i128);
+}
+
+/// set_price_bounds emits a `bnd_set` event with (min, max).
+#[test]
+fn test_set_price_bounds_emits_event() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+
+    client.set_price_bounds(&10i128, &999i128);
+
+    let events = env.events().all();
+    let (_addr, topics, data) = events.last().unwrap();
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("bnd_set"),).into_val(&env);
+    assert_eq!(topics, expected_topics);
+    let decoded: (i128, i128) = data.into_val(&env);
+    assert_eq!(decoded, (10i128, 999i128));
+}
+
+/// Price below the configured floor is rejected with PriceOutOfBounds (#23).
+#[test]
+#[should_panic(expected = "Error(Contract, #23)")]
+fn test_set_service_price_below_floor_rejected() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let svc = make_service(&env, "api");
+
+    client.set_price_bounds(&100i128, &10_000i128);
+    // 99 < 100 → PriceOutOfBounds
+    client.set_service_price(&svc, &99i128);
+}
+
+/// Price above the configured ceiling is rejected with PriceOutOfBounds (#23).
+#[test]
+#[should_panic(expected = "Error(Contract, #23)")]
+fn test_set_service_price_above_ceiling_rejected() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let svc = make_service(&env, "api");
+
+    client.set_price_bounds(&50i128, &1_000i128);
+    // 1001 > 1000 → PriceOutOfBounds
+    client.set_service_price(&svc, &1_001i128);
+}
+
+/// Price exactly at the floor boundary is accepted.
+#[test]
+fn test_set_service_price_at_floor_accepted() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let svc = make_service(&env, "api");
+
+    client.set_price_bounds(&200i128, &5_000i128);
+    client.set_service_price(&svc, &200i128); // exactly at floor
+    assert_eq!(client.get_service_price(&svc), 200i128);
+}
+
+/// Price exactly at the ceiling boundary is accepted.
+#[test]
+fn test_set_service_price_at_ceiling_accepted() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let svc = make_service(&env, "api");
+
+    client.set_price_bounds(&1i128, &999i128);
+    client.set_service_price(&svc, &999i128); // exactly at ceiling
+    assert_eq!(client.get_service_price(&svc), 999i128);
+}
+
+/// In-band price is accepted and stored correctly.
+#[test]
+fn test_set_service_price_in_band_accepted() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let svc = make_service(&env, "api");
+
+    client.set_price_bounds(&50i128, &10_000i128);
+    client.set_service_price(&svc, &500i128);
+    assert_eq!(client.get_service_price(&svc), 500i128);
+}
+
+/// Inverted band (min > max) is rejected with InvertedPriceBand (#24).
+#[test]
+#[should_panic(expected = "Error(Contract, #24)")]
+fn test_set_price_bounds_inverted_rejected() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+
+    // min > max → InvertedPriceBand
+    client.set_price_bounds(&1_000i128, &500i128);
+}
+
+/// Equal min == max is a valid (point) band.
+#[test]
+fn test_set_price_bounds_equal_min_max_accepted() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let svc = make_service(&env, "api");
+
+    client.set_price_bounds(&100i128, &100i128);
+    // Only exactly 100 is valid.
+    client.set_service_price(&svc, &100i128);
+    assert_eq!(client.get_service_price(&svc), 100i128);
+}
+
+/// Zero price with a positive floor is rejected (free services forbidden).
+///
+/// This codifies the documented policy: when `min_stroops > 0` the admin has
+/// explicitly stated that no free services are allowed. Callers must lower the
+/// floor to 0 first to re-enable zero-price (free) services.
+#[test]
+#[should_panic(expected = "Error(Contract, #23)")]
+fn test_zero_price_with_positive_floor_rejected() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let svc = make_service(&env, "api");
+
+    client.set_price_bounds(&1i128, &10_000i128);
+    // price 0 < floor 1 → PriceOutOfBounds
+    client.set_service_price(&svc, &0i128);
+}
+
+/// Zero price is still accepted when floor is 0 (the default).
+#[test]
+fn test_zero_price_with_zero_floor_accepted() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let svc = make_service(&env, "api");
+
+    // Explicitly set floor=0, ceiling=i128::MAX (mirrors the defaults).
+    client.set_price_bounds(&0i128, &i128::MAX);
+    client.set_service_price(&svc, &0i128);
+    assert_eq!(client.get_service_price(&svc), 0i128);
+}
+
+/// Bounds can be toggled and a previously-rejected price becomes valid.
+#[test]
+fn test_price_bounds_toggled_then_repriced() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let svc = make_service(&env, "api");
+
+    // Set tight bounds: only [500, 1000] allowed.
+    client.set_price_bounds(&500i128, &1_000i128);
+    client.set_service_price(&svc, &750i128);
+    assert_eq!(client.get_service_price(&svc), 750i128);
+
+    // Widen the bounds to allow 50.
+    client.set_price_bounds(&50i128, &2_000i128);
+    client.set_service_price(&svc, &50i128);
+    assert_eq!(client.get_service_price(&svc), 50i128);
+}
+
+/// set_price_bounds is admin-gated: a non-admin call panics with Unauthorized.
+#[test]
+#[should_panic(expected = "Error(Auth, _)")]
+fn test_set_price_bounds_non_admin_rejected() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+
+    // Drop all mock auths so the call has no authorization.
+    env.set_auths(&[]);
+    client.set_price_bounds(&0i128, &1_000i128);
+}
+
+/// Existing behaviour unchanged when no bounds are configured (default unbounded).
+#[test]
+fn test_default_unbounded_behaviour_unchanged() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let svc = make_service(&env, "api");
+
+    // No set_price_bounds call → any non-negative price up to i128::MAX should work.
+    client.set_service_price(&svc, &0i128);
+    assert_eq!(client.get_service_price(&svc), 0i128);
+
+    client.set_service_price(&svc, &1_000_000i128);
+    assert_eq!(client.get_service_price(&svc), 1_000_000i128);
+
+    // Extremely large value (i128::MAX) should also be accepted when no ceiling is set.
+    client.set_service_price(&svc, &i128::MAX);
+    assert_eq!(client.get_service_price(&svc), i128::MAX);
+}
+
+/// set_price_bounds with min=0 and max=i128::MAX explicitly restores defaults.
+#[test]
+fn test_set_price_bounds_restores_defaults() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let svc = make_service(&env, "api");
+
+    // First narrow the bounds.
+    client.set_price_bounds(&100i128, &200i128);
+
+    // Then restore them to the default no-bounds values.
+    client.set_price_bounds(&0i128, &i128::MAX);
+
+    // All previously-rejected prices should now pass.
+    client.set_service_price(&svc, &0i128);
+    assert_eq!(client.get_service_price(&svc), 0i128);
+    client.set_service_price(&svc, &50i128); // was below old floor
+    assert_eq!(client.get_service_price(&svc), 50i128);
+    client.set_service_price(&svc, &300i128); // was above old ceiling
+    assert_eq!(client.get_service_price(&svc), 300i128);
+}
+
+/// Negative price is still rejected even when bounds span a wide range.
+#[test]
+#[should_panic(expected = "Error(Contract, #2)")]
+fn test_negative_price_still_rejected_with_bounds() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let svc = make_service(&env, "api");
+
+    client.set_price_bounds(&0i128, &10_000i128);
+    // Negative price hits the pre-bounds RequestsMustBePositive gate.
+    client.set_service_price(&svc, &-1i128);
+}
+
+/// get_min_service_price and get_max_service_price are pure reads (no auth required).
+#[test]
+fn test_price_bound_getters_require_no_auth() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+
+    client.set_price_bounds(&10i128, &9_999i128);
+
+    // Drop all auths — pure reads must succeed regardless.
+    env.set_auths(&[]);
+    assert_eq!(client.get_min_service_price(), 10i128);
+    assert_eq!(client.get_max_service_price(), 9_999i128);
 }

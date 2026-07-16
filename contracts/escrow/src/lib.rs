@@ -166,6 +166,14 @@ pub enum DataKey {
     /// accumulated usage crosses this value on a `record_usage` call a
     /// `usage_hi` event is emitted (edge-triggered).
     UsageAlertThreshold,
+    /// Global minimum service price in stroops. When set, `set_service_price`
+    /// rejects any price below this floor with `PriceOutOfBounds`.
+    /// Defaults to `0` (no floor) when absent.
+    MinServicePrice,
+    /// Global maximum service price in stroops. When set, `set_service_price`
+    /// rejects any price above this ceiling with `PriceOutOfBounds`.
+    /// Defaults to `i128::MAX` (no ceiling) when absent.
+    MaxServicePrice,
 }
 
 /// Typed contract errors. Codes are append-only to keep client SDKs stable.
@@ -232,6 +240,16 @@ pub enum EscrowError {
     /// `resolve_dispute` was called with `refund_requests` exceeding the
     /// current accumulated usage — prevents double-refunds.
     RefundExceedsUsage = 22,
+    /// `set_service_price` was called with a `price_stroops` that falls outside
+    /// the admin-configured global price band
+    /// (`MinServicePrice` ≤ price ≤ `MaxServicePrice`). A floor of `0` and a
+    /// ceiling of `i128::MAX` are the defaults, so this error can only be
+    /// triggered after `set_price_bounds` has been called explicitly.
+    PriceOutOfBounds = 23,
+    /// `set_price_bounds` was called with `min_stroops > max_stroops`.
+    /// An inverted band is rejected immediately so the stored bounds are
+    /// always a valid interval.
+    InvertedPriceBand = 24,
 }
 
 #[contracttype]
@@ -882,6 +900,25 @@ impl Escrow {
         if read_flag(&env, &DataKey::ServiceDisabled(service_id.clone())) {
             panic_with_error!(&env, EscrowError::ServiceDisabled);
         }
+        // Global price-bounds check. Defaults: floor = 0, ceiling = i128::MAX.
+        // If a floor above 0 is configured, a price of 0 ("free service") is
+        // explicitly **forbidden** — the admin must lower the floor to 0 first
+        // if free services should be re-allowed. This is intentional: the
+        // bounds exist to prevent accidental near-zero prices and a floor > 0
+        // expresses a clear policy that the service must have a positive cost.
+        let price_floor: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MinServicePrice)
+            .unwrap_or(0);
+        let price_ceil: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MaxServicePrice)
+            .unwrap_or(i128::MAX);
+        if price_stroops < price_floor || price_stroops > price_ceil {
+            panic_with_error!(&env, EscrowError::PriceOutOfBounds);
+        }
         env.storage()
             .persistent()
             .set(&DataKey::ServicePrice(service_id.clone()), &price_stroops);
@@ -1191,6 +1228,74 @@ impl Escrow {
             .persistent()
             .get(&DataKey::MinRequestsPerCall)
             .unwrap_or(0)
+    }
+
+    /// Set the global minimum and maximum price bounds for `set_service_price`.
+    ///
+    /// Admin-gated. Both `min_stroops` and `max_stroops` are persisted in
+    /// `DataKey::MinServicePrice` / `DataKey::MaxServicePrice`. After this
+    /// call, any `set_service_price` invocation with a price outside
+    /// `[min_stroops, max_stroops]` is rejected with
+    /// [`EscrowError::PriceOutOfBounds`].
+    ///
+    /// # Default (unbounded) behaviour
+    ///
+    /// When no bounds have been configured, `set_service_price` applies the
+    /// implicit defaults: floor = `0`, ceiling = `i128::MAX`. Calling
+    /// `set_price_bounds(0, i128::MAX)` restores these defaults explicitly.
+    ///
+    /// # Zero-is-free semantics
+    ///
+    /// A price of `0` means "free service" — usage is still recorded but
+    /// settlement bills nothing. **If `min_stroops > 0`, free services are
+    /// forbidden**: `set_service_price(svc, 0)` will be rejected with
+    /// `PriceOutOfBounds` until the floor is lowered back to `0`. This is
+    /// intentional policy: a positive floor expresses that all services in
+    /// the band must have a non-zero cost. Admins who want to allow free
+    /// services alongside bounded paid services should keep `min_stroops = 0`.
+    ///
+    /// # Inverted-band rejection
+    ///
+    /// Panics with [`EscrowError::InvertedPriceBand`] when
+    /// `min_stroops > max_stroops` to prevent a logically impossible band
+    /// from being stored.
+    ///
+    /// Emits `bounds_set(min_stroops, max_stroops)` on success.
+    pub fn set_price_bounds(env: Env, min_stroops: i128, max_stroops: i128) {
+        require_admin(&env);
+        if min_stroops > max_stroops {
+            panic_with_error!(&env, EscrowError::InvertedPriceBand);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::MinServicePrice, &min_stroops);
+        env.storage()
+            .persistent()
+            .set(&DataKey::MaxServicePrice, &max_stroops);
+        env.events()
+            .publish((symbol_short!("bnd_set"),), (min_stroops, max_stroops));
+    }
+
+    /// Read the configured global minimum service price in stroops.
+    ///
+    /// Returns `0` (no floor) when no bounds have been configured via
+    /// [`Escrow::set_price_bounds`].
+    pub fn get_min_service_price(env: Env) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MinServicePrice)
+            .unwrap_or(0)
+    }
+
+    /// Read the configured global maximum service price in stroops.
+    ///
+    /// Returns `i128::MAX` (no ceiling) when no bounds have been configured via
+    /// [`Escrow::set_price_bounds`].
+    pub fn get_max_service_price(env: Env) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MaxServicePrice)
+            .unwrap_or(i128::MAX)
     }
 
     /// Admin enables or disables the agent allowlist gate. While
