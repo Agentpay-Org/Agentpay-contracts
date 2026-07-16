@@ -6,7 +6,7 @@ Please read it before opening a pull request that touches contract code.
 
 ## The CI gate
 
-Every PR must pass the same three checks CI runs, from the workspace root:
+Every PR must pass the same checks CI runs, from the workspace root:
 
 ```bash
 cargo fmt --all -- --check   # formatting (no diff allowed)
@@ -45,27 +45,40 @@ contract's public ABI: client SDKs match on them, so they are **append-only**.
 | Code | Variant | Meaning |
 |-----:|---------|---------|
 | 1 | `AlreadyInitialized` | `init` was already called and the admin is stored. |
-| 2 | `RequestsMustBePositive` | `record_usage` was called with `requests == 0` (also reused for a negative price in `set_service_price`). |
-| 3 | `NotInitialized` | An admin-gated entrypoint was invoked but the admin is not set. |
-| 4 | `ContractPaused` | A state-changing entrypoint was called while `Paused` is `true`. |
-| 5 | `NoPendingAdminTransfer` | `accept_admin_transfer` was called but no pending admin is set. |
-| 6 | `NotPendingAdmin` | `accept_admin_transfer` was called by the wrong address. |
+| 2 | `RequestsMustBePositive` | `record_usage` called with `requests == 0` (also reused for a negative price in `set_service_price`). |
+| 3 | `NotInitialized` | Admin-gated entrypoint invoked before `init`. |
+| 4 | `ContractPaused` | State-changing entrypoint called while `Paused` is `true`. |
+| 5 | `NoPendingAdminTransfer` | `accept_admin_transfer` called but no pending admin is set. |
+| 6 | `NotPendingAdmin` | `accept_admin_transfer` called by the wrong address (reused for unauthorized metadata callers). |
 | 7 | `ServiceNotRegistered` | `record_usage` referenced an unregistered service while strict registration is enabled. |
-| 8 | `RequestsExceedsMaxPerCall` | `record_usage` exceeded the configured `MaxRequestsPerCall` cap. |
-| 9 | `RequestsBelowMinPerCall` | `record_usage` was below the configured `MinRequestsPerCall` floor. |
-| 10 | `AgentNotAllowed` | `record_usage` was called for an agent not on the allowlist while strict allowlisting is enabled. |
-| 11 | `MigrationVersionMismatch` | `migrate_v1_to_v2` was called from a non-v1 schema. |
-| 12 | `ServiceDisabled` | `record_usage` referenced a service that has been disabled. |
+| 8 | `RequestsExceedsMaxPerCall` | `record_usage` exceeded `MaxRequestsPerCall` cap. |
+| 9 | `RequestsBelowMinPerCall` | `record_usage` below `MinRequestsPerCall` floor. |
+| 10 | `AgentNotAllowed` | `record_usage` for an agent not on the allowlist while allowlisting is enabled. |
+| 11 | `MigrationVersionMismatch` | `migrate_v1_to_v2` called on a non-v1 schema. |
+| 12 | `ServiceDisabled` | `record_usage` referenced a disabled service. |
+| 13 | `ServiceMetadataNotFound` | A metadata-scoped entrypoint referenced a service with no `ServiceMetadata` set. |
+| 14 | `InvalidAdminProposal` | `propose_admin_transfer` called with the current admin as the proposed new admin. |
+| 15 | `RateLimitExceeded` | `record_usage` would push an agent's per-window count above `MaxRequestsPerWindow`. |
+| 16 | `BatchTooLarge` | `get_usage_batch` called with more than `MAX_BATCH_READ` pairs. |
+| 17 | `AgentBlocked` | `record_usage` for an agent on the per-agent blocklist. |
+| 18 | `InvalidPriceTiers` | Malformed tier schedule passed to `set_price_tiers`. |
+| 19 | `SettleAllTooLarge` | `settle_all` agent service index exceeds `MAX_SETTLE_ALL`. |
+| 20 | `DisputeAlreadyOpen` | `open_dispute` called but a dispute is already open for the pair. |
+| 21 | `NoOpenDispute` | `resolve_dispute` called but no dispute is open. |
+| 22 | `RefundExceedsUsage` | `resolve_dispute` `refund_requests` exceeds current usage. |
 
-The next new error must use code **13**.
+The next new error must use code **23**.
+
+See the [full error reference](docs/escrow/errors.md) for trigger conditions,
+entrypoints, and notes on overloaded codes.
 
 ## Event conventions
 
-### Topic names: `symbol_short!` ≤ 9 characters
+### Topic names use `symbol_short!` (≤ 9 characters)
 
 Event topics are published with `symbol_short!`, which only accepts symbols of
 **9 characters or fewer**. Longer literals fail to compile. Keep topic names
-short and stable (current topics: `usage`, `settled`, `paused`).
+short and stable.
 
 ### Events are additive-only
 
@@ -76,11 +89,28 @@ dashboards, settlement loops). Treat it as **additive-only**:
 - Do not change the shape, order, or types of an existing event's payload.
 - New information goes into a **new** event, not an altered existing one.
 
-For reference, the existing events and their payloads are:
+### Current event reference
 
-- `usage` → `(agent, service_id, requests, total)`
-- `settled` → `(agent, service_id, requests, billed)`
-- `paused` → a bare `bool` (`true` on `pause()`, `false` on `unpause()`)
+| Topic | Payload | Emitted by |
+|-------|---------|------------|
+| `usage` | `(agent, service_id, requests, total)` | `record_usage` |
+| `usage_hi` | `(agent, service_id, total)` | `record_usage` (edge-triggered when crossing threshold) |
+| `usage_dec` | `(agent, service_id, amount, new_total)` | `decrement_usage` |
+| `settled` | `(agent, service_id, requests, billed)` | `settle`, `settle_all` |
+| `price_set` | `(service_id, price_stroops)` | `set_service_price` |
+| `price_rm` | `(service_id)` | `remove_service_price` |
+| `tiers_set` | `(service_id)` | `set_price_tiers` |
+| `tiers_rm` | `(service_id)` | `remove_price_tiers` |
+| `cfg_set` | `(config_key, value)` | `set_max_requests_per_call`, `set_min_requests_per_call`, `set_max_requests_per_window`, `set_rate_window_seconds` |
+| `svc_reg` | `(service_id, owner)` | `register_service_with_metadata` |
+| `paused` | `(bool)` | `pause`, `unpause` |
+| `owner_chg` | `(service_id, old_owner, new_owner)` | `transfer_service_ownership` |
+| `meta_clr` | `(service_id)` | `clear_service_metadata` |
+| `dispute` | `(Symbol, agent, service_id[, refund_requests])` | `open_dispute`, `resolve_dispute` |
+
+The `cfg_set` topic uses a secondary symbol to identify the config key: `max_call`, `min_call`, `max_win`, or `win_sec`.
+
+The `dispute` topic uses a primary action symbol: `Symbol::new(&env, "open")` or `Symbol::new(&env, "resolve")` (these are not constrained to 9 chars because they are payload data, not topic keys).
 
 ## Getter-default convention: `unwrap_or`
 
@@ -88,14 +118,19 @@ Read-only getters return a sensible **default** for absent storage rather than
 panicking, using `unwrap_or(...)`. This keeps clients from having to special-case
 never-written slots. Examples:
 
-- `get_usage` / `get_service_price` / `get_total_usage_by_agent` → `0`
+- `get_usage` / `get_service_price` / `get_total_usage_by_agent` / `get_total_settled_by_agent` → `0`
 - `get_max_requests_per_call` → `u32::MAX` (no cap)
-- `is_paused` / `is_service_registered` / `is_service_disabled` → `false`
+- `get_max_requests_per_window` / `get_min_requests_per_call` / `get_rate_window_seconds` → `0`
+- `is_paused` / `is_service_registered` / `is_service_disabled` / `is_agent_allowed` / `is_agent_blocked` / `is_allowlist_enabled` / `is_service_registration_required` → `false`
 - `get_schema_version` → `1` (the implicit pre-migration default)
 
-When the *absence* of a value is itself meaningful (e.g. "never settled" vs.
-"settled at genesis"), return `Option<T>` instead — see `get_last_settlement`
-and `get_service_metadata`, which return `None`.
+When the **absence** of a value is itself meaningful (e.g. "never settled" vs.
+"settled at genesis"), return `Option<T>` instead — see `get_last_settlement`,
+`get_service_metadata`, `get_price_tiers`, `get_admin`, and `get_pending_admin`,
+which return `None`.
+
+Boolean flags use a shared `read_flag` / `write_flag` pair that centralises
+the `unwrap_or(false)` convention (`lib.rs:275-288`).
 
 ## Test conventions
 
@@ -125,6 +160,21 @@ other contract call (including read-only getters). Compare topics against a
 tuples with `data.into_val(&env)`. When exact event matching is awkward, fall
 back to asserting observable state plus that the event count increased.
 
+### Snapshot tests
+
+Tests with complex post-state (e.g. biling computation, allowlist interactions)
+use `assert_snapshot!` from the `soroban_sdk` test utilities. Snapshots are
+stored under `contracts/escrow/test_snapshots/` and must be regenerated with
+`cargo test` when contract output changes intentionally. Commit updated
+snapshots alongside the code change.
+
+## Event-topic naming rule
+
+All event topics MUST fit within the `symbol_short!` limit. When designing a
+new event, confirm the topic name is ≤ 9 ASCII characters. If the natural name
+is too long, abbreviate (e.g. `meta_clr` for "metadata clear", `owner_chg` for
+"owner changed").
+
 ## Pull request checklist
 
 - [ ] One issue per branch; branch from `main`.
@@ -133,3 +183,4 @@ back to asserting observable state plus that the event count increased.
 - [ ] No renumbered/reused error codes; new codes appended only.
 - [ ] No renamed/reshaped existing events; new info in new events.
 - [ ] Getters default via `unwrap_or` (or return `Option` when absence matters).
+- [ ] New events use `symbol_short!` with a ≤9 character topic name.

@@ -25,6 +25,11 @@ stable across upgrades.
 | 15 | `RateLimitExceeded` | `record_usage` would push an agent's per-window request count above `MaxRequestsPerWindow` (active only when both `MaxRequestsPerWindow` and `RateWindowSeconds` are non-zero). | `record_usage` |
 | 16 | `BatchTooLarge` | `get_usage_batch` was called with more pairs than the `MAX_BATCH_READ` constant allows. | `get_usage_batch` |
 | 17 | `AgentBlocked` | `record_usage` was called by or for an agent on the per-agent blocklist. Takes precedence over the allowlist check (code 10). | `record_usage` |
+| 18 | `InvalidPriceTiers` | `set_price_tiers` was called with a malformed schedule: empty, duplicate thresholds, or not strictly ascending. | `set_price_tiers` |
+| 19 | `SettleAllTooLarge` | `settle_all` was called but the agent's service index exceeds `MAX_SETTLE_ALL`. | `settle_all` |
+| 20 | `DisputeAlreadyOpen` | `open_dispute` was called but a dispute is already open for the given `(agent, service_id)`. | `open_dispute` |
+| 21 | `NoOpenDispute` | `resolve_dispute` was called but no dispute is open for the given `(agent, service_id)`. | `resolve_dispute` |
+| 22 | `RefundExceedsUsage` | `resolve_dispute` was called with `refund_requests` exceeding the current accumulated usage. | `resolve_dispute` |
 
 ## Notes on Overloaded Codes
 
