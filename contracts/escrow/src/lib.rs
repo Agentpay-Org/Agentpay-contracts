@@ -1049,9 +1049,24 @@ impl Escrow {
     /// the billed amount in stroops. The settlement loop is expected to
     /// transfer the returned amount off-chain or via a paired token
     /// contract call; this contract intentionally holds no balance.
-    pub fn settle(env: Env, agent: Address, service_id: Symbol) -> i128 {
+    pub fn settle(env: Env, caller: Address, agent: Address, service_id: Symbol) -> i128 {
         ensure_not_paused(&env);
-        require_admin(&env);
+        caller.require_auth();
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, EscrowError::NotInitialized));
+        if caller != admin {
+            let meta: ServiceMetadata = env
+                .storage()
+                .persistent()
+                .get(&DataKey::ServiceMetadata(service_id.clone()))
+                .unwrap_or_else(|| panic_with_error!(&env, EscrowError::ServiceMetadataNotFound));
+            if caller != meta.owner {
+                panic_with_error!(&env, EscrowError::NotPendingAdmin);
+            }
+        }
         let usage_key = DataKey::Usage(agent.clone(), service_id.clone());
         let requests: u32 = env.storage().persistent().get(&usage_key).unwrap_or(0);
         // Use tier schedule when present; fall back to flat price.
