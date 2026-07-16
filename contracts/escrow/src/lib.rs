@@ -677,18 +677,11 @@ impl Escrow {
     /// Emits `usage_dec(agent, service_id, amount, new_total)` so corrections
     /// are auditable and distinguishable from `record_usage` and `settle`.
     pub fn decrement_usage(env: Env, agent: Address, service_id: Symbol, amount: u32) -> u32 {
-        if read_flag(&env, &DataKey::Paused) {
-            panic_with_error!(&env, EscrowError::ContractPaused);
-        }
+        ensure_not_paused(&env);
         if amount == 0 {
             panic_with_error!(&env, EscrowError::RequestsMustBePositive);
         }
-        let admin: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Admin)
-            .unwrap_or_else(|| panic_with_error!(&env, EscrowError::NotInitialized));
-        admin.require_auth();
+        let _admin: Address = require_admin(&env);
 
         let key = DataKey::Usage(agent.clone(), service_id.clone());
         let prev: u32 = env.storage().persistent().get(&key).unwrap_or(0);
