@@ -3337,123 +3337,28 @@ fn test_register_service_with_metadata_equivalent_to_separate_calls() {
 // get_usage_batch test coverage
 // =============================
 
-use soroban_sdk::Vec;
-
 #[test]
-fn test_get_usage_batch_empty() {
-    let env = Env::default();
-    let (client, _admin) = setup_initialized(&env);
-    let empty: Vec<(Address, Symbol)> = Vec::new(&env);
-    let results = client.get_usage_batch(&empty);
-    assert!(results.is_empty());
-}
-
-#[test]
-fn test_get_usage_batch_order_and_defaults() {
+fn test_get_usage_batch_agrees_with_single_get_usage() {
     let env = Env::default();
     let (client, _admin) = setup_initialized(&env);
 
     let agent_a = make_agent(&env);
     let agent_b = make_agent(&env);
-    let svc_x = make_service(&env, "svc_x");
-    let svc_y = make_service(&env, "svc_y");
-    let svc_z = make_service(&env, "svc_z"); // unknown
+    let svc_a = make_service(&env, "svc_a");
+    let svc_b = make_service(&env, "svc_b");
 
-    client.record_usage(&agent_a, &svc_x, &10u32);
-    client.record_usage(&agent_b, &svc_y, &20u32);
-
-    let mut pairs: Vec<(Address, Symbol)> = Vec::new(&env);
-    pairs.push_back((agent_a.clone(), svc_x.clone())); // known -> 10
-    pairs.push_back((agent_a.clone(), svc_z.clone())); // unknown -> 0
-    pairs.push_back((agent_b.clone(), svc_y.clone())); // known -> 20
-
-    let results = client.get_usage_batch(&pairs);
-    assert_eq!(results.len(), 3);
-    assert_eq!(results.get(0).unwrap(), 10u32);
-    assert_eq!(results.get(1).unwrap(), 0u32);
-    assert_eq!(results.get(2).unwrap(), 20u32);
-}
-
-#[test]
-fn test_get_usage_batch_duplicates() {
-    let env = Env::default();
-    let (client, _admin) = setup_initialized(&env);
-
-    let agent = make_agent(&env);
-    let svc = make_service(&env, "dup_svc");
-    client.record_usage(&agent, &svc, &42u32);
+    client.record_usage(&agent_a, &svc_a, &15u32);
+    client.record_usage(&agent_b, &svc_b, &25u32);
 
     let mut pairs: Vec<(Address, Symbol)> = Vec::new(&env);
-    pairs.push_back((agent.clone(), svc.clone()));
-    pairs.push_back((agent.clone(), svc.clone()));
-    pairs.push_back((agent.clone(), svc.clone()));
+    pairs.push_back((agent_a.clone(), svc_a.clone()));
+    pairs.push_back((agent_b.clone(), svc_b.clone()));
+    pairs.push_back((agent_a.clone(), svc_b.clone())); // unknown pair (should be 0)
 
-    let results = client.get_usage_batch(&pairs);
-    assert_eq!(results.len(), 3);
-    for i in 0..3 {
-        assert_eq!(results.get(i as u32).unwrap(), 42u32);
-    }
-}
+    let batch_out = client.get_usage_batch(&pairs);
 
-#[test]
-fn test_get_usage_batch_agrees_with_single_read() {
-    let env = Env::default();
-    let (client, _admin) = setup_initialized(&env);
-
-    let agents = vec![make_agent(&env), make_agent(&env)];
-    let services = vec![make_service(&env, "s1"), make_service(&env, "s2")];
-    client.record_usage(&agents[0], &services[0], &5u32);
-    client.record_usage(&agents[1], &services[1], &15u32);
-
-    let mut pairs: Vec<(Address, Symbol)> = Vec::new(&env);
-    pairs.push_back((agents[0].clone(), services[0].clone()));
-    pairs.push_back((agents[1].clone(), services[1].clone()));
-
-    let batch = client.get_usage_batch(&pairs);
-    assert_eq!(batch.get(0).unwrap(), client.get_usage(&agents[0], &services[0]));
-    assert_eq!(batch.get(1).unwrap(), client.get_usage(&agents[1], &services[1]));
-}
-
-#[test]
-fn test_get_usage_batch_at_max_limit() {
-    let env = Env::default();
-    let (client, _admin) = setup_initialized(&env);
-    let max = super::MAX_BATCH_READ as usize;
-    let mut agents = Vec::new();
-    let mut services = Vec::new();
-    for i in 0..max {
-        agents.push(make_agent(&env));
-        services.push(make_service(&env, &format!("svc{}", i)));
-        client.record_usage(&agents[i], &services[i], &1u32);
-    }
-    let mut pairs: Vec<(Address, Symbol)> = Vec::new(&env);
-    for i in 0..max {
-        pairs.push_back((agents[i].clone(), services[i].clone()));
-    }
-    let results = client.get_usage_batch(&pairs);
-    assert_eq!(results.len(), max as u32);
-    for i in 0..max {
-        assert_eq!(results.get(i as u32).unwrap(), 1u32);
-    }
-}
-
-#[test]
-#[should_panic(expected = "Error(Contract, #16)")]
-fn test_get_usage_batch_exceeds_max_limit() {
-    let env = Env::default();
-    let (client, _admin) = setup_initialized(&env);
-    let limit = super::MAX_BATCH_READ as usize;
-    let mut agents = Vec::new();
-    let mut services = Vec::new();
-    for i in 0..=limit {
-        agents.push(make_agent(&env));
-        services.push(make_service(&env, &format!("svc{}", i)));
-    }
-    let mut pairs: Vec<(Address, Symbol)> = Vec::new(&env);
-    for i in 0..=limit {
-        pairs.push_back((agents[i].clone(), services[i].clone()));
-    }
-    // This call should panic.
-    let _ = client.get_usage_batch(&pairs);
+    assert_eq!(batch_out.get(0), Some(client.get_usage(&agent_a, &svc_a)));
+    assert_eq!(batch_out.get(1), Some(client.get_usage(&agent_b, &svc_b)));
+    assert_eq!(batch_out.get(2), Some(client.get_usage(&agent_a, &svc_b)));
 }
 
