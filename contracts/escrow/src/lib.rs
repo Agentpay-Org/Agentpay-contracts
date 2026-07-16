@@ -1044,14 +1044,42 @@ impl Escrow {
 
     /// Settle the accumulated usage for an `(agent, service_id)` pair.
     ///
-    /// Admin-gated. Computes the outstanding bill (same math as
-    /// `compute_billing`), resets the usage counter to zero, and returns
-    /// the billed amount in stroops. The settlement loop is expected to
-    /// transfer the returned amount off-chain or via a paired token
-    /// contract call; this contract intentionally holds no balance.
-    pub fn settle(env: Env, agent: Address, service_id: Symbol) -> i128 {
+    /// `caller` must be either the global admin **or** the
+    /// `ServiceMetadata.owner` of the service being settled:
+    /// - If `caller` is the admin, settlement proceeds regardless of
+    ///   whether metadata exists.
+    /// - If `caller` is not the admin and no metadata has been set,
+    ///   the call panics with [`EscrowError::ServiceMetadataNotFound`] (#13).
+    /// - If `caller` is not the admin and is not the service owner,
+    ///   the call panics with [`EscrowError::NotPendingAdmin`] (#6,
+    ///   reused as the unauthorized-caller sentinel).
+    ///
+    /// Computes the outstanding bill (same math as `compute_billing`),
+    /// resets the usage counter to zero, and returns the billed amount in
+    /// stroops. The settlement loop is expected to transfer the returned
+    /// amount off-chain or via a paired token contract call; this contract
+    /// intentionally holds no balance.
+    pub fn settle(env: Env, caller: Address, agent: Address, service_id: Symbol) -> i128 {
         ensure_not_paused(&env);
-        require_admin(&env);
+        caller.require_auth();
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, EscrowError::NotInitialized));
+
+        // Non-admin callers must own this service.
+        if caller != admin {
+            let meta: ServiceMetadata = env
+                .storage()
+                .persistent()
+                .get(&DataKey::ServiceMetadata(service_id.clone()))
+                .unwrap_or_else(|| panic_with_error!(&env, EscrowError::ServiceMetadataNotFound));
+            if caller != meta.owner {
+                panic_with_error!(&env, EscrowError::NotPendingAdmin);
+            }
+        }
+
         let usage_key = DataKey::Usage(agent.clone(), service_id.clone());
         let requests: u32 = env.storage().persistent().get(&usage_key).unwrap_or(0);
         // Use tier schedule when present; fall back to flat price.
