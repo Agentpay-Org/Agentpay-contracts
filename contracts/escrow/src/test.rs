@@ -1,5 +1,7 @@
 #![cfg(test)]
 #![allow(deprecated)]
+#![allow(unused_variables)]
+#![allow(dead_code)]
 
 //! # Escrow contract test suite
 //!
@@ -1940,7 +1942,7 @@ fn test_compute_billing_zero_after_price_removed() {
 }
 
 #[test]
-fn test_remove_service_price_emits_price_rm_event() {
+fn test_remove_service_price_emits_price_rmv_event() {
     let env = Env::default();
     let (client, admin) = setup_initialized(&env);
     let svc = Symbol::new(&env, "infer");
@@ -1952,7 +1954,7 @@ fn test_remove_service_price_emits_price_rm_event() {
     assert!(!events.is_empty());
     let (_addr, topics, data) = events.last().unwrap();
     let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
-        (symbol_short!("price_rm"),).into_val(&env);
+        (symbol_short!("price_rmv"),).into_val(&env);
     assert_eq!(topics, expected_topics);
     let decoded: Symbol = data.into_val(&env);
     assert_eq!(decoded, svc);

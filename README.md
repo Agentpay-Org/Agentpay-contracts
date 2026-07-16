@@ -42,6 +42,21 @@ independent storage slots. `clear_service_metadata` (admin-gated, idempotent)
 removes only the metadata; the registration flag and per-(agent, service) usage
 history are untouched.
 
+### Service price removal: zero vs. removed
+
+`set_service_price(service_id, 0)` and `remove_service_price(service_id)` both
+make `get_service_price(service_id)` and `compute_billing(agent, service_id)`
+read back `0`, but they are not identical:
+
+- `set_service_price(_, 0)` stores an explicit zero price in `DataKey::ServicePrice`
+- `remove_service_price(_)` removes the price slot entirely, reclaiming storage
+- `remove_service_price(_)` also emits `price_rmv(service_id)` so indexers can
+  distinguish a removal from a write-to-zero
+
+Use removal when a service is being retired or reset to a truly unpriced state;
+use `0` only when you intentionally want to keep an explicit free-service price
+record on chain.
+
 ### Admin proposal validation
 
 `propose_admin_transfer` rejects proposing the current admin as the new admin
