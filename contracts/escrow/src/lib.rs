@@ -486,12 +486,57 @@ impl Escrow {
     /// Returns a `UsageRecord` carrying the *new total*, not the delta,
     /// so the caller can confirm the post-write state without a second
     /// storage read.
+    ///
+    /// # Authorization
+    ///
+    /// **Step 0**: The recorded `agent` must authorize this call via
+    /// `agent.require_auth()`. This closes a usage-forgery vector where any
+    /// party could inflate a competitor agent's counters (and therefore its
+    /// bill on the next `settle`) with no signature from the agent.
+    ///
+    /// Soroban's auth tree supports sub-invocation authorization: an agent can
+    /// pre-authorize a trusted metering operator to call `record_usage` on its
+    /// behalf by having the operator's call appear as a sub-invocation of an
+    /// agent-signed outer call. This allows existing off-chain settlement loops
+    /// to continue operating without requiring every agent to sign each
+    /// individual `record_usage` call directly:
+    ///
+    /// 1. The agent signs an outer transaction that authorizes the operator's
+    ///    contract call via Soroban's `authorize_as_current_contract` or
+    ///    sub-invocation auth.
+    /// 2. The operator's metering loop submits `record_usage` as a
+    ///    sub-invocation within that authorized context.
+    /// 3. Alternatively, agents can sign each `record_usage` call directly
+    ///    (standard path) if the metering loop supports it.
+    ///
+    /// # Validation order
+    ///
+    /// Auth checks are performed in this order (early exits on first failure):
+    ///
+    /// | Step | Check                  | Error                          |
+    /// | ---- | ---------------------- | ------------------------------ |
+    /// | 0    | `agent.require_auth()` | Soroban host auth error        |
+    /// | 1    | Contract paused        | `#4 ContractPaused`            |
+    /// | 2    | `requests == 0`        | `#2 RequestsMustBePositive`    |
+    /// | 3    | `requests > max`       | `#8 RequestsExceedsMaxPerCall` |
+    /// | 4    | `requests < min`       | `#9 RequestsBelowMinPerCall`   |
+    /// | 5    | Service not registered | `#7 ServiceNotRegistered`      |
+    /// | 6    | Service disabled       | `#12 ServiceDisabled`          |
+    /// | 7    | Agent blocked          | `#17 AgentBlocked`             |
+    /// | 8    | Agent not allowed      | `#10 AgentNotAllowed`          |
     pub fn record_usage(
         env: Env,
         agent: Address,
         service_id: Symbol,
         requests: u32,
     ) -> UsageRecord {
+        // Step 0: Require the agent to authorize this call. This prevents usage
+        // forgery where any party could inflate a competitor's bill. Soroban's
+        // auth tree supports sub-invocation authorization, allowing a metering
+        // operator to record on behalf of an agent if the agent has authorized
+        // the operator's contract call.
+        agent.require_auth();
+
         ensure_not_paused(&env);
         if requests == 0 {
             panic_with_error!(&env, EscrowError::RequestsMustBePositive);
