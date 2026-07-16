@@ -820,6 +820,21 @@ fn test_transfer_service_ownership_missing_metadata_panics() {
 }
 
 #[test]
+#[should_panic(expected = "Error(Contract, #23)")]
+fn test_transfer_service_ownership_unauthorized_panics() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let svc = Symbol::new(&env, "infer");
+    let owner = Address::generate(&env);
+    let new_owner = Address::generate(&env);
+    let desc = String::from_str(&env, "inference service");
+    client.set_service_metadata(&svc, &desc, &owner);
+
+    let intruder = Address::generate(&env);
+    client.transfer_service_ownership(&intruder, &svc, &new_owner);
+}
+
+#[test]
 fn test_clear_service_metadata_removes_entry() {
     let env = Env::default();
     let (client, admin) = setup_initialized(&env);
@@ -2625,10 +2640,9 @@ fn test_admin_can_settle_owned_service() {
     assert_eq!(billed, 40i128);
 }
 
-/// The owner of service A cannot settle service B (panics #6, the reused
-/// unauthorized-caller error).
+/// The owner of service A cannot settle service B (panics #23).
 #[test]
-#[should_panic(expected = "Error(Contract, #6)")]
+#[should_panic(expected = "Error(Contract, #23)")]
 fn test_owner_cannot_settle_other_service() {
     let env = Env::default();
     let (client, admin) = setup_initialized(&env);
