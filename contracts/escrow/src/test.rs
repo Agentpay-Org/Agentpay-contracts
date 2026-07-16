@@ -137,13 +137,6 @@ fn make_service(env: &Env, name: &'static str) -> Symbol {
 ///
 /// Useful for rate-window rollover tests and settlement-timestamp assertions
 /// without having to repeat the `env.ledger().with_mut(…)` boilerplate:
-/// ```ignore
-/// advance_ledger(&env, 100); // move 100 s into the future
-/// ```
-fn advance_ledger(env: &Env, seconds: u64) {
-    env.ledger().with_mut(|li| li.timestamp += seconds);
-}
-
 #[test]
 fn test_version() {
     let env = Env::default();
