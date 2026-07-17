@@ -1,5 +1,6 @@
 #![cfg(test)]
-#![allow(deprecated)]
+#![allow(deprecated, unused_variables, dead_code)]
+
 //! # Escrow contract test suite
 //!
 //! ## Test-harness conventions
@@ -306,11 +307,11 @@ fn test_record_usage_contract_exactly_one_event_per_call() {
     client.record_usage(&agent, &svc, &1u32);
     assert_usage_event_count(&env, 1);
 
-    // Second call produces exactly one event.
+    // Second call produces a second event.
     client.record_usage(&agent, &svc, &2u32);
     assert_usage_event_count(&env, 1);
 
-    // Third call produces exactly one event.
+    // Third call produces a third event.
     client.record_usage(&agent, &svc, &3u32);
     assert_usage_event_count(&env, 1);
 }
@@ -2691,8 +2692,8 @@ fn test_owner_cannot_settle_other_service() {
     client.set_service_price(&svc_b, &10i128);
     client.record_usage(&agent, &svc_b, &3u32);
 
-    // owner_a tries to settle_all for agent — unauthorized for svc_b.
-    client.settle_all(&owner_a, &agent);
+    // owner_a tries to settle svc_b — unauthorized.
+    client.settle(&owner_a, &agent, &svc_b);
 }
 
 /// A non-admin caller settling a service with no metadata is rejected with
@@ -2707,7 +2708,8 @@ fn test_nonadmin_settle_without_metadata_rejected() {
     let svc = Symbol::new(&env, "infer");
     client.set_service_price(&svc, &10i128);
     client.record_usage(&agent, &svc, &2u32);
-    client.settle_all(&stranger, &agent);
+
+    client.settle(&stranger, &agent, &svc);
 }
 
 /// The pause gate still applies to owner-authorized settlement.
