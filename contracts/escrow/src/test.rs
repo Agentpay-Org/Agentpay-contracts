@@ -1,6 +1,5 @@
 #![cfg(test)]
-#![allow(deprecated, unused_variables, dead_code)]
-
+#![allow(deprecated)]
 //! # Escrow contract test suite
 //!
 //! ## Test-harness conventions
@@ -38,13 +37,21 @@
 //! * **Equivalence** — the combined call produces the same post-state as the
 //!   two-step `register_service + set_service_metadata` sequence.
 //!
+//! ### Blocklist precedence coverage
+//! The per-agent blocklist (`AgentBlocked`, `#17`) is checked in
+//! `record_usage` before the allowlist and always wins — an agent that is
+//! both allow-listed and blocked is still rejected, and this holds whether
+//! the allowlist gate is enabled or disabled. See
+//! `test_blocklist_takes_precedence_over_allowlist`,
+//! `test_blocked_and_unlisted_agent_fails_with_block_not_allowlist_error`,
+//! and `test_blocklist_and_allowlist_mixed_agents_matrix` below.
+//!
 //! ### Security note
 //! Tests that use `setup_initialized` rely on `mock_all_auths`, which
 //! satisfies every `require_auth` call unconditionally.  When a test needs to
 //! verify that auth *is* enforced, use `setup_scoped_auth` or call
 //! `env.set_auths(&[])` to drop mock authorisations before the call under
 //! test.
-
 use super::*;
 use soroban_sdk::{
     testutils::{Address as _, Events, Ledger, MockAuth, MockAuthInvoke},
@@ -1883,6 +1890,107 @@ fn test_set_agent_blocked_requires_admin_auth() {
     env.set_auths(&[]);
     let agent = Address::generate(&env);
     client.set_agent_blocked(&agent, &true);
+}
+
+/// Baseline: with no blocklist entry, `is_agent_blocked` defaults to
+/// `false` and `record_usage` succeeds normally.
+#[test]
+fn test_record_usage_default_unblocked_allows_agent() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let _ = &admin;
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "infer");
+
+    assert!(!client.is_agent_blocked(&agent));
+    let record = client.record_usage(&agent, &svc, &3u32);
+    assert_eq!(record.requests, 3);
+}
+
+/// A blocked agent that is also NOT allow-listed still fails with the
+/// block error (#17), not the allowlist error (#10) — proving the block
+/// check runs strictly before the allowlist check, even for agents the
+/// allowlist would have rejected anyway.
+#[test]
+#[should_panic(expected = "Error(Contract, #17)")]
+fn test_blocked_and_unlisted_agent_fails_with_block_not_allowlist_error() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let _ = &admin;
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "infer");
+
+    client.set_allowlist_enabled(&true);
+    // Deliberately NOT allow-listed.
+    client.set_agent_blocked(&agent, &true);
+
+    client.record_usage(&agent, &svc, &1u32);
+}
+
+/// Toggling block → unblock → re-block ends in the blocked state, and a
+/// call made in that final state is rejected with #17 again.
+#[test]
+#[should_panic(expected = "Error(Contract, #17)")]
+fn test_block_unblock_reblock_ends_blocked() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let _ = &admin;
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "infer");
+
+    client.set_agent_blocked(&agent, &true);
+    assert!(client.is_agent_blocked(&agent));
+
+    client.set_agent_blocked(&agent, &false);
+    assert!(!client.is_agent_blocked(&agent));
+    // Usage succeeds while unblocked.
+    client.record_usage(&agent, &svc, &1u32);
+
+    client.set_agent_blocked(&agent, &true);
+    assert!(client.is_agent_blocked(&agent));
+    // Re-blocked: rejected again.
+    client.record_usage(&agent, &svc, &1u32);
+}
+
+/// Multiple agents with mixed blocklist/allowlist status are handled
+/// independently. Only the allow-listed, unblocked agent succeeds;
+/// every blocked agent fails regardless of allowlist status, and an
+/// unlisted-but-unblocked agent fails on the allowlist gate instead.
+#[test]
+fn test_blocklist_and_allowlist_mixed_agents_matrix() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let _ = &admin;
+    let svc = Symbol::new(&env, "infer");
+
+    let allowed_unblocked = Address::generate(&env);
+    let allowed_blocked = Address::generate(&env);
+    let unlisted_blocked = Address::generate(&env);
+    let unlisted_unblocked = Address::generate(&env);
+
+    client.set_allowlist_enabled(&true);
+    client.set_agent_allowed(&allowed_unblocked, &true);
+    client.set_agent_allowed(&allowed_blocked, &true);
+    client.set_agent_blocked(&allowed_blocked, &true);
+    client.set_agent_blocked(&unlisted_blocked, &true);
+    // unlisted_unblocked: neither allowed nor blocked.
+
+    // Only the allow-listed, unblocked agent succeeds.
+    let record = client.record_usage(&allowed_unblocked, &svc, &2u32);
+    assert_eq!(record.requests, 2);
+
+    // Allow-listed but blocked: block wins.
+    assert!(client
+        .try_record_usage(&allowed_blocked, &svc, &1u32)
+        .is_err());
+    // Not allow-listed and blocked: block still fires.
+    assert!(client
+        .try_record_usage(&unlisted_blocked, &svc, &1u32)
+        .is_err());
+    // Not allow-listed, not blocked: rejected by the allowlist gate instead.
+    assert!(client
+        .try_record_usage(&unlisted_unblocked, &svc, &1u32)
+        .is_err());
 }
 
 #[test]
