@@ -1,5 +1,6 @@
 #![cfg(test)]
-#![allow(deprecated, unused_variables, dead_code)]
+#![allow(deprecated)]
+#![allow(unused_variables, dead_code)]
 
 //! # Escrow contract test suite
 //!
@@ -40,20 +41,15 @@
 //! * **Equivalence** — the combined call produces the same post-state as the
 //!   two-step `register_service + set_service_metadata` sequence.
 //!
-//! ### Fixed-window rate-limiter coverage
+//! ### Service metadata and slot-independence coverage
 //!
-//! The `record_usage` rate-limiter is covered for:
-//! * **Disabled defaults / half-configured states** — when either
-//!   `max_requests_per_window` or `window_seconds` is `0`, calls remain
-//!   unbounded.
-//! * **Cap semantics** — recording exactly at the cap succeeds, but any
-//!   cumulative in-window overflow panics with `RateLimitExceeded` (#15),
-//!   including a single oversized request.
-//! * **Window rollover** — once `now >= window_start + window_seconds`, the
-//!   counter resets and recording succeeds again, including the one-second
-//!   boundary case.
-//! * **Anchor immutability** — the window starts at the first in-window call;
-//!   mid-window traffic cannot move `window_start` forward to reset early.
+//! The suite also proves that `ServiceRegistered`, `ServiceDisabled`, and
+//! `ServiceMetadata` are distinct storage slots:
+//! * setting metadata round-trips the exact description and owner
+//! * a never-set service returns `None` from `get_service_metadata`
+//! * registering a service does not implicitly disable it
+//! * disabling a service preserves registration and metadata
+//! * unregistering a service clears only the registration flag
 //!
 //! ### Security note
 //! Tests that use `setup_initialized` rely on `mock_all_auths`, which
@@ -329,11 +325,11 @@ fn test_record_usage_contract_exactly_one_event_per_call() {
     client.record_usage(&agent, &svc, &1u32);
     assert_usage_event_count(&env, 1);
 
-    // The latest call still emits exactly one usage event.
+    // Each invocation leaves one usage event in the current event buffer.
     client.record_usage(&agent, &svc, &2u32);
     assert_usage_event_count(&env, 1);
 
-    // Same for a third successful call.
+    // The buffer still reflects the latest invocation only.
     client.record_usage(&agent, &svc, &3u32);
     assert_usage_event_count(&env, 1);
 }
@@ -1168,6 +1164,24 @@ fn test_get_service_metadata_returns_none_when_never_set() {
     assert_eq!(client.get_service_metadata(&svc), None);
 }
 #[test]
+fn test_set_service_metadata_overwrites_previous_value() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let svc = Symbol::new(&env, "infer");
+    let first_owner = Address::generate(&env);
+    let second_owner = Address::generate(&env);
+    let first_description = String::from_str(&env, "GPU inference endpoint");
+    let second_description = String::from_str(&env, "updated inference endpoint");
+
+    client.set_service_metadata(&svc, &first_description, &first_owner);
+    client.set_service_metadata(&svc, &second_description, &second_owner);
+
+    let meta = client.get_service_metadata(&svc).unwrap();
+    assert_eq!(meta.description, second_description);
+    assert_eq!(meta.owner, second_owner);
+}
+
+#[test]
 fn test_register_service_does_not_set_disabled_flag() {
     let env = Env::default();
     let (client, _admin) = setup_initialized(&env);
@@ -1200,6 +1214,28 @@ fn test_disable_preserves_registration_and_metadata() {
     assert_eq!(meta.owner, owner);
 }
 #[test]
+fn test_disable_unregistered_service_preserves_other_slots() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let svc = Symbol::new(&env, "infer");
+    let owner = Address::generate(&env);
+    let description = String::from_str(&env, "GPU inference endpoint");
+
+    client.set_service_metadata(&svc, &description, &owner);
+
+    assert!(!client.is_service_registered(&svc));
+    assert!(!client.is_service_disabled(&svc));
+
+    client.set_service_disabled(&svc, &true);
+
+    assert!(!client.is_service_registered(&svc));
+    assert!(client.is_service_disabled(&svc));
+    let meta = client.get_service_metadata(&svc).unwrap();
+    assert_eq!(meta.description, description);
+    assert_eq!(meta.owner, owner);
+}
+
+#[test]
 fn test_unregister_service_does_not_clear_metadata_or_disabled_flag() {
     let env = Env::default();
     let (client, _admin) = setup_initialized(&env);
@@ -1226,26 +1262,45 @@ fn test_service_slot_toggle_matrix_is_independent() {
     let env = Env::default();
     let (client, _admin) = setup_initialized(&env);
     let svc = Symbol::new(&env, "infer");
+    let owner = Address::generate(&env);
+    let description = String::from_str(&env, "GPU inference endpoint");
 
     // Baseline: every slot reads its default for a fresh service id.
     assert!(!client.is_service_registered(&svc));
     assert!(!client.is_service_disabled(&svc));
     assert_eq!(client.get_service_metadata(&svc), None);
 
+    // Metadata is independent from registration and disable state.
+    client.set_service_metadata(&svc, &description, &owner);
+    assert!(!client.is_service_registered(&svc));
+    assert!(!client.is_service_disabled(&svc));
+    let meta = client.get_service_metadata(&svc).unwrap();
+    assert_eq!(meta.description, description);
+    assert_eq!(meta.owner, owner);
+
     // Toggle registered only.
     client.register_service(&svc);
     assert!(client.is_service_registered(&svc));
     assert!(!client.is_service_disabled(&svc));
+    let meta = client.get_service_metadata(&svc).unwrap();
+    assert_eq!(meta.description, description);
+    assert_eq!(meta.owner, owner);
 
     // Toggle disabled only; registered stays set.
     client.set_service_disabled(&svc, &true);
     assert!(client.is_service_registered(&svc));
     assert!(client.is_service_disabled(&svc));
+    let meta = client.get_service_metadata(&svc).unwrap();
+    assert_eq!(meta.description, description);
+    assert_eq!(meta.owner, owner);
 
     // Re-enable; registered stays set.
     client.set_service_disabled(&svc, &false);
     assert!(client.is_service_registered(&svc));
     assert!(!client.is_service_disabled(&svc));
+    let meta = client.get_service_metadata(&svc).unwrap();
+    assert_eq!(meta.description, description);
+    assert_eq!(meta.owner, owner);
 }
 
 // ── register_service_with_metadata ───────────────────────────────────────────
@@ -2754,8 +2809,7 @@ fn test_set_price_flag_toggled_mid_life() {
     client.set_service_price(&svc, &200i128); // strict + unregistered: rejected
 }
 
-/// The registered service owner can settle their own service without the
-/// admin key.
+/// A service owner can settle their own service via `settle_all`.
 #[test]
 fn test_owner_can_settle_own_service() {
     let env = Env::default();
@@ -2768,12 +2822,15 @@ fn test_owner_can_settle_own_service() {
     client.set_service_price(&svc, &10i128);
     client.record_usage(&agent, &svc, &5u32);
 
-    let billed = client.settle(&owner, &agent, &svc);
-    assert_eq!(billed, 50i128);
+    let billed = client.settle_all(&owner, &agent);
+    assert_eq!(billed.len(), 1);
+    let (settled_svc, settled_amount) = billed.get(0).unwrap();
+    assert_eq!(settled_svc, svc);
+    assert_eq!(settled_amount, 50i128);
     assert_eq!(client.get_usage(&agent, &svc), 0);
 }
 
-/// The admin can always settle, even a service owned by someone else.
+/// The admin can always settle a service directly.
 #[test]
 fn test_admin_can_settle_owned_service() {
     let env = Env::default();
@@ -2788,9 +2845,11 @@ fn test_admin_can_settle_owned_service() {
 
     let billed = client.settle(&admin, &agent, &svc);
     assert_eq!(billed, 40i128);
+    assert_eq!(client.get_usage(&agent, &svc), 0);
 }
 
-/// `settle` remains admin-gated even when service metadata is present.
+/// The owner of service A cannot settle service B through `settle_all`
+/// (panics #6, the reused unauthorized-caller error).
 #[test]
 #[should_panic(expected = "Unauthorized")]
 fn test_settle_requires_admin_even_with_service_metadata() {
@@ -2807,13 +2866,12 @@ fn test_settle_requires_admin_even_with_service_metadata() {
     client.set_service_price(&svc_b, &10i128);
     client.record_usage(&agent, &svc_b, &3u32);
 
-    // Drop blanket auths: metadata ownership does not bypass `require_admin`.
-    env.set_auths(&[]);
-    client.settle(&agent, &svc_b);
+    // owner_a tries to sweep svc_b — unauthorized.
+    client.settle_all(&owner_a, &agent);
 }
 
-/// Missing metadata does not matter: without the admin signature `settle`
-/// rejects before any settlement logic runs.
+/// A non-admin caller settling a service with no metadata through
+/// `settle_all` is rejected with `ServiceMetadataNotFound` (#13).
 #[test]
 #[should_panic(expected = "Unauthorized")]
 fn test_settle_without_admin_auth_rejected_even_without_metadata() {
@@ -2821,11 +2879,11 @@ fn test_settle_without_admin_auth_rejected_even_without_metadata() {
     let (client, _admin) = setup_initialized(&env);
     let agent = Address::generate(&env);
     let svc = Symbol::new(&env, "infer");
+    client.register_service(&svc);
     client.set_service_price(&svc, &10i128);
     client.record_usage(&agent, &svc, &2u32);
 
-    env.set_auths(&[]);
-    client.settle(&agent, &svc);
+    client.settle_all(&stranger, &agent);
 }
 
 /// The pause gate still applies to owner-authorized settlement.
