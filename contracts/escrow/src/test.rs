@@ -1,5 +1,7 @@
 #![cfg(test)]
 #![allow(deprecated)]
+#![allow(unused_variables)]
+#![allow(dead_code)]
 
 //! # Escrow contract test suite
 //!
