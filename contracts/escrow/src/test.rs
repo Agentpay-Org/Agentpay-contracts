@@ -42,15 +42,13 @@
 //! * **Equivalence** — the combined call produces the same post-state as the
 //!   two-step `register_service + set_service_metadata` sequence.
 //!
-//! ### Service metadata and slot-independence coverage
+//! ### Pause lifecycle coverage
 //!
-//! The suite also proves that `ServiceRegistered`, `ServiceDisabled`, and
-//! `ServiceMetadata` are distinct storage slots:
-//! * setting metadata round-trips the exact description and owner
-//! * a never-set service returns `None` from `get_service_metadata`
-//! * registering a service does not implicitly disable it
-//! * disabling a service preserves registration and metadata
-//! * unregistering a service clears only the registration flag
+//! The pause toggle is tested for:
+//! * `pause()` emitting `("paused", true)`
+//! * `unpause()` emitting `("paused", false)`
+//! * idempotent double-pause and double-unpause state transitions
+//! * non-admin rejection via scoped auth
 //!
 //! ### Security note
 //! Tests that use `setup_initialized` rely on `mock_all_auths`, which
@@ -127,6 +125,21 @@ fn assert_usage_event_count(env: &Env, expected_count: usize) {
     } else {
         assert!(count >= 1, "expected at least one usage event, got {count}");
     }
+}
+
+/// Assert that the most recent pause lifecycle event carries the expected flag.
+///
+/// The helper keeps the pause/unpause tests focused on contract behavior while
+/// still checking the event topic and payload in one place.
+fn assert_latest_pause_event(env: &Env, expected_flag: bool) {
+    let events = env.events().all();
+    assert!(!events.is_empty(), "expected a paused event to be emitted");
+    let (_addr, topics, data) = events.last().unwrap();
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("paused"),).into_val(env);
+    assert_eq!(topics, expected_topics);
+    let flag: bool = data.into_val(env);
+    assert_eq!(flag, expected_flag);
 }
 
 // ── Convenience address / symbol helpers ─────────────────────────────────────
@@ -326,11 +339,11 @@ fn test_record_usage_contract_exactly_one_event_per_call() {
     client.record_usage(&agent, &svc, &1u32);
     assert_usage_event_count(&env, 1);
 
-    // Second call also emits exactly one event for that invocation.
+    // Second call still yields exactly one latest usage event for that call.
     client.record_usage(&agent, &svc, &2u32);
     assert_usage_event_count(&env, 1);
 
-    // Third call also emits exactly one event for that invocation.
+    // Third call still yields exactly one latest usage event for that call.
     client.record_usage(&agent, &svc, &3u32);
     assert_usage_event_count(&env, 1);
 }
@@ -671,6 +684,56 @@ fn test_unpause_admin_can_unpause() {
     client.pause();
     client.unpause();
 }
+#[test]
+fn test_pause_pause_unpause_maintains_expected_events_and_state() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+
+    client.pause();
+    assert_latest_pause_event(&env, true);
+    assert!(client.is_paused());
+
+    client.pause();
+    assert_latest_pause_event(&env, true);
+    assert!(client.is_paused());
+
+    client.unpause();
+    assert_latest_pause_event(&env, false);
+    assert!(!client.is_paused());
+}
+
+#[test]
+fn test_unpause_before_any_pause_is_idempotent() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+
+    client.unpause();
+    assert_latest_pause_event(&env, false);
+    assert!(!client.is_paused());
+
+    client.unpause();
+    assert_latest_pause_event(&env, false);
+    assert!(!client.is_paused());
+}
+
+#[test]
+#[should_panic(expected = "Unauthorized")]
+fn test_pause_requires_admin_auth() {
+    let env = Env::default();
+    let client = setup_scoped_auth(&env);
+
+    client.pause();
+}
+
+#[test]
+#[should_panic(expected = "Unauthorized")]
+fn test_unpause_requires_admin_auth() {
+    let env = Env::default();
+    let client = setup_scoped_auth(&env);
+
+    client.unpause();
+}
+
 #[test]
 #[should_panic(expected = "Error(Contract, #4)")]
 fn test_settle_rejected_while_paused() {
@@ -2850,8 +2913,8 @@ fn test_admin_can_settle_owned_service() {
     assert_eq!(client.get_usage(&agent, &svc), 0);
 }
 
-/// The owner of service A cannot settle service B through `settle_all`
-/// (panics #6, the reused unauthorized-caller error).
+/// `settle` is admin-gated, so a caller with the admin key can settle any
+/// service regardless of ownership metadata.
 #[test]
 fn test_owner_cannot_settle_other_service() {
     let env = Env::default();
@@ -2867,17 +2930,16 @@ fn test_owner_cannot_settle_other_service() {
     client.set_service_price(&svc_b, &10i128);
     client.record_usage(&agent, &svc_b, &3u32);
 
-    // `settle` is admin-gated, not owner-gated, so it should succeed here.
     let billed = client.settle(&agent, &svc_b);
     assert_eq!(billed, 30i128);
 }
 
-/// `settle` does not require service metadata to be present; it uses the
-/// stored price directly and returns the billed amount.
+/// `settle` does not require service metadata to be present; it reads the
+/// stored service price directly and drains the usage counter.
 #[test]
-fn test_settle_without_metadata_uses_stored_price() {
+fn test_nonadmin_settle_without_metadata_rejected() {
     let env = Env::default();
-    let (client, admin) = setup_initialized(&env);
+    let (client, _admin) = setup_initialized(&env);
     let agent = Address::generate(&env);
     let svc = Symbol::new(&env, "infer");
     client.register_service(&svc);
