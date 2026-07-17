@@ -871,7 +871,7 @@ fn test_transfer_service_ownership_missing_metadata_panics() {
     client.transfer_service_ownership(&caller, &svc, &new_owner);
 }
 #[test]
-#[should_panic(expected = "Error(Contract, #23)")]
+#[should_panic(expected = "Error(Contract, #26)")]
 fn test_transfer_service_ownership_unauthorized_panics() {
     let env = Env::default();
     let (client, _admin) = setup_initialized(&env);
@@ -883,6 +883,73 @@ fn test_transfer_service_ownership_unauthorized_panics() {
 
     let intruder = Address::generate(&env);
     client.transfer_service_ownership(&intruder, &svc, &new_owner);
+}
+#[test]
+#[should_panic(expected = "Error(Contract, #27)")]
+fn test_transfer_service_ownership_to_self_rejected_by_owner() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let svc = Symbol::new(&env, "infer");
+    let owner = Address::generate(&env);
+    let desc = String::from_str(&env, "inference service");
+    client.set_service_metadata(&svc, &desc, &owner);
+    // Owner attempts to transfer to themselves — no-op rejected.
+    client.transfer_service_ownership(&owner, &svc, &owner);
+}
+#[test]
+#[should_panic(expected = "Error(Contract, #27)")]
+fn test_transfer_service_ownership_to_self_rejected_by_admin() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let svc = Symbol::new(&env, "infer");
+    let owner = Address::generate(&env);
+    let desc = String::from_str(&env, "inference service");
+    client.set_service_metadata(&svc, &desc, &owner);
+    // Admin attempts to transfer to the current owner — no-op rejected.
+    client.transfer_service_ownership(&_admin, &svc, &owner);
+}
+#[test]
+fn test_transfer_service_ownership_genuine_transfer_still_works() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let svc = Symbol::new(&env, "infer");
+    let owner = Address::generate(&env);
+    let new_owner = Address::generate(&env);
+    let desc = String::from_str(&env, "inference service");
+    client.set_service_metadata(&svc, &desc, &owner);
+    // Genuine transfer to a different address.
+    client.transfer_service_ownership(&owner, &svc, &new_owner);
+    let meta = client.get_service_metadata(&svc).unwrap();
+    assert_eq!(meta.owner, new_owner);
+    assert_eq!(meta.description, desc);
+}
+#[test]
+fn test_transfer_service_ownership_genuine_transfer_emits_event() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let svc = Symbol::new(&env, "infer");
+    let owner = Address::generate(&env);
+    let new_owner = Address::generate(&env);
+    let desc = String::from_str(&env, "inference service");
+    client.set_service_metadata(&svc, &desc, &owner);
+    // Capture event count before transfer.
+    let events_before = env.events().all();
+    let count_before = events_before.len();
+    // Perform genuine transfer.
+    client.transfer_service_ownership(&owner, &svc, &new_owner);
+    // Exactly one new event (owner_chg).
+    let events_after = env.events().all();
+    assert_eq!(
+        events_after.len(),
+        count_before + 1,
+        "genuine transfer must emit exactly one event"
+    );
+    let (_addr, topics, data) = events_after.last().unwrap();
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("owner_chg"),).into_val(&env);
+    assert_eq!(topics, expected_topics);
+    let decoded: (Symbol, Address, Address) = data.into_val(&env);
+    assert_eq!(decoded, (svc, owner, new_owner));
 }
 
 #[test]

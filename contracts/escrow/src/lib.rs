@@ -263,6 +263,12 @@ pub enum EscrowError {
     /// attempting to settle a service they do not own, or transfer
     /// ownership of metadata they do not control).
     Unauthorized = 26,
+    /// `transfer_service_ownership` was called with a `new_owner` that
+    /// matches the current owner — a no-op that would waste a storage
+    /// write and emit a spurious `owner_chg` event. Rejected to match
+    /// the existing `InvalidAdminProposal` guard on
+    /// `propose_admin_transfer`.
+    InvalidOwnerTransfer = 27,
 }
 
 #[contracttype]
@@ -1796,9 +1802,13 @@ impl Escrow {
     /// Transfer ownership of a service's metadata to `new_owner`,
     /// preserving the existing `description`. Authorised by `caller`,
     /// which must be the current owner OR the admin. Panics with
-    /// `ServiceMetadataNotFound` if no metadata has been set, or
-    /// [`EscrowError::Unauthorized`] if the caller is not the owner or admin.
-    /// Emits `owner_chg(service_id, old_owner, new_owner)` for indexers.
+    /// `ServiceMetadataNotFound` if no metadata has been set,
+    /// [`EscrowError::InvalidOwnerTransfer`] if `new_owner` matches the
+    /// current owner, or [`EscrowError::Unauthorized`] if the caller is
+    /// not the owner or admin.
+    /// Emits `owner_chg(service_id, old_owner, new_owner)` for indexers
+    /// only on genuine transfers (no-op self-transfers are rejected
+    /// before any storage write or event emission).
     /// Honours the pause gate.
     pub fn transfer_service_ownership(
         env: Env,
@@ -1816,6 +1826,14 @@ impl Escrow {
             .unwrap_or_else(|| panic_with_error!(&env, EscrowError::ServiceMetadataNotFound));
         if caller != meta.owner && caller != admin {
             panic_with_error!(&env, EscrowError::Unauthorized);
+        }
+        // Reject a no-op transfer to the current owner. Mirrors the
+        // `InvalidAdminProposal` guard on `propose_admin_transfer`:
+        // skipping the guard would waste a storage write and emit an
+        // `owner_chg` event whose old_owner == new_owner, misleading
+        // indexers into reporting a meaningful handover.
+        if new_owner == meta.owner {
+            panic_with_error!(&env, EscrowError::InvalidOwnerTransfer);
         }
         let old_owner = meta.owner.clone();
         meta.owner = new_owner.clone();
