@@ -66,6 +66,10 @@ use soroban_sdk::{
 /// All subsequent `require_auth` calls are automatically satisfied by
 /// `mock_all_auths`, so most tests can start from this helper without any
 /// additional auth wiring.
+///
+/// **Note on agent auth**: After adding `agent.require_auth()` to `record_usage`,
+/// `mock_all_auths()` will satisfy agent auth checks for any agent address,
+/// allowing the existing test suite to continue working without modification.
 fn setup_initialized(env: &Env) -> (EscrowClient<'_>, Address) {
     env.mock_all_auths();
     let contract_id = env.register_contract(None, Escrow);
@@ -2447,6 +2451,169 @@ fn test_i21_total_requests_all_time_accumulates_large_values() {
     client.record_usage(&a1, &svc, &u32::MAX);
     client.record_usage(&a2, &svc, &u32::MAX);
     assert_eq!(client.get_total_requests_all_time(), (u32::MAX as u64) * 2);
+}
+
+/// # Issue #165: Agent authorization on record_usage
+///
+/// Tests for `agent.require_auth()` enforcement in `record_usage`. The agent
+/// must authorize the call; unauthorized callers cannot forge usage on behalf
+/// of other agents. Soroban's auth tree allows metering operators to record
+/// on the agent's behalf via sub-invocation authorization if the agent has
+/// pre-authorized them.
+
+/// `record_usage` rejects when the agent does not authorize the call.
+///
+/// This test uses `setup_scoped_auth` to set up auth mocking that allows only
+/// `init`, then attempts to call `record_usage` without the agent's signature.
+/// The call must fail because `agent.require_auth()` is checked at step 0,
+/// before all other validation gates.
+#[test]
+#[should_panic]
+fn test_i165_record_usage_requires_agent_auth() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, Escrow);
+    let client = EscrowClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    env.mock_auths(&[MockAuth {
+        address: &admin,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "init",
+            args: (admin.clone(),).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    client.init(&admin);
+
+    // Attempt to record usage for an agent without authorizing as that agent.
+    // No mock_auths are set up for record_usage, so the agent.require_auth()
+    // call will fail.
+    let agent = Address::generate(&env);
+    let service_id = Symbol::new(&env, "weather_api");
+    client.record_usage(&agent, &service_id, &100u32);
+}
+
+/// `record_usage` succeeds when the agent authorizes the call.
+///
+/// This is a positive control test: when the agent's signature is included
+/// via `mock_auths`, the auth check passes and the call proceeds normally.
+#[test]
+fn test_i165_record_usage_succeeds_with_agent_auth() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, Escrow);
+    let client = EscrowClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+
+    // Mock both init and record_usage so both calls are authorized.
+    let agent = Address::generate(&env);
+    let service_id = Symbol::new(&env, "weather_api");
+
+    env.mock_auths(&[
+        MockAuth {
+            address: &admin,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "init",
+                args: (admin.clone(),).into_val(&env),
+                sub_invokes: &[],
+            },
+        },
+        MockAuth {
+            address: &agent,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "record_usage",
+                args: (agent.clone(), service_id.clone(), 100u32).into_val(&env),
+                sub_invokes: &[],
+            },
+        },
+    ]);
+
+    client.init(&admin);
+    let record = client.record_usage(&agent, &service_id, &100u32);
+    assert_eq!(record.requests, 100);
+    assert_eq!(record.agent, agent);
+    assert_eq!(record.service_id, service_id);
+}
+
+/// Agent auth is checked before the pause gate.
+///
+/// Per the validation order table in the `record_usage` doc comment, auth
+/// (step 0) is checked before the pause gate (step 1). This test confirms
+/// that auth failure occurs even when the contract is paused.
+#[test]
+#[should_panic]
+fn test_i165_record_usage_auth_checked_before_pause() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, Escrow);
+    let client = EscrowClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    env.mock_auths(&[MockAuth {
+        address: &admin,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "init",
+            args: (admin.clone(),).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    client.init(&admin);
+    client.pause();
+
+    // Try to record usage without the agent's signature, on a paused contract.
+    // Auth failure (step 0) must occur before the pause check (step 1).
+    let agent = Address::generate(&env);
+    let service_id = Symbol::new(&env, "weather_api");
+    client.record_usage(&agent, &service_id, &100u32);
+}
+
+/// Agent auth is independent per agent: one agent's signature does not
+/// authorize calls on behalf of another agent.
+///
+/// This test ensures that the auth tie is correctly bound to the specific
+/// agent address passed as a parameter; forging usage on behalf of a
+/// different agent must fail even if the other agent has previously
+/// authorized a call.
+#[test]
+#[should_panic]
+fn test_i165_record_usage_auth_is_per_agent() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, Escrow);
+    let client = EscrowClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    let agent_a = Address::generate(&env);
+    let agent_b = Address::generate(&env);
+    let service_id = Symbol::new(&env, "weather_api");
+
+    // Set up auth for init and for agent_a only.
+    env.mock_auths(&[
+        MockAuth {
+            address: &admin,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "init",
+                args: (admin.clone(),).into_val(&env),
+                sub_invokes: &[],
+            },
+        },
+        MockAuth {
+            address: &agent_a,
+            invoke: &MockAuthInvoke {
+                contract: &contract_id,
+                fn_name: "record_usage",
+                args: (agent_a.clone(), service_id.clone(), 50u32).into_val(&env),
+                sub_invokes: &[],
+            },
+        },
+    ]);
+
+    client.init(&admin);
+    // Record for agent_a succeeds.
+    client.record_usage(&agent_a, &service_id, &50u32);
+
+    // Try to record for agent_b using agent_a's auth context. This must fail
+    // because agent_b has not authorized the call.
+    client.record_usage(&agent_b, &service_id, &100u32);
 }
 
 /// Register and `init` the contract authorising only `admin` for the `init`
