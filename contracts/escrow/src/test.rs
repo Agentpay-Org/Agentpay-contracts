@@ -835,6 +835,21 @@ fn test_transfer_service_ownership_missing_metadata_panics() {
 }
 
 #[test]
+#[should_panic(expected = "Error(Contract, #23)")]
+fn test_transfer_service_ownership_unauthorized_panics() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let svc = Symbol::new(&env, "infer");
+    let owner = Address::generate(&env);
+    let new_owner = Address::generate(&env);
+    let desc = String::from_str(&env, "inference service");
+    client.set_service_metadata(&svc, &desc, &owner);
+
+    let intruder = Address::generate(&env);
+    client.transfer_service_ownership(&intruder, &svc, &new_owner);
+}
+
+#[test]
 fn test_clear_service_metadata_removes_entry() {
     let env = Env::default();
     let (client, _admin) = setup_initialized(&env);
@@ -2740,6 +2755,42 @@ fn test_admin_can_settle_owned_service() {
 
     let billed = client.settle(&admin, &agent, &svc);
     assert_eq!(billed, 40i128);
+}
+
+/// The owner of service A cannot settle service B (panics #23).
+#[test]
+#[should_panic(expected = "Error(Contract, #23)")]
+fn test_owner_cannot_settle_other_service() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let owner_a = Address::generate(&env);
+    let owner_b = Address::generate(&env);
+    let agent = Address::generate(&env);
+    let svc_a = Symbol::new(&env, "svc_a");
+    let svc_b = Symbol::new(&env, "svc_b");
+
+    client.set_service_metadata(&svc_a, &String::from_str(&env, "a"), &owner_a);
+    client.set_service_metadata(&svc_b, &String::from_str(&env, "b"), &owner_b);
+    client.set_service_price(&svc_b, &10i128);
+    client.record_usage(&agent, &svc_b, &3u32);
+
+    // owner_a tries to settle_all for agent — unauthorized for svc_b.
+    client.settle_all(&owner_a, &agent);
+}
+
+/// A non-admin caller settling a service with no metadata is rejected with
+/// ServiceMetadataNotFound (#13).
+#[test]
+#[should_panic(expected = "Error(Contract, #13)")]
+fn test_nonadmin_settle_without_metadata_rejected() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let stranger = Address::generate(&env);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "infer");
+    client.set_service_price(&svc, &10i128);
+    client.record_usage(&agent, &svc, &2u32);
+    client.settle_all(&stranger, &agent);
 }
 
 /// The pause gate still applies to owner-authorized settlement.

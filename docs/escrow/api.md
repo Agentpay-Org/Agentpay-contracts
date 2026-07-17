@@ -57,7 +57,7 @@ to 1 when absent; counters default to 0; flags default to `false`.
 | 3 | NotInitialized | admin-gated call before `init` | all admin entrypoints |
 | 4 | ContractPaused | called while paused | `record_usage`, `settle`, `transfer_service_ownership` |
 | 5 | NoPendingAdminTransfer | accept with nothing pending | `accept_admin_transfer` |
-| 6 | NotPendingAdmin | accept by wrong address (also reused for unauthorized ownership transfer) | `accept_admin_transfer`, `transfer_service_ownership` |
+| 6 | NotPendingAdmin | caller is not the pending admin | `accept_admin_transfer` |
 | 7 | ServiceNotRegistered | strict mode + unknown service | `record_usage` |
 | 8 | RequestsExceedsMaxPerCall | `requests > MaxRequestsPerCall` | `record_usage` |
 | 9 | RequestsBelowMinPerCall | `requests < MinRequestsPerCall` | `record_usage` |
@@ -66,6 +66,13 @@ to 1 when absent; counters default to 0; flags default to `false`.
 | 12 | ServiceDisabled | service disabled | `record_usage` |
 | 13 | ServiceMetadataNotFound | metadata-scoped call with no metadata | `transfer_service_ownership` |
 | 14 | InvalidAdminProposal | propose current admin as new admin | `propose_admin_transfer` |
+| 17 | AgentBlocked | agent on blocklist | `record_usage` |
+| 18 | AgentNotActive | Reserved for future use. | |
+| 19 | InvalidServiceOwner | Reserved for future use. | |
+| 20 | InvalidTransferRecipient | Reserved for future use. | |
+| 21 | DisputeAlreadyOpen | Reserved for future use. | |
+| 22 | RefundExceedsUsage | Reserved for future use. | |
+| 23 | Unauthorized | caller is not authorized for the action | `settle_all`, `transfer_service_ownership` |
 
 ## Versioning
 

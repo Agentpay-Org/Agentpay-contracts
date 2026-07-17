@@ -240,16 +240,9 @@ pub enum EscrowError {
     /// `resolve_dispute` was called with `refund_requests` exceeding the
     /// current accumulated usage — prevents double-refunds.
     RefundExceedsUsage = 22,
-    /// `set_service_price` was called with a `price_stroops` that falls outside
-    /// the admin-configured global price band
-    /// (`MinServicePrice` ≤ price ≤ `MaxServicePrice`). A floor of `0` and a
-    /// ceiling of `i128::MAX` are the defaults, so this error can only be
-    /// triggered after `set_price_bounds` has been called explicitly.
-    PriceOutOfBounds = 23,
-    /// `set_price_bounds` was called with `min_stroops > max_stroops`.
-    /// An inverted band is rejected immediately so the stored bounds are
-    /// always a valid interval.
-    InvertedPriceBand = 24,
+    /// A caller attempted to perform an action they are not authorized for,
+    /// such as settling or transferring a service they do not own.
+    Unauthorized = 23,
 }
 
 #[contracttype]
@@ -1151,6 +1144,7 @@ impl Escrow {
     /// service in the index. In practice, only the admin can call
     /// `settle_all` for an agent whose services span multiple owners;
     /// a service owner should use `settle` for their individual service.
+    /// Panics with [`EscrowError::Unauthorized`] if the caller does not own the service.
     ///
     /// Bounds: panics with [`EscrowError::SettleAllTooLarge`] when the
     /// stored index exceeds `MAX_SETTLE_ALL`. This should never occur in
@@ -1203,7 +1197,7 @@ impl Escrow {
                         panic_with_error!(&env, EscrowError::ServiceMetadataNotFound)
                     });
                 if caller != meta.owner {
-                    panic_with_error!(&env, EscrowError::NotPendingAdmin);
+                    panic_with_error!(&env, EscrowError::Unauthorized);
                 }
             }
 
@@ -1632,8 +1626,9 @@ impl Escrow {
     /// Transfer ownership of a service's metadata to `new_owner`,
     /// preserving the existing `description`. Authorised by `caller`,
     /// which must be the current owner OR the admin. Panics with
-    /// `ServiceMetadataNotFound` if no metadata has been set. Emits
-    /// `owner_chg(service_id, old_owner, new_owner)` for indexers.
+    /// `ServiceMetadataNotFound` if no metadata has been set, or
+    /// [`EscrowError::Unauthorized`] if the caller is not the owner or admin.
+    /// Emits `owner_chg(service_id, old_owner, new_owner)` for indexers.
     /// Honours the pause gate.
     pub fn transfer_service_ownership(
         env: Env,
@@ -1650,7 +1645,7 @@ impl Escrow {
             .get(&DataKey::ServiceMetadata(service_id.clone()))
             .unwrap_or_else(|| panic_with_error!(&env, EscrowError::ServiceMetadataNotFound));
         if caller != meta.owner && caller != admin {
-            panic_with_error!(&env, EscrowError::NotPendingAdmin); // reuse: unauthorized caller
+            panic_with_error!(&env, EscrowError::Unauthorized);
         }
         let old_owner = meta.owner.clone();
         meta.owner = new_owner.clone();
