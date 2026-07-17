@@ -177,6 +177,10 @@ pub enum DataKey {
 }
 
 /// Typed contract errors. Codes are append-only to keep client SDKs stable.
+///
+/// See [`docs/escrow/errors.md`](../../docs/escrow/errors.md) for the full
+/// trigger-condition table and [`CONTRIBUTING.md`](../../CONTRIBUTING.md) for
+/// the append-only convention and the PR checklist.
 #[contracterror]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
@@ -290,6 +294,7 @@ pub struct PriceTier {
 
 // New persistent boolean flags should be read/written via `read_flag` /
 // `write_flag` so they inherit the `unwrap_or(false)` default convention.
+// (See CONTRIBUTING.md § Getter-default convention.)
 
 /// Read a persistent boolean flag, defaulting to `false` when unset.
 /// Centralises the `unwrap_or(false)` convention so a new flag can never
