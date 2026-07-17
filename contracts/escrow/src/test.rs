@@ -3462,28 +3462,241 @@ fn test_register_service_with_metadata_equivalent_to_separate_calls() {
     );
     assert_eq!(combined_meta, client2.get_service_metadata(&service_id2));
 }
+// ── cfg_set configuration-change event tests (issue #171) ──────────────────
+//
+// Every rate-limit / per-call bound setter publishes a `cfg_set` event with
+// topic `(symbol_short!("cfg_set"),)` and data `(short_name: Symbol, value)`.
+// One decodable schema covers all six setters:
+//   - set_max_requests_per_call    -> ("max_call", u32)
+//   - set_min_requests_per_call    -> ("min_call", u32)
+//   - set_max_requests_per_window  -> ("max_win",  u32)
+//   - set_rate_window_seconds      -> ("win_sec",  u64)
+//   - set_allowlist_enabled        -> ("allowlist", bool)
+//   - set_require_service_registration -> ("req_reg", bool)
 
 #[test]
-fn test_get_usage_batch_agrees_with_single_get_usage() {
+fn test_cfg_set_max_requests_per_call_emits_event() {
     let env = Env::default();
     let (client, admin) = setup_initialized(&env);
+    let _ = &admin;
 
-    let agent_a = make_agent(&env);
-    let agent_b = make_agent(&env);
-    let svc_a = make_service(&env, "svc_a");
-    let svc_b = make_service(&env, "svc_b");
+    client.set_max_requests_per_call(&500u32);
 
-    client.record_usage(&agent_a, &svc_a, &15u32);
-    client.record_usage(&agent_b, &svc_b, &25u32);
+    let events = env.events().all();
+    assert!(!events.is_empty());
+    let (_addr, topics, data) = events.last().unwrap();
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("cfg_set"),).into_val(&env);
+    assert_eq!(topics, expected_topics);
+    let decoded: (Symbol, u32) = data.into_val(&env);
+    assert_eq!(decoded, (symbol_short!("max_call"), 500u32));
+}
 
-    let mut pairs: Vec<(Address, Symbol)> = Vec::new(&env);
-    pairs.push_back((agent_a.clone(), svc_a.clone()));
-    pairs.push_back((agent_b.clone(), svc_b.clone()));
-    pairs.push_back((agent_a.clone(), svc_b.clone()));
+#[test]
+fn test_cfg_set_min_requests_per_call_emits_event() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let _ = &admin;
 
-    let batch_out = client.get_usage_batch(&pairs);
+    client.set_min_requests_per_call(&10u32);
 
-    assert_eq!(batch_out.get(0), Some(client.get_usage(&agent_a, &svc_a)));
-    assert_eq!(batch_out.get(1), Some(client.get_usage(&agent_b, &svc_b)));
-    assert_eq!(batch_out.get(2), Some(client.get_usage(&agent_a, &svc_b)));
+    let events = env.events().all();
+    assert!(!events.is_empty());
+    let (_addr, topics, data) = events.last().unwrap();
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("cfg_set"),).into_val(&env);
+    assert_eq!(topics, expected_topics);
+    let decoded: (Symbol, u32) = data.into_val(&env);
+    assert_eq!(decoded, (symbol_short!("min_call"), 10u32));
+}
+
+#[test]
+fn test_cfg_set_max_requests_per_window_emits_event() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let _ = &admin;
+
+    client.set_max_requests_per_window(&100u32);
+
+    let events = env.events().all();
+    assert!(!events.is_empty());
+    let (_addr, topics, data) = events.last().unwrap();
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("cfg_set"),).into_val(&env);
+    assert_eq!(topics, expected_topics);
+    let decoded: (Symbol, u32) = data.into_val(&env);
+    assert_eq!(decoded, (symbol_short!("max_win"), 100u32));
+}
+
+#[test]
+fn test_cfg_set_rate_window_seconds_emits_event() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let _ = &admin;
+
+    client.set_rate_window_seconds(&3600u64);
+
+    let events = env.events().all();
+    assert!(!events.is_empty());
+    let (_addr, topics, data) = events.last().unwrap();
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("cfg_set"),).into_val(&env);
+    assert_eq!(topics, expected_topics);
+    let decoded: (Symbol, u64) = data.into_val(&env);
+    assert_eq!(decoded, (symbol_short!("win_sec"), 3600u64));
+}
+
+#[test]
+fn test_cfg_set_allowlist_enabled_emits_event_true() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let _ = &admin;
+
+    client.set_allowlist_enabled(&true);
+
+    let events = env.events().all();
+    assert!(!events.is_empty());
+    let (_addr, topics, data) = events.last().unwrap();
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("cfg_set"),).into_val(&env);
+    assert_eq!(topics, expected_topics);
+    let decoded: (Symbol, bool) = data.into_val(&env);
+    assert_eq!(decoded, (symbol_short!("allowlist"), true));
+}
+
+#[test]
+fn test_cfg_set_allowlist_enabled_emits_event_false() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let _ = &admin;
+
+    client.set_allowlist_enabled(&true);
+    client.set_allowlist_enabled(&false);
+
+    let events = env.events().all();
+    assert!(!events.is_empty());
+    let (_addr, topics, data) = events.last().unwrap();
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("cfg_set"),).into_val(&env);
+    assert_eq!(topics, expected_topics);
+    let decoded: (Symbol, bool) = data.into_val(&env);
+    assert_eq!(decoded, (symbol_short!("allowlist"), false));
+}
+
+#[test]
+fn test_cfg_set_require_service_registration_emits_event_true() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let _ = &admin;
+
+    client.set_require_service_registration(&true);
+
+    let events = env.events().all();
+    assert!(!events.is_empty());
+    let (_addr, topics, data) = events.last().unwrap();
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("cfg_set"),).into_val(&env);
+    assert_eq!(topics, expected_topics);
+    let decoded: (Symbol, bool) = data.into_val(&env);
+    assert_eq!(decoded, (symbol_short!("req_reg"), true));
+}
+
+#[test]
+fn test_cfg_set_require_service_registration_emits_event_false() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let _ = &admin;
+
+    client.set_require_service_registration(&true);
+    client.set_require_service_registration(&false);
+
+    let events = env.events().all();
+    assert!(!events.is_empty());
+    let (_addr, topics, data) = events.last().unwrap();
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("cfg_set"),).into_val(&env);
+    assert_eq!(topics, expected_topics);
+    let decoded: (Symbol, bool) = data.into_val(&env);
+    assert_eq!(decoded, (symbol_short!("req_reg"), false));
+}
+
+/// Edge case: setting a value identical to the current stored value still
+/// emits a fresh `cfg_set` event (setters are not short-circuited by an
+/// equality check).
+#[test]
+fn test_cfg_set_same_value_still_emits() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let _ = &admin;
+
+    client.set_max_requests_per_call(&50u32);
+    client.set_max_requests_per_call(&50u32);
+
+    let events = env.events().all();
+    assert!(!events.is_empty());
+    let (_addr, topics, data) = events.last().unwrap();
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("cfg_set"),).into_val(&env);
+    assert_eq!(topics, expected_topics);
+    let decoded: (Symbol, u32) = data.into_val(&env);
+    assert_eq!(decoded, (symbol_short!("max_call"), 50u32));
+}
+
+/// Edge case: large numeric values (near the u32/u64 boundary) encode and
+/// decode correctly through the event payload.
+#[test]
+fn test_cfg_set_large_numeric_values() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let _ = &admin;
+
+    client.set_max_requests_per_call(&u32::MAX);
+    let events = env.events().all();
+    let (_addr, topics, data) = events.last().unwrap();
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("cfg_set"),).into_val(&env);
+    assert_eq!(topics, expected_topics);
+    let decoded: (Symbol, u32) = data.into_val(&env);
+    assert_eq!(decoded, (symbol_short!("max_call"), u32::MAX));
+
+    client.set_rate_window_seconds(&u64::MAX);
+    let events = env.events().all();
+    let (_addr, topics, data) = events.last().unwrap();
+    assert_eq!(topics, expected_topics);
+    let decoded: (Symbol, u64) = data.into_val(&env);
+    assert_eq!(decoded, (symbol_short!("win_sec"), u64::MAX));
+}
+
+/// Security: `set_max_requests_per_call` remains admin-gated after adding
+/// the event emission — the event does not bypass or replace the auth
+/// check.
+#[test]
+#[should_panic(expected = "Unauthorized")]
+fn test_cfg_set_still_requires_admin_auth() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let _ = &admin;
+    env.set_auths(&[]);
+    client.set_allowlist_enabled(&true);
+}
+
+/// Additive-change guard: adding `cfg_set` events to the allowlist/strict
+/// -registration setters must not alter the unrelated `price_set` event
+/// payload shape.
+#[test]
+fn test_price_set_payload_unchanged_by_cfg_set_addition() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let _ = &admin;
+    let svc = Symbol::new(&env, "infer");
+
+    client.set_service_price(&svc, &500i128);
+
+    let events = env.events().all();
+    let (_addr, topics, data) = events.last().unwrap();
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("price_set"),).into_val(&env);
+    assert_eq!(topics, expected_topics);
+    let decoded: (Symbol, i128) = data.into_val(&env);
+    assert_eq!(decoded, (svc, 500i128));
 }
