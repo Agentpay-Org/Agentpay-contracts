@@ -30,6 +30,10 @@ stable across upgrades.
 | 20 | `DisputeAlreadyOpen` | `open_dispute` was called but a dispute is already open for the given `(agent, service_id)`. | `open_dispute` |
 | 21 | `NoOpenDispute` | `resolve_dispute` was called but no dispute is open for the given `(agent, service_id)`. | `resolve_dispute` |
 | 22 | `RefundExceedsUsage` | `resolve_dispute` was called with `refund_requests` exceeding the current accumulated usage. | `resolve_dispute` |
+| 23 | `InvalidRequestBounds` | `set_min_requests_per_call` was called with a `min` that exceeds `MaxRequestsPerCall`, or `set_max_requests_per_call` was called with a `max` below `MinRequestsPerCall`. | `set_min_requests_per_call`, `set_max_requests_per_call` |
+| 24 | `PriceOutOfBounds` | `set_service_price` was called with a price outside the configured `[MinServicePrice, MaxServicePrice]` bounds. | `set_service_price` |
+| 25 | `InvertedPriceBand` | `set_price_bounds` was called with `min_stroops > max_stroops`. | `set_price_bounds` |
+| 26 | `Unauthorized` | An entrypoint was called by an address that is neither the contract admin nor the authorised party. | `settle`, `settle_all`, `transfer_service_ownership` |
 
 ## Notes on Overloaded Codes
 

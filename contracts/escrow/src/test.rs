@@ -1618,6 +1618,39 @@ fn test_record_usage_paused_gate_via_helper() {
     client.record_usage(&agent, &Symbol::new(&env, "infer"), &1u32);
 }
 #[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn test_set_price_tiers_panics_not_initialized_before_init() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, Escrow);
+    let client = EscrowClient::new(&env, &contract_id);
+    // No init() call: require_admin must still panic NotInitialized (#3).
+    let tiers: Vec<PriceTier> = Vec::new(&env);
+    client.set_price_tiers(&Symbol::new(&env, "infer"), &tiers);
+}
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn test_remove_price_tiers_panics_not_initialized_before_init() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, Escrow);
+    let client = EscrowClient::new(&env, &contract_id);
+    // No init() call: require_admin must still panic NotInitialized (#3).
+    client.remove_price_tiers(&Symbol::new(&env, "infer"));
+}
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn test_resolve_dispute_panics_not_initialized_before_init() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, Escrow);
+    let client = EscrowClient::new(&env, &contract_id);
+    // No init() call: require_admin must still panic NotInitialized (#3).
+    // ensure_not_paused passes first (defaults to false), then require_admin panics.
+    let agent = Address::generate(&env);
+    client.resolve_dispute(&agent, &Symbol::new(&env, "infer"), &0u32);
+}
+#[test]
 fn test_get_usage_batch_preserves_order() {
     let env = Env::default();
     let (client, _admin) = setup_initialized(&env);
@@ -2679,6 +2712,29 @@ fn test_i22_propose_admin_transfer_requires_admin_auth() {
     let client = setup_scoped_auth(&env);
     let next = Address::generate(&env);
     client.propose_admin_transfer(&next);
+}
+#[test]
+#[should_panic]
+fn test_i22_set_price_tiers_requires_admin_auth() {
+    let env = Env::default();
+    let client = setup_scoped_auth(&env);
+    let tiers: Vec<PriceTier> = Vec::new(&env);
+    client.set_price_tiers(&Symbol::new(&env, "infer"), &tiers);
+}
+#[test]
+#[should_panic]
+fn test_i22_remove_price_tiers_requires_admin_auth() {
+    let env = Env::default();
+    let client = setup_scoped_auth(&env);
+    client.remove_price_tiers(&Symbol::new(&env, "infer"));
+}
+#[test]
+#[should_panic]
+fn test_i22_resolve_dispute_requires_admin_auth() {
+    let env = Env::default();
+    let client = setup_scoped_auth(&env);
+    let agent = Address::generate(&env);
+    client.resolve_dispute(&agent, &Symbol::new(&env, "infer"), &0u32);
 }
 
 /// Positive control: with `mock_all_auths` the same privileged call

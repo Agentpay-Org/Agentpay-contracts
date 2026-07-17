@@ -252,6 +252,17 @@ pub enum EscrowError {
     /// until corrected. An equal value (`min == max`) is accepted — it
     /// enforces an exact per-call request count.
     InvalidRequestBounds = 23,
+    /// `set_service_price` was called with a price outside the configured
+    /// `[MinServicePrice, MaxServicePrice]` bounds.
+    PriceOutOfBounds = 24,
+    /// `set_price_bounds` was called with `min_stroops > max_stroops`,
+    /// which would create an impossible price band.
+    InvertedPriceBand = 25,
+    /// An entrypoint was called by an address that is neither the
+    /// contract admin nor the authorised party (e.g. a service owner
+    /// attempting to settle a service they do not own, or transfer
+    /// ownership of metadata they do not control).
+    Unauthorized = 26,
 }
 
 #[contracttype]
@@ -1056,12 +1067,7 @@ impl Escrow {
     /// - `threshold_requests` values must be strictly ascending (no ties).
     /// - Each `price_stroops` must be non-negative.
     pub fn set_price_tiers(env: Env, service_id: Symbol, tiers: Vec<PriceTier>) {
-        let admin: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Admin)
-            .unwrap_or_else(|| panic_with_error!(&env, EscrowError::NotInitialized));
-        admin.require_auth();
+        require_admin(&env);
         ensure_not_paused(&env);
         // Reject empty schedules.
         if tiers.is_empty() {
@@ -1106,12 +1112,7 @@ impl Escrow {
     /// a no-op. Admin-gated and honours the pause gate. Emits
     /// `tiers_rm(service_id)`.
     pub fn remove_price_tiers(env: Env, service_id: Symbol) {
-        let admin: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Admin)
-            .unwrap_or_else(|| panic_with_error!(&env, EscrowError::NotInitialized));
-        admin.require_auth();
+        require_admin(&env);
         ensure_not_paused(&env);
         env.storage()
             .persistent()
@@ -1936,12 +1937,7 @@ impl Escrow {
     /// - Dispute must be open: `NoOpenDispute` prevents spurious calls.
     pub fn resolve_dispute(env: Env, agent: Address, service_id: Symbol, refund_requests: u32) {
         ensure_not_paused(&env);
-        let admin: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Admin)
-            .unwrap_or_else(|| panic_with_error!(&env, EscrowError::NotInitialized));
-        admin.require_auth();
+        require_admin(&env);
         let dispute_key = DataKey::Dispute(agent.clone(), service_id.clone());
         if !read_flag(&env, &dispute_key) {
             panic_with_error!(&env, EscrowError::NoOpenDispute);
