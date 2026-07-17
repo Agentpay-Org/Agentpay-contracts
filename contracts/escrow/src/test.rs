@@ -1918,6 +1918,82 @@ fn test_i17_per_call_bounds_default_to_unbounded() {
     );
 }
 #[test]
+fn test_rate_window_getters_unrecorded() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let agent = make_agent(&env);
+
+    assert_eq!(client.get_rate_window(&agent), (0, 0));
+    // MaxRequestsPerWindow and WindowSeconds default to 0, which disables the limiter.
+    // get_remaining_in_window should return 0 in this case (max_per_window).
+    assert_eq!(client.get_remaining_in_window(&agent), 0);
+}
+
+#[test]
+fn test_rate_window_getters_mid_window() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let agent = make_agent(&env);
+    let svc = make_service(&env, "svc");
+    
+    // Configure rate limiter
+    client.set_max_requests_per_window(&100u32);
+    client.set_rate_window_seconds(&3600u64);
+    
+    // First call: window starts now.
+    let now = env.ledger().timestamp();
+    client.record_usage(&agent, &svc, &10u32);
+    
+    assert_eq!(client.get_rate_window(&agent), (now, 10));
+    assert_eq!(client.get_remaining_in_window(&agent), 90);
+}
+
+#[test]
+fn test_rate_window_read_does_not_mutate() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let agent = make_agent(&env);
+    let svc = make_service(&env, "svc");
+    
+    client.set_max_requests_per_window(&100u32);
+    client.set_rate_window_seconds(&3600u64);
+    
+    client.record_usage(&agent, &svc, &10u32);
+    
+    // Call get_rate_window
+    client.get_rate_window(&agent);
+    
+    // Verify state is unchanged
+    let now = env.ledger().timestamp();
+    assert_eq!(client.get_rate_window(&agent), (now, 10));
+}
+
+#[test]
+fn test_rate_window_expired_rollover() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let agent = make_agent(&env);
+    let svc = make_service(&env, "svc");
+    
+    let window_len = 3600u64;
+    client.set_max_requests_per_window(&100u32);
+    client.set_rate_window_seconds(&window_len);
+    
+    // First call: window starts now.
+    let now = env.ledger().timestamp();
+    client.record_usage(&agent, &svc, &10u32);
+    
+    // Advance ledger to trigger expiration
+    advance_ledger(&env, window_len + 1);
+    
+    // get_remaining_in_window should see expired window and return full cap.
+    assert_eq!(client.get_remaining_in_window(&agent), 100);
+    
+    // get_rate_window should still show the old window data (it doesn't roll forward)
+    assert_eq!(client.get_rate_window(&agent), (now, 10));
+}
+
+#[test]
 fn test_i17_record_usage_accepts_value_exactly_at_max() {
     let env = Env::default();
     let (client, _admin) = setup_initialized(&env);
