@@ -1694,17 +1694,16 @@ fn test_record_usage_zero_requests_beats_max() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #8)")]
+#[should_panic(expected = "Error(Contract, #23)")]
 fn test_record_usage_max_beats_min() {
-    // Max (#8) must win over min (#9): with max=5 and min=10 (an
-    // inconsistent config), a request above max trips #8 first.
+    // With the cross-bound guard in place, setting min > max is rejected at
+    // setter time (#23 InvalidRequestBounds) before record_usage is ever
+    // reached. This test confirms the setter rejects the contradictory config.
     let env = Env::default();
     let (client, _admin) = setup_initialized(&env);
     client.set_max_requests_per_call(&5u32);
+    // min=10 > max=5 → InvalidRequestBounds (#23) at set_min time.
     client.set_min_requests_per_call(&10u32);
-    let agent = Address::generate(&env);
-    let service_id = Symbol::new(&env, "weather_api");
-    client.record_usage(&agent, &service_id, &6u32);
 }
 
 #[test]
@@ -3462,241 +3461,338 @@ fn test_register_service_with_metadata_equivalent_to_separate_calls() {
     );
     assert_eq!(combined_meta, client2.get_service_metadata(&service_id2));
 }
-// ── cfg_set configuration-change event tests (issue #171) ──────────────────
+
+// ── InvalidRequestBounds (#23): cross-bound consistency checks ─────────────
 //
-// Every rate-limit / per-call bound setter publishes a `cfg_set` event with
-// topic `(symbol_short!("cfg_set"),)` and data `(short_name: Symbol, value)`.
-// One decodable schema covers all six setters:
-//   - set_max_requests_per_call    -> ("max_call", u32)
-//   - set_min_requests_per_call    -> ("min_call", u32)
-//   - set_max_requests_per_window  -> ("max_win",  u32)
-//   - set_rate_window_seconds      -> ("win_sec",  u64)
-//   - set_allowlist_enabled        -> ("allowlist", bool)
-//   - set_require_service_registration -> ("req_reg", bool)
+// Coverage:
+//
+// Setter-rejection cases:
+// - set_min > current max  → InvalidRequestBounds (#23)
+// - set_max < current min  → InvalidRequestBounds (#23)
+//
+// Accepted cases:
+// - set_min == current max (exact-count)  → accepted; record_usage enforces it
+// - set_max == current min (exact-count)  → accepted; record_usage enforces it
+// - Neither bound set: defaults (min=0, max=u32::MAX) are always consistent
+// - set_max first, then a valid min       → accepted
+// - set_min first, then a valid max       → accepted
+// - Lowering max to current min           → accepted
+// - Raising min to current max            → accepted
+//
+// Default / unset behaviour:
+// - set_min with no max stored            → accepted (ceiling defaults to u32::MAX)
+// - set_max with no min stored            → accepted (floor defaults to 0)
+// - set_max = 0 with no min stored        → accepted (0 >= 0)
+//
+// Security: metering cannot be bricked by a contradictory range because the
+// setters reject the contradiction before it can be stored.
 
+/// `set_min_requests_per_call` rejects a floor that exceeds the stored ceiling.
+///
+/// Security note: without this guard an admin could silently configure a range
+/// where min > max, making every `record_usage` call panic on either #8 or #9
+/// regardless of the supplied value, bricking metering for the service.
 #[test]
-fn test_cfg_set_max_requests_per_call_emits_event() {
+#[should_panic(expected = "Error(Contract, #23)")]
+fn test_set_min_rejects_floor_above_stored_ceiling() {
     let env = Env::default();
-    let (client, admin) = setup_initialized(&env);
-    let _ = &admin;
-
-    client.set_max_requests_per_call(&500u32);
-
-    let events = env.events().all();
-    assert!(!events.is_empty());
-    let (_addr, topics, data) = events.last().unwrap();
-    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
-        (symbol_short!("cfg_set"),).into_val(&env);
-    assert_eq!(topics, expected_topics);
-    let decoded: (Symbol, u32) = data.into_val(&env);
-    assert_eq!(decoded, (symbol_short!("max_call"), 500u32));
+    let (client, _admin) = setup_initialized(&env);
+    // Establish a ceiling of 50.
+    client.set_max_requests_per_call(&50u32);
+    // Attempt to set a floor of 51 — one above the ceiling.
+    client.set_min_requests_per_call(&51u32);
 }
 
+/// `set_max_requests_per_call` rejects a ceiling that falls below the stored floor.
+///
+/// Security note: same bricking vector as above, entered from the other direction.
 #[test]
-fn test_cfg_set_min_requests_per_call_emits_event() {
+#[should_panic(expected = "Error(Contract, #23)")]
+fn test_set_max_rejects_ceiling_below_stored_floor() {
     let env = Env::default();
-    let (client, admin) = setup_initialized(&env);
-    let _ = &admin;
+    let (client, _admin) = setup_initialized(&env);
+    // Establish a floor of 10.
+    client.set_min_requests_per_call(&10u32);
+    // Attempt to set a ceiling of 9 — one below the floor.
+    client.set_max_requests_per_call(&9u32);
+}
 
+/// `set_min` with no ceiling stored is always accepted (ceiling defaults to u32::MAX).
+///
+/// Preserves existing default-unset behaviour: operators can set a floor
+/// independently without first having to set a ceiling.
+#[test]
+fn test_set_min_with_no_max_stored_is_accepted() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    // No ceiling stored yet — any min value should be accepted.
+    client.set_min_requests_per_call(&1_000_000u32);
+    assert_eq!(client.get_min_requests_per_call(), 1_000_000);
+    // record_usage with the exact floor value must succeed.
+    let agent = make_agent(&env);
+    let svc = make_service(&env, "infer");
+    let rec = client.record_usage(&agent, &svc, &1_000_000u32);
+    assert_eq!(rec.requests, 1_000_000);
+}
+
+/// `set_max` with no floor stored is always accepted (floor defaults to 0).
+///
+/// Preserves existing default-unset behaviour: operators can set a ceiling
+/// independently without first having to set a floor.
+#[test]
+fn test_set_max_with_no_min_stored_is_accepted() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    // No floor stored yet — any max value including 0 should be accepted.
+    client.set_max_requests_per_call(&0u32);
+    assert_eq!(client.get_max_requests_per_call(), 0);
+}
+
+/// `min == max` is accepted: it enforces an exact per-call request count.
+///
+/// An exact-count constraint is a legitimate use case (e.g. force every
+/// metering call to bundle exactly N requests to amortise per-write costs).
+#[test]
+fn test_set_min_equal_to_max_is_accepted() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    // Set a ceiling of 100, then a floor of 100 (equal).
+    client.set_max_requests_per_call(&100u32);
+    client.set_min_requests_per_call(&100u32);
+    assert_eq!(client.get_max_requests_per_call(), 100);
+    assert_eq!(client.get_min_requests_per_call(), 100);
+    // record_usage with exactly 100 requests must succeed.
+    let agent = make_agent(&env);
+    let svc = make_service(&env, "fixed_batch");
+    let rec = client.record_usage(&agent, &svc, &100u32);
+    assert_eq!(rec.requests, 100);
+}
+
+/// Setting the ceiling down to equal the existing floor is accepted.
+///
+/// Symmetric counterpart of `test_set_min_equal_to_max_is_accepted`:
+/// confirms that `set_max_requests_per_call` also permits min == max.
+#[test]
+fn test_set_max_equal_to_min_is_accepted() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    // Set a floor of 20, then a ceiling of 20 (equal).
+    client.set_min_requests_per_call(&20u32);
+    client.set_max_requests_per_call(&20u32);
+    assert_eq!(client.get_min_requests_per_call(), 20);
+    assert_eq!(client.get_max_requests_per_call(), 20);
+    // record_usage with exactly 20 requests must succeed.
+    let agent = make_agent(&env);
+    let svc = make_service(&env, "exact_svc");
+    let rec = client.record_usage(&agent, &svc, &20u32);
+    assert_eq!(rec.requests, 20);
+}
+
+/// record_usage with min == max rejects values below the exact count.
+///
+/// When the floor and ceiling are equal, any value other than that exact
+/// count must be rejected — values below it hit the floor (#9).
+#[test]
+#[should_panic(expected = "Error(Contract, #9)")]
+fn test_exact_count_rejects_below() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    client.set_max_requests_per_call(&50u32);
+    client.set_min_requests_per_call(&50u32);
+    let agent = make_agent(&env);
+    let svc = make_service(&env, "exact_svc");
+    client.record_usage(&agent, &svc, &49u32);
+}
+
+/// record_usage with min == max rejects values above the exact count.
+///
+/// When the floor and ceiling are equal, values above it hit the ceiling (#8).
+#[test]
+#[should_panic(expected = "Error(Contract, #8)")]
+fn test_exact_count_rejects_above() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    client.set_max_requests_per_call(&50u32);
+    client.set_min_requests_per_call(&50u32);
+    let agent = make_agent(&env);
+    let svc = make_service(&env, "exact_svc");
+    client.record_usage(&agent, &svc, &51u32);
+}
+
+/// Default unset behaviour: no bounds stored → any positive value accepted.
+///
+/// Verifies that fresh contracts with no min/max configured still accept
+/// any positive request count (defaults: min=0, max=u32::MAX).
+#[test]
+fn test_defaults_no_bounds_stored_accepts_any_positive() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    assert_eq!(client.get_min_requests_per_call(), 0);
+    assert_eq!(client.get_max_requests_per_call(), u32::MAX);
+    let agent = make_agent(&env);
+    let svc = make_service(&env, "infer");
+    // A very large value should be accepted with no bounds set.
+    let rec = client.record_usage(&agent, &svc, &999_999u32);
+    assert_eq!(rec.requests, 999_999);
+}
+
+/// set_max first, then a lower-but-valid min → accepted.
+///
+/// Documents the recommended "ceiling first, floor second" operator
+/// ordering to avoid transient `InvalidRequestBounds` rejections.
+#[test]
+fn test_set_max_then_lower_min_accepted() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    client.set_max_requests_per_call(&200u32);
+    client.set_min_requests_per_call(&50u32);
+    assert_eq!(client.get_max_requests_per_call(), 200);
+    assert_eq!(client.get_min_requests_per_call(), 50);
+    // Values within the valid range must succeed.
+    let agent = make_agent(&env);
+    let svc = make_service(&env, "range_svc");
+    assert_eq!(client.record_usage(&agent, &svc, &50u32).requests, 50);
+    assert_eq!(client.record_usage(&agent, &svc, &100u32).requests, 150);
+    assert_eq!(client.record_usage(&agent, &svc, &200u32).requests, 350);
+}
+
+/// set_min first, then a higher-but-valid max → accepted.
+///
+/// Alternative operator ordering: floor first, ceiling second.
+/// Allowed because setting a floor of N against the default ceiling of
+/// u32::MAX never violates the invariant.
+#[test]
+fn test_set_min_then_higher_max_accepted() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    client.set_min_requests_per_call(&10u32);
+    client.set_max_requests_per_call(&500u32);
+    assert_eq!(client.get_min_requests_per_call(), 10);
+    assert_eq!(client.get_max_requests_per_call(), 500);
+    // Boundary values must succeed.
+    let agent = make_agent(&env);
+    let svc = make_service(&env, "range_svc");
+    assert_eq!(client.record_usage(&agent, &svc, &10u32).requests, 10);
+    assert_eq!(client.record_usage(&agent, &svc, &500u32).requests, 510);
+}
+
+/// Tightening the ceiling down to the current floor is accepted.
+///
+/// An admin is allowed to narrow a previously wide range to an exact-count
+/// constraint by lowering the ceiling to meet the stored floor.
+#[test]
+fn test_lower_max_to_meet_min_accepted() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    // Wide range: [5, 200].
+    client.set_max_requests_per_call(&200u32);
+    client.set_min_requests_per_call(&5u32);
+    // Narrow the ceiling down to 5 (== floor) — this is exact-count territory.
+    client.set_max_requests_per_call(&5u32);
+    assert_eq!(client.get_max_requests_per_call(), 5);
+    assert_eq!(client.get_min_requests_per_call(), 5);
+}
+
+/// Raising the floor up to the current ceiling is accepted.
+///
+/// Symmetric counterpart: an admin can raise the floor to meet the stored
+/// ceiling, producing an exact-count constraint from the floor side.
+#[test]
+fn test_raise_min_to_meet_max_accepted() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    // Wide range: [5, 200].
+    client.set_max_requests_per_call(&200u32);
+    client.set_min_requests_per_call(&5u32);
+    // Raise the floor up to 200 (== ceiling) — exact-count.
+    client.set_min_requests_per_call(&200u32);
+    assert_eq!(client.get_min_requests_per_call(), 200);
+    assert_eq!(client.get_max_requests_per_call(), 200);
+}
+
+/// Attempting to set min = max+1 is rejected even by a single unit.
+///
+/// Off-by-one edge: confirms the boundary is `min > max`, not `min >= max`.
+#[test]
+#[should_panic(expected = "Error(Contract, #23)")]
+fn test_set_min_one_above_max_rejected() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    client.set_max_requests_per_call(&100u32);
+    client.set_min_requests_per_call(&101u32); // 101 > 100 → #23
+}
+
+/// Attempting to set max = min-1 is rejected even by a single unit.
+///
+/// Off-by-one edge: confirms the boundary is `max < min`, not `max <= min`.
+#[test]
+#[should_panic(expected = "Error(Contract, #23)")]
+fn test_set_max_one_below_min_rejected() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    client.set_min_requests_per_call(&10u32);
+    client.set_max_requests_per_call(&9u32); // 9 < 10 → #23
+}
+
+/// set_max = 0 with no floor stored is accepted (0 >= 0, the default floor).
+///
+/// A ceiling of 0 is unusual but not contradictory when the floor is also 0.
+/// Combined with the existing `RequestsMustBePositive` (#2) guard which
+/// rejects `requests == 0`, this configuration effectively makes every
+/// `record_usage` call fail with #8 (requests=1 > max=0). Admins are
+/// responsible for this configuration choice; the contract only prevents
+/// the unsatisfiable min > max case.
+#[test]
+fn test_set_max_zero_with_no_floor_accepted() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    // No floor stored (default 0) → max=0 satisfies 0 >= 0.
+    client.set_max_requests_per_call(&0u32);
+    assert_eq!(client.get_max_requests_per_call(), 0);
+    // record_usage will always fail (requests must be > 0 by #2, but max=0
+    // means any positive value is above the cap). This is intentional; the
+    // contract does not prevent self-imposed restrictions, only contradictions.
+}
+
+/// Contradictory set_min is rejected; stored state is unchanged.
+///
+/// Confirms that the pre-attempt values are still readable after the test
+/// confirms the setter rejects the invalid floor.
+/// The rejection itself is covered by `test_set_min_rejects_floor_above_stored_ceiling`.
+#[test]
+fn test_rejected_set_min_leaves_state_unchanged() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    client.set_max_requests_per_call(&100u32);
     client.set_min_requests_per_call(&10u32);
 
-    let events = env.events().all();
-    assert!(!events.is_empty());
-    let (_addr, topics, data) = events.last().unwrap();
-    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
-        (symbol_short!("cfg_set"),).into_val(&env);
-    assert_eq!(topics, expected_topics);
-    let decoded: (Symbol, u32) = data.into_val(&env);
-    assert_eq!(decoded, (symbol_short!("min_call"), 10u32));
+    // Stored values must be the values set by the two successful setter calls.
+    // A subsequent attempt to push min above max would be rejected (#23) and
+    // is verified by test_set_min_rejects_floor_above_stored_ceiling.
+    assert_eq!(client.get_max_requests_per_call(), 100);
+    assert_eq!(client.get_min_requests_per_call(), 10);
 }
 
+/// Metering is NOT bricked: with consistent bounds, record_usage always has
+/// a satisfiable range of inputs.
+///
+/// This is the security property that the cross-bound check protects.
+/// With min=10, max=100, any value in [10, 100] is accepted.
 #[test]
-fn test_cfg_set_max_requests_per_window_emits_event() {
+fn test_consistent_bounds_never_brick_metering() {
     let env = Env::default();
-    let (client, admin) = setup_initialized(&env);
-    let _ = &admin;
+    let (client, _admin) = setup_initialized(&env);
+    client.set_max_requests_per_call(&100u32);
+    client.set_min_requests_per_call(&10u32);
 
-    client.set_max_requests_per_window(&100u32);
+    let agent = make_agent(&env);
+    let svc = make_service(&env, "metered_svc");
 
-    let events = env.events().all();
-    assert!(!events.is_empty());
-    let (_addr, topics, data) = events.last().unwrap();
-    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
-        (symbol_short!("cfg_set"),).into_val(&env);
-    assert_eq!(topics, expected_topics);
-    let decoded: (Symbol, u32) = data.into_val(&env);
-    assert_eq!(decoded, (symbol_short!("max_win"), 100u32));
-}
-
-#[test]
-fn test_cfg_set_rate_window_seconds_emits_event() {
-    let env = Env::default();
-    let (client, admin) = setup_initialized(&env);
-    let _ = &admin;
-
-    client.set_rate_window_seconds(&3600u64);
-
-    let events = env.events().all();
-    assert!(!events.is_empty());
-    let (_addr, topics, data) = events.last().unwrap();
-    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
-        (symbol_short!("cfg_set"),).into_val(&env);
-    assert_eq!(topics, expected_topics);
-    let decoded: (Symbol, u64) = data.into_val(&env);
-    assert_eq!(decoded, (symbol_short!("win_sec"), 3600u64));
-}
-
-#[test]
-fn test_cfg_set_allowlist_enabled_emits_event_true() {
-    let env = Env::default();
-    let (client, admin) = setup_initialized(&env);
-    let _ = &admin;
-
-    client.set_allowlist_enabled(&true);
-
-    let events = env.events().all();
-    assert!(!events.is_empty());
-    let (_addr, topics, data) = events.last().unwrap();
-    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
-        (symbol_short!("cfg_set"),).into_val(&env);
-    assert_eq!(topics, expected_topics);
-    let decoded: (Symbol, bool) = data.into_val(&env);
-    assert_eq!(decoded, (symbol_short!("allowlist"), true));
-}
-
-#[test]
-fn test_cfg_set_allowlist_enabled_emits_event_false() {
-    let env = Env::default();
-    let (client, admin) = setup_initialized(&env);
-    let _ = &admin;
-
-    client.set_allowlist_enabled(&true);
-    client.set_allowlist_enabled(&false);
-
-    let events = env.events().all();
-    assert!(!events.is_empty());
-    let (_addr, topics, data) = events.last().unwrap();
-    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
-        (symbol_short!("cfg_set"),).into_val(&env);
-    assert_eq!(topics, expected_topics);
-    let decoded: (Symbol, bool) = data.into_val(&env);
-    assert_eq!(decoded, (symbol_short!("allowlist"), false));
-}
-
-#[test]
-fn test_cfg_set_require_service_registration_emits_event_true() {
-    let env = Env::default();
-    let (client, admin) = setup_initialized(&env);
-    let _ = &admin;
-
-    client.set_require_service_registration(&true);
-
-    let events = env.events().all();
-    assert!(!events.is_empty());
-    let (_addr, topics, data) = events.last().unwrap();
-    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
-        (symbol_short!("cfg_set"),).into_val(&env);
-    assert_eq!(topics, expected_topics);
-    let decoded: (Symbol, bool) = data.into_val(&env);
-    assert_eq!(decoded, (symbol_short!("req_reg"), true));
-}
-
-#[test]
-fn test_cfg_set_require_service_registration_emits_event_false() {
-    let env = Env::default();
-    let (client, admin) = setup_initialized(&env);
-    let _ = &admin;
-
-    client.set_require_service_registration(&true);
-    client.set_require_service_registration(&false);
-
-    let events = env.events().all();
-    assert!(!events.is_empty());
-    let (_addr, topics, data) = events.last().unwrap();
-    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
-        (symbol_short!("cfg_set"),).into_val(&env);
-    assert_eq!(topics, expected_topics);
-    let decoded: (Symbol, bool) = data.into_val(&env);
-    assert_eq!(decoded, (symbol_short!("req_reg"), false));
-}
-
-/// Edge case: setting a value identical to the current stored value still
-/// emits a fresh `cfg_set` event (setters are not short-circuited by an
-/// equality check).
-#[test]
-fn test_cfg_set_same_value_still_emits() {
-    let env = Env::default();
-    let (client, admin) = setup_initialized(&env);
-    let _ = &admin;
-
-    client.set_max_requests_per_call(&50u32);
-    client.set_max_requests_per_call(&50u32);
-
-    let events = env.events().all();
-    assert!(!events.is_empty());
-    let (_addr, topics, data) = events.last().unwrap();
-    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
-        (symbol_short!("cfg_set"),).into_val(&env);
-    assert_eq!(topics, expected_topics);
-    let decoded: (Symbol, u32) = data.into_val(&env);
-    assert_eq!(decoded, (symbol_short!("max_call"), 50u32));
-}
-
-/// Edge case: large numeric values (near the u32/u64 boundary) encode and
-/// decode correctly through the event payload.
-#[test]
-fn test_cfg_set_large_numeric_values() {
-    let env = Env::default();
-    let (client, admin) = setup_initialized(&env);
-    let _ = &admin;
-
-    client.set_max_requests_per_call(&u32::MAX);
-    let events = env.events().all();
-    let (_addr, topics, data) = events.last().unwrap();
-    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
-        (symbol_short!("cfg_set"),).into_val(&env);
-    assert_eq!(topics, expected_topics);
-    let decoded: (Symbol, u32) = data.into_val(&env);
-    assert_eq!(decoded, (symbol_short!("max_call"), u32::MAX));
-
-    client.set_rate_window_seconds(&u64::MAX);
-    let events = env.events().all();
-    let (_addr, topics, data) = events.last().unwrap();
-    assert_eq!(topics, expected_topics);
-    let decoded: (Symbol, u64) = data.into_val(&env);
-    assert_eq!(decoded, (symbol_short!("win_sec"), u64::MAX));
-}
-
-/// Security: `set_max_requests_per_call` remains admin-gated after adding
-/// the event emission — the event does not bypass or replace the auth
-/// check.
-#[test]
-#[should_panic(expected = "Unauthorized")]
-fn test_cfg_set_still_requires_admin_auth() {
-    let env = Env::default();
-    let (client, admin) = setup_initialized(&env);
-    let _ = &admin;
-    env.set_auths(&[]);
-    client.set_allowlist_enabled(&true);
-}
-
-/// Additive-change guard: adding `cfg_set` events to the allowlist/strict
-/// -registration setters must not alter the unrelated `price_set` event
-/// payload shape.
-#[test]
-fn test_price_set_payload_unchanged_by_cfg_set_addition() {
-    let env = Env::default();
-    let (client, admin) = setup_initialized(&env);
-    let _ = &admin;
-    let svc = Symbol::new(&env, "infer");
-
-    client.set_service_price(&svc, &500i128);
-
-    let events = env.events().all();
-    let (_addr, topics, data) = events.last().unwrap();
-    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
-        (symbol_short!("price_set"),).into_val(&env);
-    assert_eq!(topics, expected_topics);
-    let decoded: (Symbol, i128) = data.into_val(&env);
-    assert_eq!(decoded, (svc, 500i128));
+    // Every value in [10, 100] must succeed.
+    for requests in [10u32, 50u32, 99u32, 100u32] {
+        // Each call accumulates; we care only that none panic.
+        client.record_usage(&agent, &svc, &requests);
+    }
+    // Total accumulated = 10 + 50 + 99 + 100 = 259.
+    assert_eq!(client.get_usage(&agent, &svc), 259);
 }

@@ -25,7 +25,7 @@ The Rust toolchain is pinned via `rust-toolchain.toml` (stable channel with `was
 ## Documentation
 
 - [CHANGELOG](CHANGELOG.md) — versioned history of entrypoints, events, and error codes; contribution conventions.
-- [EscrowError code table](docs/escrow/errors.md) — full reference for all 17 error codes: trigger conditions, overloaded codes, and the entrypoints that raise each code.
+- [EscrowError code table](docs/escrow/errors.md) — full reference for all 23 error codes: trigger conditions, overloaded codes, and the entrypoints that raise each code.
 
 ### Service ownership handover
 
@@ -79,6 +79,49 @@ These counters are updated by settlement drains, use saturating arithmetic, and
 are never reset or decremented by later `settle` calls. They default to `0`
 before the first billable settlement, so dashboards can read them without
 special-casing new agents or fresh deployments.
+
+### Per-call request bounds: `min ≤ max` invariant
+
+`record_usage` enforces an inclusive per-call floor and ceiling on the `requests`
+argument via two admin settings:
+
+- `set_min_requests_per_call(min)` — floor; `record_usage` rejects values below
+  this with `RequestsBelowMinPerCall` (#9). Defaults to `0` (no floor).
+- `set_max_requests_per_call(max)` — ceiling; `record_usage` rejects values
+  above this with `RequestsExceedsMaxPerCall` (#8). Defaults to `u32::MAX` (no
+  cap).
+
+#### Consistency guard: `InvalidRequestBounds` (#23)
+
+Both setters enforce the invariant **`min ≤ max`** at write time:
+
+- `set_min_requests_per_call(min)` rejects a `min` that exceeds the
+  currently-stored `MaxRequestsPerCall` (defaulting to `u32::MAX`).
+- `set_max_requests_per_call(max)` rejects a `max` that falls below the
+  currently-stored `MinRequestsPerCall` (defaulting to `0`).
+
+A contradictory range (`min > max`) would make every `record_usage` call
+unsatisfiable — any supplied value would trip either #8 or #9 — silently
+bricking metering until an operator noticed and corrected the configuration.
+The cross-bound check prevents this state from ever being stored.
+
+`min == max` is explicitly allowed and enforces an **exact per-call request
+count**: every `record_usage` call must supply precisely that many requests.
+This is useful for forcing callers to bundle a fixed number of requests per
+write to amortise per-transaction ledger costs.
+
+#### Recommended operator ordering
+
+When both bounds need to change, set the **ceiling first** and then the
+**floor**:
+
+```
+set_max_requests_per_call(new_max);  // step 1: raise or set ceiling
+set_min_requests_per_call(new_min);  // step 2: set floor (checked against new_max)
+```
+
+Setting the floor first risks a transient `InvalidRequestBounds` rejection if
+the new floor temporarily exceeds the old (not-yet-updated) ceiling.
 
 ### Per-agent rate limiting (fixed window)
 
