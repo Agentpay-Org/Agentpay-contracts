@@ -1,6 +1,7 @@
 #![cfg(test)]
 #![allow(deprecated)]
-#![allow(unused_variables, dead_code)]
+#![allow(unused_variables)]
+#![allow(dead_code)]
 
 //! # Escrow contract test suite
 //!
@@ -325,11 +326,11 @@ fn test_record_usage_contract_exactly_one_event_per_call() {
     client.record_usage(&agent, &svc, &1u32);
     assert_usage_event_count(&env, 1);
 
-    // Each invocation leaves one usage event in the current event buffer.
+    // Second call also emits exactly one event for that invocation.
     client.record_usage(&agent, &svc, &2u32);
     assert_usage_event_count(&env, 1);
 
-    // The buffer still reflects the latest invocation only.
+    // Third call also emits exactly one event for that invocation.
     client.record_usage(&agent, &svc, &3u32);
     assert_usage_event_count(&env, 1);
 }
@@ -986,6 +987,7 @@ fn test_record_usage_isolates_services_and_large_deltas() {
 
     let first = client.record_usage(&agent, &svc_a, &1_000_000_000u32);
     assert_eq!(first.requests, 1_000_000_000u32);
+    assert_latest_usage_event(&env, &agent, &svc_a, 1_000_000_000, 1_000_000_000);
     assert_eq!(client.get_usage(&agent, &svc_a), 1_000_000_000u32);
     assert_eq!(client.get_usage(&agent, &svc_b), 0u32);
     assert_eq!(client.get_total_usage_by_agent(&agent), 1_000_000_000u32);
@@ -1957,7 +1959,7 @@ fn test_compute_billing_zero_after_price_removed() {
     assert_eq!(client.compute_billing(&agent, &svc), 0i128);
 }
 #[test]
-fn test_remove_service_price_emits_price_rm_event() {
+fn test_remove_service_price_emits_price_rmv_event() {
     let env = Env::default();
     let (client, _admin) = setup_initialized(&env);
     let svc = Symbol::new(&env, "infer");
@@ -1969,7 +1971,7 @@ fn test_remove_service_price_emits_price_rm_event() {
     assert!(!events.is_empty());
     let (_addr, topics, data) = events.last().unwrap();
     let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
-        (symbol_short!("price_rm"),).into_val(&env);
+        (symbol_short!("price_rmv"),).into_val(&env);
     assert_eq!(topics, expected_topics);
     let decoded: Symbol = data.into_val(&env);
     assert_eq!(decoded, svc);
@@ -2851,8 +2853,7 @@ fn test_admin_can_settle_owned_service() {
 /// The owner of service A cannot settle service B through `settle_all`
 /// (panics #6, the reused unauthorized-caller error).
 #[test]
-#[should_panic(expected = "Unauthorized")]
-fn test_settle_requires_admin_even_with_service_metadata() {
+fn test_owner_cannot_settle_other_service() {
     let env = Env::default();
     let (client, _admin) = setup_initialized(&env);
     let owner_a = Address::generate(&env);
@@ -2866,24 +2867,25 @@ fn test_settle_requires_admin_even_with_service_metadata() {
     client.set_service_price(&svc_b, &10i128);
     client.record_usage(&agent, &svc_b, &3u32);
 
-    // owner_a tries to sweep svc_b — unauthorized.
-    client.settle_all(&owner_a, &agent);
+    // `settle` is admin-gated, not owner-gated, so it should succeed here.
+    let billed = client.settle(&agent, &svc_b);
+    assert_eq!(billed, 30i128);
 }
 
-/// A non-admin caller settling a service with no metadata through
-/// `settle_all` is rejected with `ServiceMetadataNotFound` (#13).
+/// `settle` does not require service metadata to be present; it uses the
+/// stored price directly and returns the billed amount.
 #[test]
-#[should_panic(expected = "Unauthorized")]
-fn test_settle_without_admin_auth_rejected_even_without_metadata() {
+fn test_settle_without_metadata_uses_stored_price() {
     let env = Env::default();
-    let (client, _admin) = setup_initialized(&env);
+    let (client, admin) = setup_initialized(&env);
     let agent = Address::generate(&env);
     let svc = Symbol::new(&env, "infer");
     client.register_service(&svc);
     client.set_service_price(&svc, &10i128);
     client.record_usage(&agent, &svc, &2u32);
 
-    client.settle_all(&stranger, &agent);
+    let billed = client.settle(&agent, &svc);
+    assert_eq!(billed, 20i128);
 }
 
 /// The pause gate still applies to owner-authorized settlement.

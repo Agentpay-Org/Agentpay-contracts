@@ -1023,9 +1023,9 @@ impl Escrow {
     /// After removal, `get_service_price` and `compute_billing` read back
     /// `0`, exactly as for a service that was never priced. Note the
     /// zero-vs-removed distinction: removal frees the underlying storage
-    /// slot and emits a `price_rm` event, whereas `set_service_price(_, 0)`
+    /// slot and emits a `price_rmv` event, whereas `set_service_price(_, 0)`
     /// leaves a stored slot holding `0`. Both read back as `0`, but only
-    /// removal reclaims the slot. Emits `price_rm(service_id)`.
+    /// removal reclaims the slot. Emits `price_rmv(service_id)`.
     pub fn remove_service_price(env: Env, service_id: Symbol) {
         ensure_not_paused(&env);
         require_admin(&env);
@@ -1033,7 +1033,7 @@ impl Escrow {
             .persistent()
             .remove(&DataKey::ServicePrice(service_id.clone()));
         env.events()
-            .publish((symbol_short!("price_rm"),), service_id);
+            .publish((symbol_short!("price_rmv"),), service_id);
     }
 
     /// Admin sets a volume-discount tier schedule for a service.
