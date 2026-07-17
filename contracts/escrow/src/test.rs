@@ -22,6 +22,8 @@
 //! * [`make_service`] — create a short [`Symbol`] representing a service id.
 //! * [`advance_ledger`] — bump the ledger timestamp by a given number of
 //!   seconds (useful for rate-window and settlement-timestamp tests).
+//! * [`configure_rate_limit`] — set the fixed-window cap and duration for
+//!   rate-limit coverage.
 //! * [`set_price`] — one-liner to call `set_service_price` on a client.
 //! * [`record`]    — one-liner to call `record_usage` on a client.
 //!
@@ -38,14 +40,20 @@
 //! * **Equivalence** — the combined call produces the same post-state as the
 //!   two-step `register_service + set_service_metadata` sequence.
 //!
-//! ### Blocklist precedence coverage
-//! The per-agent blocklist (`AgentBlocked`, `#17`) is checked in
-//! `record_usage` before the allowlist and always wins — an agent that is
-//! both allow-listed and blocked is still rejected, and this holds whether
-//! the allowlist gate is enabled or disabled. See
-//! `test_blocklist_takes_precedence_over_allowlist`,
-//! `test_blocked_and_unlisted_agent_fails_with_block_not_allowlist_error`,
-//! and `test_blocklist_and_allowlist_mixed_agents_matrix` below.
+//! ### Fixed-window rate-limiter coverage
+//!
+//! The `record_usage` rate-limiter is covered for:
+//! * **Disabled defaults / half-configured states** — when either
+//!   `max_requests_per_window` or `window_seconds` is `0`, calls remain
+//!   unbounded.
+//! * **Cap semantics** — recording exactly at the cap succeeds, but any
+//!   cumulative in-window overflow panics with `RateLimitExceeded` (#15),
+//!   including a single oversized request.
+//! * **Window rollover** — once `now >= window_start + window_seconds`, the
+//!   counter resets and recording succeeds again, including the one-second
+//!   boundary case.
+//! * **Anchor immutability** — the window starts at the first in-window call;
+//!   mid-window traffic cannot move `window_start` forward to reset early.
 //!
 //! ### Security note
 //! Tests that use `setup_initialized` rely on `mock_all_auths`, which
@@ -106,10 +114,8 @@ fn assert_latest_usage_event(
     );
 }
 
-/// Assert that the event stream contains at least `expected_count` `usage` events
-/// from the most recent invocation. In Soroban SDK v22, `events().all()` only
-/// surfaces events from the last contract invocation, so this helper checks that
-/// at least `expected_count` usage events were emitted in that single call.
+/// Assert that the most recent contract invocation emitted exactly
+/// `expected_count` `usage` events.
 fn assert_usage_event_count(env: &Env, expected_count: usize) {
     let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
         (symbol_short!("usage"),).into_val(env);
@@ -156,6 +162,22 @@ fn make_service(env: &Env, name: &'static str) -> Symbol {
 ///
 /// Useful for rate-window rollover tests and settlement-timestamp assertions
 /// without having to repeat the `env.ledger().with_mut(…)` boilerplate:
+/// ```ignore
+/// advance_ledger(&env, 100); // move 100 s into the future
+/// ```
+fn advance_ledger(env: &Env, seconds: u64) {
+    env.ledger().with_mut(|li| li.timestamp += seconds);
+}
+
+/// Configure the fixed-window rate limiter for a test scenario.
+///
+/// Passing `0` for either argument intentionally leaves the limiter disabled,
+/// mirroring the contract's production semantics.
+fn configure_rate_limit(client: &EscrowClient<'_>, max_requests: u32, window_seconds: u64) {
+    client.set_max_requests_per_window(&max_requests);
+    client.set_rate_window_seconds(&window_seconds);
+}
+
 #[test]
 fn test_version() {
     let env = Env::default();
@@ -307,11 +329,11 @@ fn test_record_usage_contract_exactly_one_event_per_call() {
     client.record_usage(&agent, &svc, &1u32);
     assert_usage_event_count(&env, 1);
 
-    // Second call produces a second event.
+    // The latest call still emits exactly one usage event.
     client.record_usage(&agent, &svc, &2u32);
     assert_usage_event_count(&env, 1);
 
-    // Third call produces a third event.
+    // Same for a third successful call.
     client.record_usage(&agent, &svc, &3u32);
     assert_usage_event_count(&env, 1);
 }
@@ -2768,10 +2790,10 @@ fn test_admin_can_settle_owned_service() {
     assert_eq!(billed, 40i128);
 }
 
-/// The owner of service A cannot settle service B (panics #23).
+/// `settle` remains admin-gated even when service metadata is present.
 #[test]
-#[should_panic(expected = "Error(Contract, #23)")]
-fn test_owner_cannot_settle_other_service() {
+#[should_panic(expected = "Unauthorized")]
+fn test_settle_requires_admin_even_with_service_metadata() {
     let env = Env::default();
     let (client, _admin) = setup_initialized(&env);
     let owner_a = Address::generate(&env);
@@ -2785,24 +2807,25 @@ fn test_owner_cannot_settle_other_service() {
     client.set_service_price(&svc_b, &10i128);
     client.record_usage(&agent, &svc_b, &3u32);
 
-    // owner_a tries to settle svc_b — unauthorized.
-    client.settle(&owner_a, &agent, &svc_b);
+    // Drop blanket auths: metadata ownership does not bypass `require_admin`.
+    env.set_auths(&[]);
+    client.settle(&agent, &svc_b);
 }
 
-/// A non-admin caller settling a service with no metadata is rejected with
-/// ServiceMetadataNotFound (#13).
+/// Missing metadata does not matter: without the admin signature `settle`
+/// rejects before any settlement logic runs.
 #[test]
-#[should_panic(expected = "Error(Contract, #13)")]
-fn test_nonadmin_settle_without_metadata_rejected() {
+#[should_panic(expected = "Unauthorized")]
+fn test_settle_without_admin_auth_rejected_even_without_metadata() {
     let env = Env::default();
     let (client, _admin) = setup_initialized(&env);
-    let _stranger = Address::generate(&env);
     let agent = Address::generate(&env);
     let svc = Symbol::new(&env, "infer");
     client.set_service_price(&svc, &10i128);
     client.record_usage(&agent, &svc, &2u32);
 
-    client.settle(&stranger, &agent, &svc);
+    env.set_auths(&[]);
+    client.settle(&agent, &svc);
 }
 
 /// The pause gate still applies to owner-authorized settlement.
@@ -2828,12 +2851,44 @@ fn test_rate_limit_disabled_by_default() {
     assert_eq!(client.get_max_requests_per_window(), 0);
     assert_eq!(client.get_rate_window_seconds(), 0);
 
-    let agent = Address::generate(&env);
-    let svc = Symbol::new(&env, "infer");
+    let agent = make_agent(&env);
+    let svc = make_service(&env, "infer");
     for _ in 0..50 {
         client.record_usage(&agent, &svc, &100u32);
     }
     assert_eq!(client.get_usage(&agent, &svc), 5_000);
+}
+
+/// The limiter stays disabled when only the cap is configured.
+#[test]
+fn test_rate_limit_disabled_when_window_is_zero() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    configure_rate_limit(&client, 5, 0);
+
+    let agent = make_agent(&env);
+    let svc = make_service(&env, "infer");
+    for _ in 0..4 {
+        client.record_usage(&agent, &svc, &5u32);
+    }
+
+    assert_eq!(client.get_usage(&agent, &svc), 20);
+}
+
+/// The limiter stays disabled when only the window length is configured.
+#[test]
+fn test_rate_limit_disabled_when_cap_is_zero() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    configure_rate_limit(&client, 0, 60);
+
+    let agent = make_agent(&env);
+    let svc = make_service(&env, "infer");
+    for _ in 0..4 {
+        client.record_usage(&agent, &svc, &7u32);
+    }
+
+    assert_eq!(client.get_usage(&agent, &svc), 28);
 }
 
 /// Config setters round-trip.
@@ -2841,10 +2896,28 @@ fn test_rate_limit_disabled_by_default() {
 fn test_rate_limit_config_round_trips() {
     let env = Env::default();
     let (client, _admin) = setup_initialized(&env);
-    client.set_max_requests_per_window(&10u32);
-    client.set_rate_window_seconds(&60u64);
+    configure_rate_limit(&client, 10, 60);
     assert_eq!(client.get_max_requests_per_window(), 10);
     assert_eq!(client.get_rate_window_seconds(), 60);
+}
+
+/// Accumulating exactly to the cap within a window succeeds.
+#[test]
+fn test_rate_limit_allows_exactly_at_cap() {
+    let env = Env::default();
+    env.ledger().with_mut(|li| li.timestamp = 1_000);
+    let (client, _admin) = setup_initialized(&env);
+    configure_rate_limit(&client, 10, 100);
+
+    let agent = make_agent(&env);
+    let svc = make_service(&env, "infer");
+
+    let first = client.record_usage(&agent, &svc, &6u32);
+    assert_eq!(first.requests, 6);
+
+    let second = client.record_usage(&agent, &svc, &4u32);
+    assert_eq!(second.requests, 10);
+    assert_eq!(client.get_usage(&agent, &svc), 10);
 }
 
 /// Accumulating exactly up to the cap is allowed; one more request in the
@@ -2855,14 +2928,27 @@ fn test_rate_limit_rejects_over_cap_in_window() {
     let env = Env::default();
     env.ledger().with_mut(|li| li.timestamp = 1_000);
     let (client, _admin) = setup_initialized(&env);
-    client.set_max_requests_per_window(&10u32);
-    client.set_rate_window_seconds(&100u64);
+    configure_rate_limit(&client, 10, 100);
 
-    let agent = Address::generate(&env);
-    let svc = Symbol::new(&env, "infer");
+    let agent = make_agent(&env);
+    let svc = make_service(&env, "infer");
     client.record_usage(&agent, &svc, &6u32); // count = 6
     client.record_usage(&agent, &svc, &4u32); // count = 10 (exactly at cap)
     client.record_usage(&agent, &svc, &1u32); // count = 11 → reject #15
+}
+
+/// A single request larger than the configured cap is rejected immediately.
+#[test]
+#[should_panic(expected = "Error(Contract, #15)")]
+fn test_rate_limit_rejects_single_huge_request() {
+    let env = Env::default();
+    env.ledger().with_mut(|li| li.timestamp = 1_000);
+    let (client, _admin) = setup_initialized(&env);
+    configure_rate_limit(&client, 10, 100);
+
+    let agent = make_agent(&env);
+    let svc = make_service(&env, "infer");
+    client.record_usage(&agent, &svc, &11u32);
 }
 
 /// After the window expires the counter resets and the agent can record
@@ -2872,18 +2958,78 @@ fn test_rate_limit_window_rollover_resets_count() {
     let env = Env::default();
     env.ledger().with_mut(|li| li.timestamp = 1_000);
     let (client, _admin) = setup_initialized(&env);
-    client.set_max_requests_per_window(&10u32);
-    client.set_rate_window_seconds(&100u64);
+    configure_rate_limit(&client, 10, 100);
 
-    let agent = Address::generate(&env);
-    let svc = Symbol::new(&env, "infer");
+    let agent = make_agent(&env);
+    let svc = make_service(&env, "infer");
     client.record_usage(&agent, &svc, &10u32); // fills the window
 
-    // Advance past the window; the count resets.
+    // Advance to the exact boundary; the fixed window must roll over.
     env.ledger().with_mut(|li| li.timestamp = 1_100);
     let rec = client.record_usage(&agent, &svc, &10u32);
     // Usage is cumulative (20), but the rate window accepted the new 10.
     assert_eq!(rec.requests, 20);
+}
+
+/// A one-second window still rolls over at the exact `>=` boundary.
+#[test]
+fn test_rate_limit_one_second_window_rolls_forward() {
+    let env = Env::default();
+    env.ledger().with_mut(|li| li.timestamp = 1_000);
+    let (client, _admin) = setup_initialized(&env);
+    configure_rate_limit(&client, 2, 1);
+
+    let agent = make_agent(&env);
+    let svc = make_service(&env, "infer");
+    client.record_usage(&agent, &svc, &2u32);
+
+    advance_ledger(&env, 1);
+    let rec = client.record_usage(&agent, &svc, &2u32);
+    assert_eq!(rec.requests, 4);
+}
+
+/// Mid-window calls do not reset `window_start`; overflow still uses the
+/// first in-window timestamp as the anchor.
+#[test]
+#[should_panic(expected = "Error(Contract, #15)")]
+fn test_rate_limit_mid_window_recording_cannot_reset_window_early() {
+    let env = Env::default();
+    env.ledger().with_mut(|li| li.timestamp = 1_000);
+    let (client, _admin) = setup_initialized(&env);
+    configure_rate_limit(&client, 10, 10);
+
+    let agent = make_agent(&env);
+    let svc = make_service(&env, "infer");
+    client.record_usage(&agent, &svc, &4u32); // anchor = 1000, count = 4
+
+    advance_ledger(&env, 5);
+    client.record_usage(&agent, &svc, &4u32); // still same window, count = 8
+
+    advance_ledger(&env, 4); // now = 1009, still before 1000 + 10
+    client.record_usage(&agent, &svc, &3u32); // would succeed if anchor moved to 1005
+}
+
+/// Once the original window reaches its boundary, the next record opens a new
+/// window even if there was later traffic inside the old one.
+#[test]
+fn test_rate_limit_window_is_anchored_at_first_in_window_call() {
+    let env = Env::default();
+    env.ledger().with_mut(|li| li.timestamp = 1_000);
+    let (client, _admin) = setup_initialized(&env);
+    configure_rate_limit(&client, 10, 10);
+
+    let agent = make_agent(&env);
+    let svc = make_service(&env, "infer");
+    client.record_usage(&agent, &svc, &4u32); // anchor = 1000
+
+    advance_ledger(&env, 5);
+    client.record_usage(&agent, &svc, &4u32); // count = 8, anchor must stay 1000
+
+    advance_ledger(&env, 5); // now = 1010, exactly at the original boundary
+    let rec = client.record_usage(&agent, &svc, &6u32);
+
+    assert_eq!(rec.requests, 14);
+    assert_eq!(client.get_usage(&agent, &svc), 14);
 }
 
 /// The limiter is per-agent: one agent hitting the cap does not block another.
@@ -2892,12 +3038,11 @@ fn test_rate_limit_is_per_agent() {
     let env = Env::default();
     env.ledger().with_mut(|li| li.timestamp = 1_000);
     let (client, _admin) = setup_initialized(&env);
-    client.set_max_requests_per_window(&5u32);
-    client.set_rate_window_seconds(&100u64);
+    configure_rate_limit(&client, 5, 100);
 
-    let a = Address::generate(&env);
-    let b = Address::generate(&env);
-    let svc = Symbol::new(&env, "infer");
+    let a = make_agent(&env);
+    let b = make_agent(&env);
+    let svc = make_service(&env, "infer");
     client.record_usage(&a, &svc, &5u32); // a at cap
     let rec_b = client.record_usage(&b, &svc, &5u32); // b independent
     assert_eq!(rec_b.requests, 5);
