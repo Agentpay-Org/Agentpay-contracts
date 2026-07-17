@@ -854,7 +854,6 @@ impl Escrow {
         }
     }
 
-
     /// Batched usage read: returns the accumulated request count for each
     /// input `(agent, service_id)` pair, in the same order as `pairs`.
     ///

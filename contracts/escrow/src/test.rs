@@ -804,6 +804,23 @@ fn test_transfer_service_ownership_unauthorized_panics() {
 }
 
 #[test]
+#[should_panic(expected = "Unauthorized")]
+fn test_clear_service_metadata_rejects_non_admin() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, Escrow);
+    let client = EscrowClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    env.mock_all_auths();
+    client.init(&admin);
+
+    let svc = Symbol::new(&env, "infer");
+
+    // Drop the mocked auths so the admin's require_auth() is unsatisfied.
+    env.set_auths(&[]);
+    client.clear_service_metadata(&svc);
+}
+
+#[test]
 fn test_clear_service_metadata_removes_entry() {
     let env = Env::default();
     let (client, _admin) = setup_initialized(&env);
@@ -1935,15 +1952,15 @@ fn test_rate_window_getters_mid_window() {
     let (client, _admin) = setup_initialized(&env);
     let agent = make_agent(&env);
     let svc = make_service(&env, "svc");
-    
+
     // Configure rate limiter
     client.set_max_requests_per_window(&100u32);
     client.set_rate_window_seconds(&3600u64);
-    
+
     // First call: window starts now.
     let now = env.ledger().timestamp();
     client.record_usage(&agent, &svc, &10u32);
-    
+
     assert_eq!(client.get_rate_window(&agent), (now, 10));
     assert_eq!(client.get_remaining_in_window(&agent), 90);
 }
@@ -1954,15 +1971,15 @@ fn test_rate_window_read_does_not_mutate() {
     let (client, _admin) = setup_initialized(&env);
     let agent = make_agent(&env);
     let svc = make_service(&env, "svc");
-    
+
     client.set_max_requests_per_window(&100u32);
     client.set_rate_window_seconds(&3600u64);
-    
+
     client.record_usage(&agent, &svc, &10u32);
-    
+
     // Call get_rate_window
     client.get_rate_window(&agent);
-    
+
     // Verify state is unchanged
     let now = env.ledger().timestamp();
     assert_eq!(client.get_rate_window(&agent), (now, 10));
@@ -1974,21 +1991,21 @@ fn test_rate_window_expired_rollover() {
     let (client, _admin) = setup_initialized(&env);
     let agent = make_agent(&env);
     let svc = make_service(&env, "svc");
-    
+
     let window_len = 3600u64;
     client.set_max_requests_per_window(&100u32);
     client.set_rate_window_seconds(&window_len);
-    
+
     // First call: window starts now.
     let now = env.ledger().timestamp();
     client.record_usage(&agent, &svc, &10u32);
-    
+
     // Advance ledger to trigger expiration
     advance_ledger(&env, window_len + 1);
-    
+
     // get_remaining_in_window should see expired window and return full cap.
     assert_eq!(client.get_remaining_in_window(&agent), 100);
-    
+
     // get_rate_window should still show the old window data (it doesn't roll forward)
     assert_eq!(client.get_rate_window(&agent), (now, 10));
 }
