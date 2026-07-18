@@ -382,7 +382,8 @@ Auth is checked at **step 0**, before the pause gate:
 | 4    | `requests < min`       | `#9 RequestsBelowMinPerCall`   |
 | 5    | Service not registered | `#7 ServiceNotRegistered`      |
 | 6    | Service disabled       | `#12 ServiceDisabled`          |
-| 7    | Agent not allowed      | `#10 AgentNotAllowed`          |
+| 7    | Agent on blocklist     | `#17 AgentBlocked`             |
+| 8    | Agent not allowed      | `#10 AgentNotAllowed`          |
 
 #### Operator override (metering loop migration)
 
