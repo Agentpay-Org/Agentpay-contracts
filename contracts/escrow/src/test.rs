@@ -3038,6 +3038,7 @@ fn test_admin_can_settle_owned_service() {
 /// `settle` is admin-gated, so a caller with the admin key can settle any
 /// service regardless of ownership metadata.
 #[test]
+#[should_panic(expected = "Error(Contract, #6)")]
 fn test_owner_cannot_settle_other_service() {
     let env = Env::default();
     let (client, admin) = setup_initialized(&env);
@@ -3052,13 +3053,13 @@ fn test_owner_cannot_settle_other_service() {
     client.set_service_price(&svc_b, &10i128);
     client.record_usage(&agent, &svc_b, &3u32);
 
-    let billed = client.settle(&agent, &agent, &svc_b);
-    assert_eq!(billed, 30i128);
+    client.settle(&owner_a, &agent, &svc_b);
 }
 
-/// `settle` does not require service metadata to be present; it reads the
-/// stored service price directly and drains the usage counter.
+/// `settle` requires service metadata when the caller is not the admin;
+/// a non-admin caller for an unregistered service is rejected.
 #[test]
+#[should_panic(expected = "Error(Contract, #13)")]
 fn test_nonadmin_settle_without_metadata_rejected() {
     let env = Env::default();
     let (client, admin) = setup_initialized(&env);
@@ -3068,8 +3069,7 @@ fn test_nonadmin_settle_without_metadata_rejected() {
     client.set_service_price(&svc, &10i128);
     client.record_usage(&agent, &svc, &2u32);
 
-    let billed = client.settle(&agent, &agent, &svc);
-    assert_eq!(billed, 20i128);
+    client.settle(&agent, &agent, &svc);
 }
 
 /// The pause gate still applies to owner-authorized settlement.
