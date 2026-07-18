@@ -3537,7 +3537,7 @@ fn test_get_contract_config_defaults_on_fresh_contract() {
     assert_eq!(cfg.max_requests_per_window, 0);
     assert_eq!(cfg.window_seconds, 0);
     assert_eq!(cfg.schema_version, 2);
-    assert_eq!(cfg.admin, Some(_admin));
+    assert_eq!(cfg.admin, Some(admin));
 }
 
 /// Every field in the snapshot matches the corresponding individual getter.
@@ -3644,7 +3644,7 @@ fn test_get_contract_config_readable_while_paused() {
 
     let cfg = client.get_contract_config();
     assert!(cfg.paused);
-    assert_eq!(cfg.admin, Some(_admin));
+    assert_eq!(cfg.admin, Some(admin));
 }
 
 /// Before `init`, `admin` is `None` and all fields carry their defaults.
