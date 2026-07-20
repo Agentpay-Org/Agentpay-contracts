@@ -1978,6 +1978,31 @@ impl Escrow {
         );
     }
 
+    /// Return the service ids for an agent that currently have open disputes.
+    ///
+    /// Pure read — no auth, no pause gate. The method reuses the same
+    /// per-agent service index backing as [`Escrow::get_agent_services`] so it
+    /// iterates the active service list in the same order and stops after
+    /// [`MAX_BATCH_READ`] entries to keep the read bounded.
+    pub fn list_open_disputes(env: Env, agent: Address) -> Vec<Symbol> {
+        let index: Vec<Symbol> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AgentServiceIndex(agent.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut disputes: Vec<Symbol> = Vec::new(&env);
+        for service_id in index.iter() {
+            if disputes.len() >= MAX_BATCH_READ {
+                break;
+            }
+            if read_flag(&env, &DataKey::Dispute(agent.clone(), service_id.clone())) {
+                disputes.push_back(service_id);
+            }
+        }
+        disputes
+    }
+
     /// Returns `true` iff there is currently an open dispute for the
     /// given `(agent, service_id)` pair. Pure read — no auth, no pause gate.
     pub fn has_open_dispute(env: Env, agent: Address, service_id: Symbol) -> bool {

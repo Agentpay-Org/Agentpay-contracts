@@ -22,10 +22,10 @@ When a billing discrepancy is detected, any authorized agent may open a dispute 
 
 ### States
 
-| State         | `has_open_dispute` | `settle` allowed |
-|---------------|--------------------|------------------|
-| No dispute    | `false`            | Yes              |
-| Dispute open  | `true`             | No (#18)         |
+| State        | `has_open_dispute` | `settle` allowed |
+| ------------ | ------------------ | ---------------- |
+| No dispute   | `false`            | Yes              |
+| Dispute open | `true`             | No (#18)         |
 
 ## Entrypoints
 
@@ -54,14 +54,18 @@ When a billing discrepancy is detected, any authorized agent may open a dispute 
 
 Pure read. Returns `true` iff a dispute is currently open for the pair. No auth, no pause gate.
 
+### `list_open_disputes(agent) → Vec<Symbol>`
+
+Pure read. Returns the service ids for which the agent currently has an open dispute, iterating the same per-agent service index backing `get_agent_services` and stopping after `MAX_BATCH_READ` entries. The response is ordered by the service index and is bounded to keep the read cost predictable.
+
 ## Error Codes (append-only)
 
-| Code | Name                  | Trigger                                        |
-|------|-----------------------|------------------------------------------------|
-| `18` | `DisputeOpen`         | `settle` called while a dispute is open        |
-| `19` | `DisputeAlreadyOpen`  | `open_dispute` called when dispute already open |
-| `20` | `NoOpenDispute`       | `resolve_dispute` called with no open dispute   |
-| `21` | `RefundExceedsUsage`  | `refund_requests > current usage`              |
+| Code | Name                 | Trigger                                         |
+| ---- | -------------------- | ----------------------------------------------- |
+| `18` | `DisputeOpen`        | `settle` called while a dispute is open         |
+| `19` | `DisputeAlreadyOpen` | `open_dispute` called when dispute already open |
+| `20` | `NoOpenDispute`      | `resolve_dispute` called with no open dispute   |
+| `21` | `RefundExceedsUsage` | `refund_requests > current usage`               |
 
 ## Security Notes
 
