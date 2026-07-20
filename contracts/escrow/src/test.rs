@@ -3,6 +3,8 @@
 #![allow(unused_variables)]
 #![allow(dead_code)]
 
+extern crate alloc;
+
 //! # Escrow contract test suite
 //!
 //! ## Test-harness conventions
@@ -4357,7 +4359,7 @@ fn test_refund_batch_oversized_panics() {
     // service created below.
     let mut services: Vec<Symbol> = Vec::new(&env);
     for i in 0..=MAX_BATCH_READ {
-        let s = Symbol::new(&env, &format!("svc_{}", i));
+        let s = Symbol::new(&env, &alloc::format!("svc_{}", i));
         client.record_usage(&agent, &s, &1u32);
         client.open_dispute(&agent, &s);
         services.push_back(s);
@@ -4528,7 +4530,7 @@ fn test_refund_batch_at_boundary_succeeds() {
 
     let mut services: Vec<Symbol> = Vec::new(&env);
     for i in 0..MAX_BATCH_READ {
-        let s = Symbol::new(&env, &format!("svc_{}", i));
+        let s = Symbol::new(&env, &alloc::format!("svc_{}", i));
         client.record_usage(&agent, &s, &1u32);
         client.open_dispute(&agent, &s);
         services.push_back(s);
@@ -4539,7 +4541,7 @@ fn test_refund_batch_at_boundary_succeeds() {
 
     // All disputes cleared, all usage zeroed.
     for i in 0..MAX_BATCH_READ {
-        let s = Symbol::new(&env, &format!("svc_{}", i));
+        let s = Symbol::new(&env, &alloc::format!("svc_{}", i));
         assert!(!client.has_open_dispute(&agent, &s));
         assert_eq!(client.get_usage(&agent, &s), 0);
     }
