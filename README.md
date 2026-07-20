@@ -99,6 +99,20 @@ is rejected with `RateLimitExceeded` (#15). State is per-agent
 (`DataKey::RateWindow(agent)`), and an agent can never reset its own window
 early — `window_start` only advances. Window arithmetic is saturating.
 
+### Operator override: `reset_rate_window`
+
+`reset_rate_window(env, agent)` is an admin-gated, pause-respecting entrypoint
+that clears the per-agent `RateWindow` storage slot, so the next `record_usage`
+call opens a fresh window with a zero count. This lets an operator lift a
+throttle immediately — for example, when a misconfigured cap has been raised,
+or a legitimate burst the operator wants to forgive.
+
+**Idempotent:** resetting an agent that has no stored rate window is a no-op.
+The configured cap and window length are **not** changed — only the agent's
+accumulated count for the current window is cleared.
+
+Emits a `rate_rst(agent)` event so the override is auditable.
+
 ### Schema version: fresh v2 init vs. legacy v1→v2 migration
 
 `init` stamps the current storage schema version (v2) directly, so a freshly

@@ -2730,6 +2730,168 @@ fn test_rate_limit_is_per_agent() {
     let rec_b = client.record_usage(&b, &svc, &5u32); // b independent
     assert_eq!(rec_b.requests, 5);
 }
+// ── reset_rate_window tests ──────────────────────────────────────────────────
+//
+// `reset_rate_window(agent)` clears the per-agent `RateWindow` storage slot
+// so the next `record_usage` opens a fresh window. It is admin-gated,
+// pause-respecting, idempotent (no-op when no window exists), and emits
+// a `rate_rst(agent)` event. Covered scenarios:
+//   1. Throttle → reset → record succeeds in the same ledger.
+//   2. No-op when no window exists (limiter never hit).
+//   3. Non-admin caller is rejected.
+//   4. Paused contract is rejected.
+//   5. Reset mid-window, then re-throttle in the same window.
+//   6. Reset with limiter disabled (no window state, still emits event).
+//   7. Reset then immediately re-throttle.
+
+/// Throttle an agent to the cap, reset the window, then record usage
+/// again — all within the same fixed window. Demonstrates the admin
+/// override lifts the throttle without waiting for window rollover.
+#[test]
+fn test_reset_rate_window_lifts_throttle() {
+    let env = Env::default();
+    env.ledger().with_mut(|li| li.timestamp = 1_000);
+    let (client, _admin) = setup_initialized(&env);
+    client.set_max_requests_per_window(&10u32);
+    client.set_rate_window_seconds(&100u64);
+
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "infer");
+
+    // Fill the window (count = 10).
+    client.record_usage(&agent, &svc, &10u32);
+    // The next call would be rejected (RateLimitExceeded #15).
+    assert!(client.try_record_usage(&agent, &svc, &1u32).is_err());
+
+    // Reset the rate window — clears the agent's accumulated count.
+    client.reset_rate_window(&agent);
+
+    // Now the agent can record again even though the window hasn't rolled.
+    let rec = client.record_usage(&agent, &svc, &5u32);
+    assert_eq!(rec.requests, 15);
+}
+
+/// Resetting an agent that has no stored rate window is a no-op (no panic).
+#[test]
+fn test_reset_rate_window_noop_when_no_window() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+
+    let agent = Address::generate(&env);
+    // No record_usage has been called, so no RateWindow exists.
+    client.reset_rate_window(&agent);
+    // Event is still emitted for auditability.
+    let events = env.events().all();
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("rate_rst"),).into_val(&env);
+    let has_rate_rst = events.iter().any(|(_, t, _)| t == expected_topics);
+    assert!(has_rate_rst);
+}
+
+/// A non-admin caller is rejected with `Unauthorized`.
+#[test]
+#[should_panic(expected = "Unauthorized")]
+fn test_reset_rate_window_non_admin_rejected() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    env.set_auths(&[]);
+
+    let agent = Address::generate(&env);
+    client.reset_rate_window(&agent);
+}
+
+/// Calling while the contract is paused panics with ContractPaused (#4).
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")]
+fn test_reset_rate_window_paused_rejected() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    client.pause();
+
+    let agent = Address::generate(&env);
+    client.reset_rate_window(&agent);
+}
+
+/// Reset the window mid-window, re-fill it, and verify the cap is enforced
+/// again within the same fixed window.
+#[test]
+fn test_reset_rate_window_mid_window_rethrottle() {
+    let env = Env::default();
+    env.ledger().with_mut(|li| li.timestamp = 1_000);
+    let (client, _admin) = setup_initialized(&env);
+    client.set_max_requests_per_window(&5u32);
+    client.set_rate_window_seconds(&100u64);
+
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "infer");
+
+    // Record up to the cap.
+    client.record_usage(&agent, &svc, &5u32);
+    assert!(client.try_record_usage(&agent, &svc, &1u32).is_err());
+
+    // Reset mid-window — count goes back to 0.
+    client.reset_rate_window(&agent);
+
+    // Re-fill the window.
+    client.record_usage(&agent, &svc, &5u32);
+    // Now it should be throttled again.
+    assert!(client.try_record_usage(&agent, &svc, &1u32).is_err());
+}
+
+/// When the limiter is disabled (cap = 0 or window = 0), `record_usage`
+/// never writes a `RateWindow` slot, so reset is a no-op.
+#[test]
+fn test_reset_rate_window_limiter_disabled() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    // Limiter is disabled by default (cap = 0, window = 0).
+
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "infer");
+
+    // Record some usage — RateWindow is never written.
+    client.record_usage(&agent, &svc, &100u32);
+
+    // Reset has no effect but should not panic.
+    client.reset_rate_window(&agent);
+
+    // Recording still works.
+    let rec = client.record_usage(&agent, &svc, &50u32);
+    assert_eq!(rec.requests, 150);
+}
+
+/// Reset emits a `rate_rst(agent)` event that indexers can observe.
+#[test]
+fn test_reset_rate_window_emits_event() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+
+    client.reset_rate_window(&agent);
+
+    let events = env.events().all();
+    assert!(!events.is_empty());
+    let (_addr, topics, data) = events.last().unwrap();
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("rate_rst"),).into_val(&env);
+    assert_eq!(topics, expected_topics);
+    let decoded: Address = data.into_val(&env);
+    assert_eq!(decoded, agent);
+}
+
+/// Reset is idempotent: calling it twice in a row does not panic.
+#[test]
+fn test_reset_rate_window_idempotent() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+
+    // First reset (no window yet — no-op).
+    client.reset_rate_window(&agent);
+    // Second reset — must also succeed.
+    client.reset_rate_window(&agent);
+}
+
 // ── compute_billing tests ────────────────────────────────────────────────────
 //
 // `compute_billing(agent, service_id)` returns `accumulated_requests * price_per_request`

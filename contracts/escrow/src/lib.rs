@@ -1314,6 +1314,32 @@ impl Escrow {
         );
     }
 
+    /// Admin-gated, pause-respecting entrypoint that clears the per-agent
+    /// rate-limit window state.
+    ///
+    /// Removes the `DataKey::RateWindow(agent)` storage slot so the next
+    /// `record_usage` call for this agent opens a fresh window with a zero
+    /// count. This lets an operator lift a throttle immediately — for
+    /// example, when a misconfigured cap has been raised, or a legitimate
+    /// burst the operator wants to forgive.
+    ///
+    /// Idempotent: resetting an agent that has no stored rate window is a
+    /// no-op. The configured cap (`MaxRequestsPerWindow`) and window length
+    /// (`WindowSeconds`) are **not** changed — only the agent's accumulated
+    /// count for the current window is cleared.
+    ///
+    /// # Events
+    ///
+    /// Emits `rate_rst(agent)` so the override is auditable.
+    pub fn reset_rate_window(env: Env, agent: Address) {
+        ensure_not_paused(&env);
+        require_admin(&env);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::RateWindow(agent.clone()));
+        env.events().publish((symbol_short!("rate_rst"),), agent);
+    }
+
     /// Admin sets the per-call upper bound on `requests` accepted by
     /// `record_usage`. Pass `u32::MAX` to effectively disable the cap.
     ///
