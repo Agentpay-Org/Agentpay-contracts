@@ -2076,6 +2076,44 @@ impl Escrow {
             (symbol_short!("resolve"), agent, service_id, refund_requests),
         );
     }
+
+    /// Admin-only batch entrypoint that resolves disputes for multiple
+    /// services of one agent, zeroing the full disputed usage in a single
+    /// transaction.
+    ///
+    /// Accepts a bounded `Vec<Symbol>` of service ids. For each service:
+    /// - Skips the service if no dispute is open (no-op).
+    /// - Reads the current accumulated usage and uses that as the refund
+    ///   amount (the counter is then reset to zero).
+    /// - Clears the dispute flag.
+    /// - Emits a `dispute` event with
+    ///   `("resolve", agent, service_id, refunded)`.
+    ///
+    /// Rejects oversized batches (more than [`MAX_BATCH_READ`] entries) with
+    /// [`EscrowError::BatchTooLarge`]. Honours the pause gate.
+    pub fn refund_batch(env: Env, agent: Address, services: Vec<Symbol>) {
+        ensure_not_paused(&env);
+        require_admin(&env);
+        if services.len() > MAX_BATCH_READ {
+            panic_with_error!(&env, EscrowError::BatchTooLarge);
+        }
+        for service_id in services.iter() {
+            let dispute_key = DataKey::Dispute(agent.clone(), service_id.clone());
+            if !read_flag(&env, &dispute_key) {
+                continue;
+            }
+            let usage_key = DataKey::Usage(agent.clone(), service_id.clone());
+            let current: u32 = env.storage().persistent().get(&usage_key).unwrap_or(0);
+            // Zero the usage counter.
+            env.storage().persistent().set(&usage_key, &0u32);
+            // Clear the dispute flag so settle can proceed.
+            write_flag(&env, &dispute_key, false);
+            env.events().publish(
+                (symbol_short!("dispute"),),
+                (symbol_short!("resolve"), agent.clone(), service_id.clone(), current),
+            );
+        }
+    }
 }
 
 #[cfg(test)]
