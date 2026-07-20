@@ -166,6 +166,14 @@ pub enum DataKey {
     /// accumulated usage crosses this value on a `record_usage` call a
     /// `usage_hi` event is emitted (edge-triggered).
     UsageAlertThreshold,
+    /// Global minimum service price in stroops. When set, `set_service_price`
+    /// rejects any price below this floor with `PriceOutOfBounds`.
+    /// Defaults to `0` (no floor) when absent.
+    MinServicePrice,
+    /// Global maximum service price in stroops. When set, `set_service_price`
+    /// rejects any price above this ceiling with `PriceOutOfBounds`.
+    /// Defaults to `i128::MAX` (no ceiling) when absent.
+    MaxServicePrice,
 }
 
 /// Typed contract errors. Codes are append-only to keep client SDKs stable.
@@ -236,6 +244,31 @@ pub enum EscrowError {
     /// `resolve_dispute` was called with `refund_requests` exceeding the
     /// current accumulated usage — prevents double-refunds.
     RefundExceedsUsage = 22,
+    /// `set_min_requests_per_call` was called with a `min` that exceeds the
+    /// currently-stored `MaxRequestsPerCall`, or `set_max_requests_per_call`
+    /// was called with a `max` that is below the currently-stored
+    /// `MinRequestsPerCall`. Either configuration would make the
+    /// `min <= max` invariant unsatisfiable, permanently bricking metering
+    /// until corrected. An equal value (`min == max`) is accepted — it
+    /// enforces an exact per-call request count.
+    InvalidRequestBounds = 23,
+    /// `set_service_price` was called with a price outside the configured
+    /// `[MinServicePrice, MaxServicePrice]` bounds.
+    PriceOutOfBounds = 24,
+    /// `set_price_bounds` was called with `min_stroops > max_stroops`,
+    /// which would create an impossible price band.
+    InvertedPriceBand = 25,
+    /// An entrypoint was called by an address that is neither the
+    /// contract admin nor the authorised party (e.g. a service owner
+    /// attempting to settle a service they do not own, or transfer
+    /// ownership of metadata they do not control).
+    Unauthorized = 26,
+    /// `transfer_service_ownership` was called with a `new_owner` that
+    /// matches the current owner — a no-op that would waste a storage
+    /// write and emit a spurious `owner_chg` event. Rejected to match
+    /// the existing `InvalidAdminProposal` guard on
+    /// `propose_admin_transfer`.
+    InvalidOwnerTransfer = 27,
 }
 
 #[contracttype]
@@ -491,12 +524,57 @@ impl Escrow {
     /// Returns a `UsageRecord` carrying the *new total*, not the delta,
     /// so the caller can confirm the post-write state without a second
     /// storage read.
+    ///
+    /// # Authorization
+    ///
+    /// **Step 0**: The recorded `agent` must authorize this call via
+    /// `agent.require_auth()`. This closes a usage-forgery vector where any
+    /// party could inflate a competitor agent's counters (and therefore its
+    /// bill on the next `settle`) with no signature from the agent.
+    ///
+    /// Soroban's auth tree supports sub-invocation authorization: an agent can
+    /// pre-authorize a trusted metering operator to call `record_usage` on its
+    /// behalf by having the operator's call appear as a sub-invocation of an
+    /// agent-signed outer call. This allows existing off-chain settlement loops
+    /// to continue operating without requiring every agent to sign each
+    /// individual `record_usage` call directly:
+    ///
+    /// 1. The agent signs an outer transaction that authorizes the operator's
+    ///    contract call via Soroban's `authorize_as_current_contract` or
+    ///    sub-invocation auth.
+    /// 2. The operator's metering loop submits `record_usage` as a
+    ///    sub-invocation within that authorized context.
+    /// 3. Alternatively, agents can sign each `record_usage` call directly
+    ///    (standard path) if the metering loop supports it.
+    ///
+    /// # Validation order
+    ///
+    /// Auth checks are performed in this order (early exits on first failure):
+    ///
+    /// | Step | Check                  | Error                          |
+    /// | ---- | ---------------------- | ------------------------------ |
+    /// | 0    | `agent.require_auth()` | Soroban host auth error        |
+    /// | 1    | Contract paused        | `#4 ContractPaused`            |
+    /// | 2    | `requests == 0`        | `#2 RequestsMustBePositive`    |
+    /// | 3    | `requests > max`       | `#8 RequestsExceedsMaxPerCall` |
+    /// | 4    | `requests < min`       | `#9 RequestsBelowMinPerCall`   |
+    /// | 5    | Service not registered | `#7 ServiceNotRegistered`      |
+    /// | 6    | Service disabled       | `#12 ServiceDisabled`          |
+    /// | 7    | Agent blocked          | `#17 AgentBlocked`             |
+    /// | 8    | Agent not allowed      | `#10 AgentNotAllowed`          |
     pub fn record_usage(
         env: Env,
         agent: Address,
         service_id: Symbol,
         requests: u32,
     ) -> UsageRecord {
+        // Step 0: Require the agent to authorize this call. This prevents usage
+        // forgery where any party could inflate a competitor's bill. Soroban's
+        // auth tree supports sub-invocation authorization, allowing a metering
+        // operator to record on behalf of an agent if the agent has authorized
+        // the operator's contract call.
+        agent.require_auth();
+
         ensure_not_paused(&env);
         if requests == 0 {
             panic_with_error!(&env, EscrowError::RequestsMustBePositive);
@@ -674,18 +752,11 @@ impl Escrow {
     /// Emits `usage_dec(agent, service_id, amount, new_total)` so corrections
     /// are auditable and distinguishable from `record_usage` and `settle`.
     pub fn decrement_usage(env: Env, agent: Address, service_id: Symbol, amount: u32) -> u32 {
-        if read_flag(&env, &DataKey::Paused) {
-            panic_with_error!(&env, EscrowError::ContractPaused);
-        }
+        ensure_not_paused(&env);
         if amount == 0 {
             panic_with_error!(&env, EscrowError::RequestsMustBePositive);
         }
-        let admin: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Admin)
-            .unwrap_or_else(|| panic_with_error!(&env, EscrowError::NotInitialized));
-        admin.require_auth();
+        let _admin: Address = require_admin(&env);
 
         let key = DataKey::Usage(agent.clone(), service_id.clone());
         let prev: u32 = env.storage().persistent().get(&key).unwrap_or(0);
@@ -749,10 +820,55 @@ impl Escrow {
             .unwrap_or(0)
     }
 
-    /// Returns the accumulated request count for an `(agent, service_id)`
+    /// Return the accumulated request count for an `(agent, service_id)`
     /// pair, or `0` if no usage has been recorded yet.
     pub fn get_usage(env: Env, agent: Address, service_id: Symbol) -> u32 {
         read_usage(&env, &agent, &service_id)
+    }
+
+    /// Return the raw per-agent fixed-window rate-limit state:
+    /// `(window_start, count)` where `window_start` is the ledger timestamp
+    /// the current window opened and `count` is the requests accumulated.
+    /// Returns `(0, 0)` if no window has opened.
+    ///
+    /// Pure read — no window advance on read.
+    pub fn get_rate_window(env: Env, agent: Address) -> (u64, u32) {
+        env.storage()
+            .persistent()
+            .get(&DataKey::RateWindow(agent))
+            .unwrap_or((0, 0))
+    }
+
+    /// Return the remaining capacity for an agent in the current rate-limit
+    /// window, accounting for window expiration. Returns `MaxRequestsPerWindow`
+    /// if the window has expired or the limiter is disabled (window_seconds=0
+    /// or max_requests_per_window=0).
+    ///
+    /// Note: `env.ledger().timestamp()` is used to determine window expiration.
+    pub fn get_remaining_in_window(env: Env, agent: Address) -> u32 {
+        let max_per_window: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MaxRequestsPerWindow)
+            .unwrap_or(0);
+        let window_seconds: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::WindowSeconds)
+            .unwrap_or(0);
+
+        if max_per_window == 0 || window_seconds == 0 {
+            return max_per_window;
+        }
+
+        let (window_start, count): (u64, u32) = Self::get_rate_window(env.clone(), agent);
+        let now = env.ledger().timestamp();
+
+        if now >= window_start.saturating_add(window_seconds) {
+            max_per_window
+        } else {
+            max_per_window.saturating_sub(count)
+        }
     }
 
     /// Batched usage read: returns the accumulated request count for each
@@ -887,6 +1003,25 @@ impl Escrow {
         if read_flag(&env, &DataKey::ServiceDisabled(service_id.clone())) {
             panic_with_error!(&env, EscrowError::ServiceDisabled);
         }
+        // Global price-bounds check. Defaults: floor = 0, ceiling = i128::MAX.
+        // If a floor above 0 is configured, a price of 0 ("free service") is
+        // explicitly **forbidden** — the admin must lower the floor to 0 first
+        // if free services should be re-allowed. This is intentional: the
+        // bounds exist to prevent accidental near-zero prices and a floor > 0
+        // expresses a clear policy that the service must have a positive cost.
+        let price_floor: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MinServicePrice)
+            .unwrap_or(0);
+        let price_ceil: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MaxServicePrice)
+            .unwrap_or(i128::MAX);
+        if price_stroops < price_floor || price_stroops > price_ceil {
+            panic_with_error!(&env, EscrowError::PriceOutOfBounds);
+        }
         env.storage()
             .persistent()
             .set(&DataKey::ServicePrice(service_id.clone()), &price_stroops);
@@ -905,9 +1040,9 @@ impl Escrow {
     /// After removal, `get_service_price` and `compute_billing` read back
     /// `0`, exactly as for a service that was never priced. Note the
     /// zero-vs-removed distinction: removal frees the underlying storage
-    /// slot and emits a `price_rm` event, whereas `set_service_price(_, 0)`
+    /// slot and emits a `price_rmv` event, whereas `set_service_price(_, 0)`
     /// leaves a stored slot holding `0`. Both read back as `0`, but only
-    /// removal reclaims the slot. Emits `price_rm(service_id)`.
+    /// removal reclaims the slot. Emits `price_rmv(service_id)`.
     pub fn remove_service_price(env: Env, service_id: Symbol) {
         ensure_not_paused(&env);
         require_admin(&env);
@@ -915,7 +1050,7 @@ impl Escrow {
             .persistent()
             .remove(&DataKey::ServicePrice(service_id.clone()));
         env.events()
-            .publish((symbol_short!("price_rm"),), service_id);
+            .publish((symbol_short!("price_rmv"),), service_id);
     }
 
     /// Admin sets a volume-discount tier schedule for a service.
@@ -938,12 +1073,7 @@ impl Escrow {
     /// - `threshold_requests` values must be strictly ascending (no ties).
     /// - Each `price_stroops` must be non-negative.
     pub fn set_price_tiers(env: Env, service_id: Symbol, tiers: Vec<PriceTier>) {
-        let admin: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Admin)
-            .unwrap_or_else(|| panic_with_error!(&env, EscrowError::NotInitialized));
-        admin.require_auth();
+        require_admin(&env);
         ensure_not_paused(&env);
         // Reject empty schedules.
         if tiers.is_empty() {
@@ -988,12 +1118,7 @@ impl Escrow {
     /// a no-op. Admin-gated and honours the pause gate. Emits
     /// `tiers_rm(service_id)`.
     pub fn remove_price_tiers(env: Env, service_id: Symbol) {
-        let admin: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Admin)
-            .unwrap_or_else(|| panic_with_error!(&env, EscrowError::NotInitialized));
-        admin.require_auth();
+        require_admin(&env);
         ensure_not_paused(&env);
         env.storage()
             .persistent()
@@ -1054,9 +1179,24 @@ impl Escrow {
     /// the billed amount in stroops. The settlement loop is expected to
     /// transfer the returned amount off-chain or via a paired token
     /// contract call; this contract intentionally holds no balance.
-    pub fn settle(env: Env, agent: Address, service_id: Symbol) -> i128 {
+    pub fn settle(env: Env, caller: Address, agent: Address, service_id: Symbol) -> i128 {
         ensure_not_paused(&env);
-        require_admin(&env);
+        caller.require_auth();
+        let admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, EscrowError::NotInitialized));
+        if caller != admin {
+            let meta: ServiceMetadata = env
+                .storage()
+                .persistent()
+                .get(&DataKey::ServiceMetadata(service_id.clone()))
+                .unwrap_or_else(|| panic_with_error!(&env, EscrowError::ServiceMetadataNotFound));
+            if caller != meta.owner {
+                panic_with_error!(&env, EscrowError::NotPendingAdmin);
+            }
+        }
         let usage_key = DataKey::Usage(agent.clone(), service_id.clone());
         let requests: u32 = env.storage().persistent().get(&usage_key).unwrap_or(0);
         // Use tier schedule when present; fall back to flat price.
@@ -1104,6 +1244,7 @@ impl Escrow {
     /// service in the index. In practice, only the admin can call
     /// `settle_all` for an agent whose services span multiple owners;
     /// a service owner should use `settle` for their individual service.
+    /// Panics with [`EscrowError::Unauthorized`] if the caller does not own the service.
     ///
     /// Bounds: panics with [`EscrowError::SettleAllTooLarge`] when the
     /// stored index exceeds `MAX_SETTLE_ALL`. This should never occur in
@@ -1156,7 +1297,7 @@ impl Escrow {
                         panic_with_error!(&env, EscrowError::ServiceMetadataNotFound)
                     });
                 if caller != meta.owner {
-                    panic_with_error!(&env, EscrowError::NotPendingAdmin);
+                    panic_with_error!(&env, EscrowError::Unauthorized);
                 }
             }
 
@@ -1198,11 +1339,86 @@ impl Escrow {
             .unwrap_or(0)
     }
 
+    /// Set the global minimum and maximum price bounds for `set_service_price`.
+    ///
+    /// Admin-gated. Both `min_stroops` and `max_stroops` are persisted in
+    /// `DataKey::MinServicePrice` / `DataKey::MaxServicePrice`. After this
+    /// call, any `set_service_price` invocation with a price outside
+    /// `[min_stroops, max_stroops]` is rejected with
+    /// [`EscrowError::PriceOutOfBounds`].
+    ///
+    /// # Default (unbounded) behaviour
+    ///
+    /// When no bounds have been configured, `set_service_price` applies the
+    /// implicit defaults: floor = `0`, ceiling = `i128::MAX`. Calling
+    /// `set_price_bounds(0, i128::MAX)` restores these defaults explicitly.
+    ///
+    /// # Zero-is-free semantics
+    ///
+    /// A price of `0` means "free service" — usage is still recorded but
+    /// settlement bills nothing. **If `min_stroops > 0`, free services are
+    /// forbidden**: `set_service_price(svc, 0)` will be rejected with
+    /// `PriceOutOfBounds` until the floor is lowered back to `0`. This is
+    /// intentional policy: a positive floor expresses that all services in
+    /// the band must have a non-zero cost. Admins who want to allow free
+    /// services alongside bounded paid services should keep `min_stroops = 0`.
+    ///
+    /// # Inverted-band rejection
+    ///
+    /// Panics with [`EscrowError::InvertedPriceBand`] when
+    /// `min_stroops > max_stroops` to prevent a logically impossible band
+    /// from being stored.
+    ///
+    /// Emits `bounds_set(min_stroops, max_stroops)` on success.
+    pub fn set_price_bounds(env: Env, min_stroops: i128, max_stroops: i128) {
+        require_admin(&env);
+        if min_stroops > max_stroops {
+            panic_with_error!(&env, EscrowError::InvertedPriceBand);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::MinServicePrice, &min_stroops);
+        env.storage()
+            .persistent()
+            .set(&DataKey::MaxServicePrice, &max_stroops);
+        env.events()
+            .publish((symbol_short!("bnd_set"),), (min_stroops, max_stroops));
+    }
+
+    /// Read the configured global minimum service price in stroops.
+    ///
+    /// Returns `0` (no floor) when no bounds have been configured via
+    /// [`Escrow::set_price_bounds`].
+    pub fn get_min_service_price(env: Env) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MinServicePrice)
+            .unwrap_or(0)
+    }
+
+    /// Read the configured global maximum service price in stroops.
+    ///
+    /// Returns `i128::MAX` (no ceiling) when no bounds have been configured via
+    /// [`Escrow::set_price_bounds`].
+    pub fn get_max_service_price(env: Env) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MaxServicePrice)
+            .unwrap_or(i128::MAX)
+    }
+
     /// Admin enables or disables the agent allowlist gate. While
     /// disabled, `record_usage` does not consult the per-agent entries.
+    ///
+    /// Emits a `cfg_set` event with data `(allowlist, enabled)` after the
+    /// storage write so indexers can observe every toggle on-chain.
     pub fn set_allowlist_enabled(env: Env, enabled: bool) {
         require_admin(&env);
         write_flag(&env, &DataKey::AllowlistEnabled, enabled);
+        env.events().publish(
+            (symbol_short!("cfg_set"),),
+            (symbol_short!("allowlist"), enabled),
+        );
     }
 
     /// Read the master allowlist toggle.
@@ -1238,10 +1454,41 @@ impl Escrow {
     /// Admin sets the per-call lower bound on `requests` for batched
     /// writes. Pass `0` to disable the floor.
     ///
+    /// # Invariant: `min <= max`
+    ///
+    /// Rejects a `min_requests` that exceeds the currently-stored
+    /// `MaxRequestsPerCall` (defaulting to `u32::MAX` when unset) with
+    /// [`EscrowError::InvalidRequestBounds`]. This prevents a contradictory
+    /// configuration that would make every `record_usage` call unsatisfiable —
+    /// no value could pass both the ceiling check (#8) and the floor check (#9)
+    /// simultaneously.
+    ///
+    /// `min == max` (an exact-count requirement) is explicitly allowed:
+    /// every `record_usage` call must supply precisely that many requests.
+    ///
+    /// # Setting order
+    ///
+    /// When both bounds need to change, set the ceiling first via
+    /// [`Self::set_max_requests_per_call`] and then the floor via this
+    /// entrypoint. Doing it in the reverse order risks a transient
+    /// `InvalidRequestBounds` rejection if the new floor temporarily
+    /// exceeds the old ceiling.
+    ///
     /// Emits a `cfg_set` event with data `(min_call, min_requests)` after
     /// the storage write so indexers can observe every floor change on-chain.
     pub fn set_min_requests_per_call(env: Env, min_requests: u32) {
         require_admin(&env);
+        // Cross-bound guard: reject a floor that exceeds the current ceiling.
+        // Default the ceiling to u32::MAX (no cap) when it has never been set,
+        // which means any min value is valid against an unset ceiling.
+        let current_max: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MaxRequestsPerCall)
+            .unwrap_or(u32::MAX);
+        if min_requests > current_max {
+            panic_with_error!(&env, EscrowError::InvalidRequestBounds);
+        }
         env.storage()
             .persistent()
             .set(&DataKey::MinRequestsPerCall, &min_requests);
@@ -1343,10 +1590,41 @@ impl Escrow {
     /// Admin sets the per-call upper bound on `requests` accepted by
     /// `record_usage`. Pass `u32::MAX` to effectively disable the cap.
     ///
+    /// # Invariant: `min <= max`
+    ///
+    /// Rejects a `max_requests` that is below the currently-stored
+    /// `MinRequestsPerCall` (defaulting to `0` when unset) with
+    /// [`EscrowError::InvalidRequestBounds`]. This prevents a contradictory
+    /// configuration that would make every `record_usage` call unsatisfiable —
+    /// no value could pass both the ceiling check (#8) and the floor check (#9)
+    /// simultaneously.
+    ///
+    /// `max == min` (an exact-count requirement) is explicitly allowed:
+    /// every `record_usage` call must supply precisely that many requests.
+    ///
+    /// # Setting order
+    ///
+    /// When both bounds need to change, set the ceiling first via this
+    /// entrypoint and then the floor via
+    /// [`Self::set_min_requests_per_call`]. Doing it in the reverse order
+    /// risks a transient `InvalidRequestBounds` rejection if the new floor
+    /// temporarily exceeds the old ceiling.
+    ///
     /// Emits a `cfg_set` event with data `(max_call, max_requests)` after
     /// the storage write so indexers can observe every cap change on-chain.
     pub fn set_max_requests_per_call(env: Env, max_requests: u32) {
         require_admin(&env);
+        // Cross-bound guard: reject a ceiling that falls below the current floor.
+        // Default the floor to 0 (no floor) when it has never been set, which
+        // means any max value is valid against an unset floor.
+        let current_min: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MinRequestsPerCall)
+            .unwrap_or(0);
+        if max_requests < current_min {
+            panic_with_error!(&env, EscrowError::InvalidRequestBounds);
+        }
         env.storage()
             .persistent()
             .set(&DataKey::MaxRequestsPerCall, &max_requests);
@@ -1359,9 +1637,16 @@ impl Escrow {
     /// Admin toggles strict-registration mode. When enabled,
     /// `record_usage` rejects unknown services with
     /// EscrowError::ServiceNotRegistered.
+    ///
+    /// Emits a `cfg_set` event with data `(req_reg, required)` after the
+    /// storage write so indexers can observe every toggle on-chain.
     pub fn set_require_service_registration(env: Env, required: bool) {
         require_admin(&env);
         write_flag(&env, &DataKey::RequireServiceRegistration, required);
+        env.events().publish(
+            (symbol_short!("cfg_set"),),
+            (symbol_short!("req_reg"), required),
+        );
     }
 
     /// Read the strict-registration flag.
@@ -1543,8 +1828,13 @@ impl Escrow {
     /// Transfer ownership of a service's metadata to `new_owner`,
     /// preserving the existing `description`. Authorised by `caller`,
     /// which must be the current owner OR the admin. Panics with
-    /// `ServiceMetadataNotFound` if no metadata has been set. Emits
-    /// `owner_chg(service_id, old_owner, new_owner)` for indexers.
+    /// `ServiceMetadataNotFound` if no metadata has been set,
+    /// [`EscrowError::InvalidOwnerTransfer`] if `new_owner` matches the
+    /// current owner, or [`EscrowError::Unauthorized`] if the caller is
+    /// not the owner or admin.
+    /// Emits `owner_chg(service_id, old_owner, new_owner)` for indexers
+    /// only on genuine transfers (no-op self-transfers are rejected
+    /// before any storage write or event emission).
     /// Honours the pause gate.
     pub fn transfer_service_ownership(
         env: Env,
@@ -1561,7 +1851,15 @@ impl Escrow {
             .get(&DataKey::ServiceMetadata(service_id.clone()))
             .unwrap_or_else(|| panic_with_error!(&env, EscrowError::ServiceMetadataNotFound));
         if caller != meta.owner && caller != admin {
-            panic_with_error!(&env, EscrowError::NotPendingAdmin); // reuse: unauthorized caller
+            panic_with_error!(&env, EscrowError::Unauthorized);
+        }
+        // Reject a no-op transfer to the current owner. Mirrors the
+        // `InvalidAdminProposal` guard on `propose_admin_transfer`:
+        // skipping the guard would waste a storage write and emit an
+        // `owner_chg` event whose old_owner == new_owner, misleading
+        // indexers into reporting a meaningful handover.
+        if new_owner == meta.owner {
+            panic_with_error!(&env, EscrowError::InvalidOwnerTransfer);
         }
         let old_owner = meta.owner.clone();
         meta.owner = new_owner.clone();
@@ -1683,12 +1981,7 @@ impl Escrow {
     /// - Dispute must be open: `NoOpenDispute` prevents spurious calls.
     pub fn resolve_dispute(env: Env, agent: Address, service_id: Symbol, refund_requests: u32) {
         ensure_not_paused(&env);
-        let admin: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Admin)
-            .unwrap_or_else(|| panic_with_error!(&env, EscrowError::NotInitialized));
-        admin.require_auth();
+        require_admin(&env);
         let dispute_key = DataKey::Dispute(agent.clone(), service_id.clone());
         if !read_flag(&env, &dispute_key) {
             panic_with_error!(&env, EscrowError::NoOpenDispute);

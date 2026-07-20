@@ -55,7 +55,7 @@ This project uses **append-only error codes** and **additive events**:
 #### Error codes
 
 See [`docs/escrow/errors.md`](docs/escrow/errors.md) for the full error code
-table (codes 1–17).
+table (codes 1–23).
 
 | Code | Variant | Brief description |
 |---|---|---|
@@ -64,7 +64,7 @@ table (codes 1–17).
 | 3 | `NotInitialized` | Admin-gated call before `init`. |
 | 4 | `ContractPaused` | State-changing call while paused. |
 | 5 | `NoPendingAdminTransfer` | `accept_admin_transfer` with no pending admin. |
-| 6 | `NotPendingAdmin` | Wrong caller for `accept_admin_transfer`; also unauthorized metadata caller. |
+| 6 | `NotPendingAdmin` | Wrong caller for `accept_admin_transfer`. |
 | 7 | `ServiceNotRegistered` | Unregistered service in strict mode. |
 | 8 | `RequestsExceedsMaxPerCall` | `requests` above per-call cap. |
 | 9 | `RequestsBelowMinPerCall` | `requests` below per-call floor. |
@@ -76,7 +76,12 @@ table (codes 1–17).
 | 15 | `RateLimitExceeded` | Agent exceeded per-window request cap. |
 | 16 | `BatchTooLarge` | `get_usage_batch` pair count above `MAX_BATCH_READ`. |
 | 17 | `AgentBlocked` | Agent on the per-agent blocklist. |
-
+| 18 | `AgentNotActive` | Reserved for future use. |
+| 19 | `InvalidServiceOwner` | Reserved for future use. |
+| 20 | `InvalidTransferRecipient` | Reserved for future use. |
+| 21 | `DisputeAlreadyOpen` | Reserved for future use. |
+| 22 | `RefundExceedsUsage` | Reserved for future use. |
+| 23 | `Unauthorized` | Caller is not authorized for the action (e.g. non-owner settle). |
 ---
 
 ## Contribution guidelines

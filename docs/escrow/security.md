@@ -24,15 +24,22 @@ authorization can never leave a half-applied state change.
 | `init` | the `admin` argument (once) | no |
 | `record_usage` | none (public, metered) | yes |
 | `settle` | admin | yes |
-| `set_service_price` | admin | no |
+| `set_service_price` / `remove_service_price` | admin | no |
 | `register_service` / `unregister_service` | admin | no |
+| `register_service_with_metadata` | admin | yes |
 | `set_service_disabled` | admin | no |
 | `set_service_metadata` / `clear_service_metadata` | admin | no |
 | `transfer_service_ownership` | current owner **or** admin | yes |
-| `set_agent_allowed` / `set_allowlist_enabled` | admin | no |
+| `set_agent_allowed` / `set_agent_blocked` / `set_allowlist_enabled` | admin | no |
 | `set_min_requests_per_call` / `set_max_requests_per_call` | admin | no |
+| `set_max_requests_per_window` / `set_rate_window_seconds` | admin | no |
+| `set_price_tiers` / `remove_price_tiers` | admin | yes |
+| `set_price_bounds` | admin | no |
 | `set_require_service_registration` | admin | no |
 | `pause` / `unpause` | admin | n/a |
+| `settle_all` | caller (admin or service owner) | yes |
+| `open_dispute` | agent | yes |
+| `resolve_dispute` | admin | yes |
 | `propose_admin_transfer` / `cancel_admin_transfer` | current admin | no |
 | `accept_admin_transfer` | the pending admin (caller) | no |
 | `migrate_v1_to_v2` | admin | no |

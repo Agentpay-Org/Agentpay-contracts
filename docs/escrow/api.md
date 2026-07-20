@@ -13,26 +13,37 @@ contract is paused.
 | Entrypoint | Params | Auth | Pause | Returns | Panics |
 |---|---|---|---|---|---|
 | `init` | `admin: Address` | `admin` (once) | no | — | #1 AlreadyInitialized |
-| `record_usage` | `agent, service_id, requests: u32` | none | yes | `UsageRecord` (new total) | #2, #4, #7, #8, #9, #10, #12 |
+| `record_usage` | `agent, service_id, requests: u32` | none | yes | `UsageRecord` (new total) | #2, #4, #7, #8, #9, #10, #12, #17 |
 | `settle` | `agent, service_id` | admin | yes | `i128` billed | #3, #4 |
+| `settle_all` | `agent` | caller | yes | — | #3, #4, #13, #19, #26 |
 | `set_service_price` | `service_id, price_stroops: i128` | admin | no | — | #2 (negative price), #3 |
+| `remove_service_price` | `service_id` | admin | no | — | #3 |
+| `set_price_tiers` | `service_id, tiers: Vec<PriceTier>` | admin | yes | — | #3, #18 |
+| `remove_price_tiers` | `service_id` | admin | yes | — | #3 |
 | `register_service` | `service_id` | admin | no | — | #3 |
+| `register_service_with_metadata` | `service_id, description, owner` | admin | yes | — | #3 |
 | `unregister_service` | `service_id` | admin | no | — | #3 |
 | `set_service_disabled` | `service_id, disabled: bool` | admin | no | — | #3 |
 | `set_service_metadata` | `service_id, description, owner` | admin | no | — | #3 |
 | `clear_service_metadata` | `service_id` | admin | no | — | #3 |
 | `transfer_service_ownership` | `caller, service_id, new_owner` | owner or admin | yes | — | #3, #4, #6 (unauthorized), #13 |
 | `set_agent_allowed` | `agent, allowed: bool` | admin | no | — | #3 |
+| `set_agent_blocked` | `agent, blocked: bool` | admin | no | — | #3 |
 | `set_allowlist_enabled` | `enabled: bool` | admin | no | — | #3 |
 | `set_min_requests_per_call` | `min_requests: u32` | admin | no | — | #3 |
 | `set_max_requests_per_call` | `max_requests: u32` | admin | no | — | #3 |
 | `set_require_service_registration` | `required: bool` | admin | no | — | #3 |
+| `set_max_requests_per_window` | `max: u32` | admin | no | — | #3 |
+| `set_rate_window_seconds` | `seconds: u64` | admin | no | — | #3 |
+| `set_price_bounds` | `min_stroops, max_stroops: i128` | admin | no | — | #3, #25 |
 | `pause` | — | admin | n/a | — | #3 |
 | `unpause` | — | admin | n/a | — | #3 |
 | `propose_admin_transfer` | `new_admin` | admin | no | — | #3, #14 (self-target) |
 | `cancel_admin_transfer` | — | admin | no | — | #3 |
 | `accept_admin_transfer` | `caller` | pending admin | no | — | #5, #6 |
 | `migrate_v1_to_v2` | — | admin | no | — | #3, #11 |
+| `open_dispute` | `agent, service_id` | agent | yes | — | #20 |
+| `resolve_dispute` | `agent, service_id, refund_requests: u32` | admin | yes | — | #3, #21, #22 |
 
 ## Read entrypoints (no auth, no pause)
 
@@ -40,10 +51,14 @@ contract is paused.
 `compute_billing`, `get_last_settlement`, `get_total_requests_all_time`,
 `get_total_usage_by_agent`, `get_total_settled_by_agent`,
 `get_total_settled_all_time`, `get_min_requests_per_call`,
-`get_max_requests_per_call`, `is_allowlist_enabled`, `is_agent_allowed`,
+`get_max_requests_per_call`, `get_max_requests_per_window`,
+`get_rate_window_seconds`, `get_rate_window`, `get_remaining_in_window`,
+`is_allowlist_enabled`, `is_agent_allowed`, `is_agent_blocked`,
 `is_service_registration_required`, `is_service_registered`,
 `is_service_disabled`, `is_paused`, `get_service_metadata`,
-`get_schema_version`, `version`.
+`get_price_tiers`, `get_min_service_price`, `get_max_service_price`,
+`get_usage_batch`, `get_agent_services`, `get_agent_usage_page`,
+`get_contract_config`, `get_schema_version`, `version`.
 
 `compute_billing` saturates at `i128::MAX`; `get_schema_version` defaults
 to 1 when absent; counters default to 0; flags default to `false`.
@@ -57,7 +72,7 @@ to 1 when absent; counters default to 0; flags default to `false`.
 | 3 | NotInitialized | admin-gated call before `init` | all admin entrypoints |
 | 4 | ContractPaused | called while paused | `record_usage`, `settle`, `transfer_service_ownership` |
 | 5 | NoPendingAdminTransfer | accept with nothing pending | `accept_admin_transfer` |
-| 6 | NotPendingAdmin | accept by wrong address (also reused for unauthorized ownership transfer) | `accept_admin_transfer`, `transfer_service_ownership` |
+| 6 | NotPendingAdmin | caller is not the pending admin | `accept_admin_transfer` |
 | 7 | ServiceNotRegistered | strict mode + unknown service | `record_usage` |
 | 8 | RequestsExceedsMaxPerCall | `requests > MaxRequestsPerCall` | `record_usage` |
 | 9 | RequestsBelowMinPerCall | `requests < MinRequestsPerCall` | `record_usage` |
@@ -66,6 +81,19 @@ to 1 when absent; counters default to 0; flags default to `false`.
 | 12 | ServiceDisabled | service disabled | `record_usage` |
 | 13 | ServiceMetadataNotFound | metadata-scoped call with no metadata | `transfer_service_ownership` |
 | 14 | InvalidAdminProposal | propose current admin as new admin | `propose_admin_transfer` |
+| 15 | RateLimitExceeded | per-window request cap exceeded | `record_usage` |
+| 16 | BatchTooLarge | `get_usage_batch` called with more than `MAX_BATCH_READ` pairs | `get_usage_batch` |
+| 17 | AgentBlocked | agent on blocklist (takes precedence over allowlist) | `record_usage` |
+| 18 | InvalidPriceTiers | malformed tier schedule | `set_price_tiers` |
+| 19 | SettleAllTooLarge | agent's service index exceeds `MAX_SETTLE_ALL` | `settle_all` |
+| 20 | DisputeAlreadyOpen | dispute already open for the pair | `open_dispute` |
+| 21 | NoOpenDispute | no dispute open for the pair | `resolve_dispute` |
+| 22 | RefundExceedsUsage | refund exceeds accumulated usage | `resolve_dispute` |
+| 23 | InvalidRequestBounds | min exceeds max per-call bounds | `set_min_requests_per_call`, `set_max_requests_per_call` |
+| 24 | PriceOutOfBounds | price outside configured bounds | `set_service_price` |
+| 25 | InvertedPriceBand | min price exceeds max price | `set_price_bounds` |
+| 26 | Unauthorized | caller is not the admin or authorised party | `settle_all`, `transfer_service_ownership` |
+| 27 | InvalidOwnerTransfer | new owner matches current owner | `transfer_service_ownership` |
 
 ## Versioning
 

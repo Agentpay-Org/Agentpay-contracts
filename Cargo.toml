@@ -10,3 +10,14 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = "symbols"
+
+# ── Dependency patches ────────────────────────────────────────────────────────
+#
+# ethnum v1.5.2 (pulled in by soroban-env-host v22.1.x) uses
+# `unsafe { mem::transmute(()) }` to construct a `TryFromIntError`, which
+# Rust 1.82 made a hard compile error (E0512: transmute between types of
+# different sizes).  v1.5.3 replaces that pattern with a safe alternative.
+# This patch substitutes the broken version for the fixed one without
+# requiring an upstream soroban-env-host release.
+[patch.crates-io]
+ethnum = { git = "https://github.com/nlordell/ethnum-rs", tag = "v1.5.3" }

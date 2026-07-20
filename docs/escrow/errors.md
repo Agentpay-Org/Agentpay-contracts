@@ -13,7 +13,7 @@ stable across upgrades.
 | 3 | `NotInitialized` | An admin-gated entrypoint was invoked before `init` has stored the admin address. | `record_usage`, `set_*` admin setters, `pause`, `unpause`, `accept_admin_transfer`, `propose_admin_transfer`, `migrate_v1_to_v2` |
 | 4 | `ContractPaused` | A state-changing entrypoint was called while the `Paused` flag is `true`. | `record_usage`, `set_service_metadata`, `clear_service_metadata`, `transfer_service_ownership`, `register_service`, `deregister_service`, `enable_service`, `disable_service` |
 | 5 | `NoPendingAdminTransfer` | `accept_admin_transfer` was called but no pending admin address has been stored. | `accept_admin_transfer` |
-| 6 | `NotPendingAdmin` | `accept_admin_transfer` was called by an address that does not match the stored pending admin. Also reused for unauthorized metadata callers (see note below). | `accept_admin_transfer`, `set_service_metadata`, `clear_service_metadata`, `transfer_service_ownership` |
+| 6 | `NotPendingAdmin` | `accept_admin_transfer` was called by an address that does not match the stored pending admin. | `accept_admin_transfer` |
 | 7 | `ServiceNotRegistered` | `record_usage` referenced a `service_id` that has not been registered while strict registration mode is enabled. Also raised by `get_usage_batch` for unregistered services. | `record_usage`, `get_usage_batch` |
 | 8 | `RequestsExceedsMaxPerCall` | `requests` supplied to `record_usage` exceeds the `MaxRequestsPerCall` cap (when the cap is non-zero). | `record_usage` |
 | 9 | `RequestsBelowMinPerCall` | `requests` supplied to `record_usage` is below the `MinRequestsPerCall` floor (when the floor is non-zero). | `record_usage` |
@@ -30,6 +30,11 @@ stable across upgrades.
 | 20 | `DisputeAlreadyOpen` | `open_dispute` was called but a dispute is already open for the given `(agent, service_id)`. | `open_dispute` |
 | 21 | `NoOpenDispute` | `resolve_dispute` was called but no dispute is open for the given `(agent, service_id)`. | `resolve_dispute` |
 | 22 | `RefundExceedsUsage` | `resolve_dispute` was called with `refund_requests` exceeding the current accumulated usage. | `resolve_dispute` |
+| 23 | `InvalidRequestBounds` | `set_min_requests_per_call` was called with a `min` that exceeds `MaxRequestsPerCall`, or `set_max_requests_per_call` was called with a `max` below `MinRequestsPerCall`. | `set_min_requests_per_call`, `set_max_requests_per_call` |
+| 24 | `PriceOutOfBounds` | `set_service_price` was called with a price outside the configured `[MinServicePrice, MaxServicePrice]` bounds. | `set_service_price` |
+| 25 | `InvertedPriceBand` | `set_price_bounds` was called with `min_stroops > max_stroops`. | `set_price_bounds` |
+| 26 | `Unauthorized` | An entrypoint was called by an address that is neither the contract admin nor the authorised party. | `settle`, `settle_all`, `transfer_service_ownership` |
+| 27 | `InvalidOwnerTransfer` | `transfer_service_ownership` was called with a `new_owner` that matches the current owner. | `transfer_service_ownership` |
 
 ## Notes on Overloaded Codes
 
@@ -39,11 +44,7 @@ is also raised when a price value is non-positive (zero or negative). SDK author
 should treat code 2 as "a required positive integer argument was zero or
 negative" rather than purely a request-count error.
 
-### Code 6 — `NotPendingAdmin`
-Primarily signals that the caller of `accept_admin_transfer` is not the stored
-pending admin. The same code is reused in metadata entrypoints to signal that
-the caller is not authorized (e.g. not the service owner or admin). Off-chain
-tools should read the call context to disambiguate the two uses.
+
 
 ## Conventions for Future Codes
 

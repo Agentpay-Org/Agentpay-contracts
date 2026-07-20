@@ -25,7 +25,7 @@ The Rust toolchain is pinned via `rust-toolchain.toml` (stable channel with `was
 ## Documentation
 
 - [CHANGELOG](CHANGELOG.md) — versioned history of entrypoints, events, and error codes; contribution conventions.
-- [EscrowError code table](docs/escrow/errors.md) — full reference for all 17 error codes: trigger conditions, overloaded codes, and the entrypoints that raise each code.
+- [EscrowError code table](docs/escrow/errors.md) — full reference for all 23 error codes: trigger conditions, overloaded codes, and the entrypoints that raise each code.
 
 ### Service ownership handover
 
@@ -41,6 +41,21 @@ A service's metadata (`description` + `owner`) and its registration flag live in
 independent storage slots. `clear_service_metadata` (admin-gated, idempotent)
 removes only the metadata; the registration flag and per-(agent, service) usage
 history are untouched.
+
+### Service price removal: zero vs. removed
+
+`set_service_price(service_id, 0)` and `remove_service_price(service_id)` both
+make `get_service_price(service_id)` and `compute_billing(agent, service_id)`
+read back `0`, but they are not identical:
+
+- `set_service_price(_, 0)` stores an explicit zero price in `DataKey::ServicePrice`
+- `remove_service_price(_)` removes the price slot entirely, reclaiming storage
+- `remove_service_price(_)` also emits `price_rmv(service_id)` so indexers can
+  distinguish a removal from a write-to-zero
+
+Use removal when a service is being retired or reset to a truly unpriced state;
+use `0` only when you intentionally want to keep an explicit free-service price
+record on chain.
 
 ### Admin proposal validation
 
@@ -80,6 +95,49 @@ are never reset or decremented by later `settle` calls. They default to `0`
 before the first billable settlement, so dashboards can read them without
 special-casing new agents or fresh deployments.
 
+### Per-call request bounds: `min ≤ max` invariant
+
+`record_usage` enforces an inclusive per-call floor and ceiling on the `requests`
+argument via two admin settings:
+
+- `set_min_requests_per_call(min)` — floor; `record_usage` rejects values below
+  this with `RequestsBelowMinPerCall` (#9). Defaults to `0` (no floor).
+- `set_max_requests_per_call(max)` — ceiling; `record_usage` rejects values
+  above this with `RequestsExceedsMaxPerCall` (#8). Defaults to `u32::MAX` (no
+  cap).
+
+#### Consistency guard: `InvalidRequestBounds` (#23)
+
+Both setters enforce the invariant **`min ≤ max`** at write time:
+
+- `set_min_requests_per_call(min)` rejects a `min` that exceeds the
+  currently-stored `MaxRequestsPerCall` (defaulting to `u32::MAX`).
+- `set_max_requests_per_call(max)` rejects a `max` that falls below the
+  currently-stored `MinRequestsPerCall` (defaulting to `0`).
+
+A contradictory range (`min > max`) would make every `record_usage` call
+unsatisfiable — any supplied value would trip either #8 or #9 — silently
+bricking metering until an operator noticed and corrected the configuration.
+The cross-bound check prevents this state from ever being stored.
+
+`min == max` is explicitly allowed and enforces an **exact per-call request
+count**: every `record_usage` call must supply precisely that many requests.
+This is useful for forcing callers to bundle a fixed number of requests per
+write to amortise per-transaction ledger costs.
+
+#### Recommended operator ordering
+
+When both bounds need to change, set the **ceiling first** and then the
+**floor**:
+
+```
+set_max_requests_per_call(new_max);  // step 1: raise or set ceiling
+set_min_requests_per_call(new_min);  // step 2: set floor (checked against new_max)
+```
+
+Setting the floor first risks a transient `InvalidRequestBounds` rejection if
+the new floor temporarily exceeds the old (not-yet-updated) ceiling.
+
 ### Per-agent rate limiting (fixed window)
 
 `record_usage` supports an optional per-agent rate limit anchored to
@@ -112,6 +170,16 @@ The configured cap and window length are **not** changed — only the agent's
 accumulated count for the current window is cleared.
 
 Emits a `rate_rst(agent)` event so the override is auditable.
+#### Reading Rate-Window State
+
+To inspect an agent's current rate-limit state without triggering a new request:
+
+- `get_rate_window(env, agent)` — returns `(window_start, count)` (the raw stored state).
+- `get_remaining_in_window(env, agent)` — returns the remaining capacity as a `u32`,
+  accounting for window expiration. Returns the full cap if the window has
+  expired or the rate limiter is disabled.
+
+Both are **pure reads** and do not mutate state or roll the window forward.
 
 ### Schema version: fresh v2 init vs. legacy v1→v2 migration
 
@@ -145,6 +213,89 @@ The struct fields and their defaults when the storage slot is absent:
 The per-field getters remain available and always return values identical to
 the corresponding fields in this struct. `ContractConfig` is a convenience
 snapshot only and does not replace any existing getter.
+### Configuration-change events: `cfg_set`
+
+Every rate-limit and per-call bound setter publishes a `cfg_set` event
+after the storage write succeeds, so indexers and security monitors can
+observe policy changes on-chain instead of only inferring them from
+storage diffs. All six setters share one decodable schema: topic
+`(symbol_short!("cfg_set"),)`, data `(name: Symbol, value)`.
+
+| Setter | `name` | `value` type |
+|---|---|---|
+| `set_max_requests_per_call` | `max_call` | `u32` |
+| `set_min_requests_per_call` | `min_call` | `u32` |
+| `set_max_requests_per_window` | `max_win` | `u32` |
+| `set_rate_window_seconds` | `win_sec` | `u64` |
+| `set_allowlist_enabled` | `allowlist` | `bool` |
+| `set_require_service_registration` | `req_reg` | `bool` |
+
+A single subscriber can decode every config event with one schema:
+match on the first tuple element (`Symbol`) to route to the right
+handler, then decode the second element as `u32`, `u64`, or `bool`
+per the table above.
+
+Notes:
+- Events fire even when the new value equals the current stored value
+  — setters are not short-circuited by an equality check, so every
+  call is observable.
+- This is purely additive: `price_set`, `paused`, and all other
+  existing event payloads are unchanged.
+- Events expose no more information than was already readable via the
+  corresponding getter (`get_max_requests_per_call`,
+  `is_allowlist_enabled`, etc.) — `cfg_set` only makes an existing,
+  publicly-readable state change observable in real time.
+
+### Global price bounds for `set_service_price`
+
+Admins can configure a global **price band** `[min_stroops, max_stroops]`
+that every subsequent `set_service_price` call must respect.  By default the
+band is unbounded (`0` to `i128::MAX`), so existing behaviour is unchanged.
+
+#### Entrypoints
+
+| Entrypoint | Signature | Description |
+|---|---|---|
+| `set_price_bounds` | `(min_stroops: i128, max_stroops: i128)` | Admin-gated. Persist the floor and ceiling. Emits `bnd_set(min, max)`. |
+| `get_min_service_price` | `() → i128` | Read the floor; returns `0` if never set. |
+| `get_max_service_price` | `() → i128` | Read the ceiling; returns `i128::MAX` if never set. |
+
+#### How the check works
+
+After passing the existing negative-price gate and the registration/disabled
+gates, `set_service_price` reads `MinServicePrice` (default `0`) and
+`MaxServicePrice` (default `i128::MAX`) and rejects any price outside
+`[floor, ceiling]` with `PriceOutOfBounds` (#23).
+
+#### Zero-is-free semantics
+
+A price of `0` means **free service** — usage is still recorded but settlement
+bills nothing.  The price bounds interact with this as follows:
+
+- When `min_stroops == 0` (the default), a zero price is permitted as usual.
+- When `min_stroops > 0`, free services are **explicitly forbidden**:
+  `set_service_price(svc, 0)` is rejected with `PriceOutOfBounds` until the
+  floor is lowered back to `0`.
+
+This is intentional policy: a positive floor expresses that all services in
+the band must have a non-zero cost.  Admins who want to allow free services
+alongside bounded paid services should keep `min_stroops = 0`.
+
+#### Error codes (new, append-only)
+
+| Code | Variant | Trigger |
+|---|---|---|
+| `#23` | `PriceOutOfBounds` | `set_service_price` price falls outside `[floor, ceiling]`. |
+| `#24` | `InvertedPriceBand` | `set_price_bounds` called with `min_stroops > max_stroops`. |
+
+#### Security
+
+- `set_price_bounds` is admin-gated: a non-admin call panics with
+  Soroban's host auth error before any storage is touched.
+- `get_min_service_price` / `get_max_service_price` are pure reads (no auth
+  required), so dashboards can query the current band without signing.
+- An inverted band (`min > max`) is rejected immediately, so the stored
+  bounds are always a valid interval `min ≤ max`.
 
 ## Prerequisites
 
@@ -244,7 +395,8 @@ Auth is checked at **step 0**, before the pause gate:
 | 4    | `requests < min`       | `#9 RequestsBelowMinPerCall`   |
 | 5    | Service not registered | `#7 ServiceNotRegistered`      |
 | 6    | Service disabled       | `#12 ServiceDisabled`          |
-| 7    | Agent not allowed      | `#10 AgentNotAllowed`          |
+| 7    | Agent on blocklist     | `#17 AgentBlocked`             |
+| 8    | Agent not allowed      | `#10 AgentNotAllowed`          |
 
 #### Operator override (metering loop migration)
 
