@@ -1983,7 +1983,7 @@ impl Escrow {
     /// transaction.
     ///
     /// Accepts a bounded `Vec<Symbol>` of service ids. For each service:
-    /// - Panics with [`EscrowError::NoOpenDispute`] when no dispute is open.
+    /// - Skips the service if no dispute is open (no-op).
     /// - Reads the current accumulated usage and uses that as the refund
     ///   amount (the counter is then reset to zero).
     /// - Clears the dispute flag.
@@ -2001,7 +2001,7 @@ impl Escrow {
         for service_id in services.iter() {
             let dispute_key = DataKey::Dispute(agent.clone(), service_id.clone());
             if !read_flag(&env, &dispute_key) {
-                panic_with_error!(&env, EscrowError::NoOpenDispute);
+                continue;
             }
             let usage_key = DataKey::Usage(agent.clone(), service_id.clone());
             let current: u32 = env.storage().persistent().get(&usage_key).unwrap_or(0);
@@ -2011,7 +2011,7 @@ impl Escrow {
             write_flag(&env, &dispute_key, false);
             env.events().publish(
                 (symbol_short!("dispute"),),
-                (symbol_short!("resolve"), agent.clone(), service_id, current),
+                (symbol_short!("resolve"), agent.clone(), service_id.clone(), current),
             );
         }
     }

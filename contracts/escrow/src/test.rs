@@ -4215,7 +4215,7 @@ fn test_consistent_bounds_never_brick_metering() {
 //   4. Event payload carries "resolve", agent, service_id, and the refunded
 //      amount (= the full usage before zeroing)
 //   5. Oversized batch (exceeds MAX_BATCH_READ) → BatchTooLarge (#16)
-//   6. Service with no open dispute → NoOpenDispute (#21)
+//   6. Service with no open dispute → silently skipped
 //   7. Contract paused → ContractPaused (#4)
 //   8. Non-admin caller → Unauthorized
 //   9. Service with zero usage: still clears dispute, refunds 0
@@ -4368,11 +4368,9 @@ fn test_refund_batch_oversized_panics() {
     client.refund_batch(&agent, &services);
 }
 
-/// refund_batch panics with NoOpenDispute (#21) when a service has no
-/// open dispute.
+/// refund_batch silently skips services without an open dispute.
 #[test]
-#[should_panic(expected = "Error(Contract, #21)")]
-fn test_refund_batch_no_open_dispute_panics() {
+fn test_refund_batch_no_open_dispute_skips_silently() {
     let env = Env::default();
     let (client, admin) = setup_initialized(&env);
     let agent = make_agent(&env);
@@ -4384,13 +4382,15 @@ fn test_refund_batch_no_open_dispute_panics() {
     let mut services: Vec<Symbol> = Vec::new(&env);
     services.push_back(svc.clone());
     client.refund_batch(&agent, &services);
+
+    // Service without dispute is untouched.
+    assert_eq!(client.get_usage(&agent, &svc), 50);
+    assert!(!client.has_open_dispute(&agent, &svc));
 }
 
-/// refund_batch panics with NoOpenDispute (#21) at the first service without
-/// a dispute; prior services must have their dispute open.
+/// refund_batch skips services without a dispute and processes the rest.
 #[test]
-#[should_panic(expected = "Error(Contract, #21)")]
-fn test_refund_batch_partial_failure_no_dispute() {
+fn test_refund_batch_skips_missing_disputes() {
     let env = Env::default();
     let (client, admin) = setup_initialized(&env);
     let agent = make_agent(&env);
@@ -4401,9 +4401,17 @@ fn test_refund_batch_partial_failure_no_dispute() {
     open_dispute_with_usage(&client, &agent, &svc_b, 100);
 
     let mut services: Vec<Symbol> = Vec::new(&env);
-    services.push_back(svc_a.clone()); // no dispute → #21
+    services.push_back(svc_a.clone());
     services.push_back(svc_b.clone());
     client.refund_batch(&agent, &services);
+
+    // svc_a (no dispute) is untouched.
+    assert_eq!(client.get_usage(&agent, &svc_a), 0);
+    assert!(!client.has_open_dispute(&agent, &svc_a));
+
+    // svc_b (had dispute) is resolved.
+    assert_eq!(client.get_usage(&agent, &svc_b), 0);
+    assert!(!client.has_open_dispute(&agent, &svc_b));
 }
 
 /// refund_batch panics with ContractPaused (#4) when the contract is paused.
