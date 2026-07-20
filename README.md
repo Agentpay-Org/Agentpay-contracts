@@ -8,12 +8,12 @@ Soroban smart contracts for the AgentPay protocol: escrow, usage recording, and 
 
 Every push and pull request runs the following gates automatically:
 
-| Step | Command |
-|------|---------|
-| Formatting | `cargo fmt --all -- --check` |
-| Linting | `cargo clippy --all-targets -- -D warnings` |
-| Build | `cargo build` |
-| Tests | `cargo test` |
+| Step       | Command                                                 |
+| ---------- | ------------------------------------------------------- |
+| Formatting | `cargo fmt --all -- --check`                            |
+| Linting    | `cargo clippy --all-targets -- -D warnings`             |
+| Build      | `cargo build`                                           |
+| Tests      | `cargo test`                                            |
 | Wasm build | `cargo build --target wasm32-unknown-unknown --release` |
 
 The Rust toolchain is pinned via `rust-toolchain.toml` (stable channel with `wasm32-unknown-unknown` target). Cargo registry and build artefacts are cached between runs to keep CI fast.
@@ -62,6 +62,7 @@ record on chain.
 `propose_admin_transfer` rejects proposing the current admin as the new admin
 (panics with `InvalidAdminProposal`). This surfaces no-op handovers as caller
 mistakes rather than silently storing a pending entry equal to the active admin.
+
 ### Correction flow: `decrement_usage`
 
 When a metering client over-reports (e.g. double-counts a batch), the
@@ -80,6 +81,18 @@ analytics; correcting the per-pair balance should not retroactively distort
 the lifetime signal. Off-chain billing pipelines that need the corrected
 view should subtract the decrement event amount from the lifetime counter
 when processing the `usage_dec` event.
+
+### Prepaid agent credits
+
+Agents can now be funded with prepaid credit balances via `credit_agent(agent, amount)`.
+The balance is stored in stroops and is drawn down by `settle` as usage is
+settled. `record_usage` rejects a write when the prepaid balance cannot cover
+that service's projected bill for the updated usage total, so prepaid accounts
+can enforce solvency before work is accepted.
+
+`get_agent_credit(agent)` reads the current balance. A successful settlement
+emits `credit_debited(agent, debit, new_balance)` so off-chain systems can
+track balance consumption in real time.
 
 ### Lifetime settled-amount counters
 
@@ -198,21 +211,22 @@ other fields carry their defaults).
 
 The struct fields and their defaults when the storage slot is absent:
 
-| Field | Type | Default | Individual getter |
-|---|---|---|---|
-| `paused` | `bool` | `false` | `is_paused` |
-| `allowlist_enabled` | `bool` | `false` | `is_allowlist_enabled` |
-| `require_service_registration` | `bool` | `false` | `is_service_registration_required` |
-| `max_requests_per_call` | `u32` | `u32::MAX` (no cap) | `get_max_requests_per_call` |
-| `min_requests_per_call` | `u32` | `0` (no floor) | `get_min_requests_per_call` |
-| `max_requests_per_window` | `u32` | `0` (disabled) | `get_max_requests_per_window` |
-| `window_seconds` | `u64` | `0` (disabled) | `get_rate_window_seconds` |
-| `schema_version` | `u32` | `1` (pre-migration) | `get_schema_version` |
-| `admin` | `Option<Address>` | `None` | `get_admin` |
+| Field                          | Type              | Default             | Individual getter                  |
+| ------------------------------ | ----------------- | ------------------- | ---------------------------------- |
+| `paused`                       | `bool`            | `false`             | `is_paused`                        |
+| `allowlist_enabled`            | `bool`            | `false`             | `is_allowlist_enabled`             |
+| `require_service_registration` | `bool`            | `false`             | `is_service_registration_required` |
+| `max_requests_per_call`        | `u32`             | `u32::MAX` (no cap) | `get_max_requests_per_call`        |
+| `min_requests_per_call`        | `u32`             | `0` (no floor)      | `get_min_requests_per_call`        |
+| `max_requests_per_window`      | `u32`             | `0` (disabled)      | `get_max_requests_per_window`      |
+| `window_seconds`               | `u64`             | `0` (disabled)      | `get_rate_window_seconds`          |
+| `schema_version`               | `u32`             | `1` (pre-migration) | `get_schema_version`               |
+| `admin`                        | `Option<Address>` | `None`              | `get_admin`                        |
 
 The per-field getters remain available and always return values identical to
 the corresponding fields in this struct. `ContractConfig` is a convenience
 snapshot only and does not replace any existing getter.
+
 ### Configuration-change events: `cfg_set`
 
 Every rate-limit and per-call bound setter publishes a `cfg_set` event
@@ -221,14 +235,14 @@ observe policy changes on-chain instead of only inferring them from
 storage diffs. All six setters share one decodable schema: topic
 `(symbol_short!("cfg_set"),)`, data `(name: Symbol, value)`.
 
-| Setter | `name` | `value` type |
-|---|---|---|
-| `set_max_requests_per_call` | `max_call` | `u32` |
-| `set_min_requests_per_call` | `min_call` | `u32` |
-| `set_max_requests_per_window` | `max_win` | `u32` |
-| `set_rate_window_seconds` | `win_sec` | `u64` |
-| `set_allowlist_enabled` | `allowlist` | `bool` |
-| `set_require_service_registration` | `req_reg` | `bool` |
+| Setter                             | `name`      | `value` type |
+| ---------------------------------- | ----------- | ------------ |
+| `set_max_requests_per_call`        | `max_call`  | `u32`        |
+| `set_min_requests_per_call`        | `min_call`  | `u32`        |
+| `set_max_requests_per_window`      | `max_win`   | `u32`        |
+| `set_rate_window_seconds`          | `win_sec`   | `u64`        |
+| `set_allowlist_enabled`            | `allowlist` | `bool`       |
+| `set_require_service_registration` | `req_reg`   | `bool`       |
 
 A single subscriber can decode every config event with one schema:
 match on the first tuple element (`Symbol`) to route to the right
@@ -236,6 +250,7 @@ handler, then decode the second element as `u32`, `u64`, or `bool`
 per the table above.
 
 Notes:
+
 - Events fire even when the new value equals the current stored value
   — setters are not short-circuited by an equality check, so every
   call is observable.
@@ -249,16 +264,16 @@ Notes:
 ### Global price bounds for `set_service_price`
 
 Admins can configure a global **price band** `[min_stroops, max_stroops]`
-that every subsequent `set_service_price` call must respect.  By default the
+that every subsequent `set_service_price` call must respect. By default the
 band is unbounded (`0` to `i128::MAX`), so existing behaviour is unchanged.
 
 #### Entrypoints
 
-| Entrypoint | Signature | Description |
-|---|---|---|
-| `set_price_bounds` | `(min_stroops: i128, max_stroops: i128)` | Admin-gated. Persist the floor and ceiling. Emits `bnd_set(min, max)`. |
-| `get_min_service_price` | `() → i128` | Read the floor; returns `0` if never set. |
-| `get_max_service_price` | `() → i128` | Read the ceiling; returns `i128::MAX` if never set. |
+| Entrypoint              | Signature                                | Description                                                            |
+| ----------------------- | ---------------------------------------- | ---------------------------------------------------------------------- |
+| `set_price_bounds`      | `(min_stroops: i128, max_stroops: i128)` | Admin-gated. Persist the floor and ceiling. Emits `bnd_set(min, max)`. |
+| `get_min_service_price` | `() → i128`                              | Read the floor; returns `0` if never set.                              |
+| `get_max_service_price` | `() → i128`                              | Read the ceiling; returns `i128::MAX` if never set.                    |
 
 #### How the check works
 
@@ -270,7 +285,7 @@ gates, `set_service_price` reads `MinServicePrice` (default `0`) and
 #### Zero-is-free semantics
 
 A price of `0` means **free service** — usage is still recorded but settlement
-bills nothing.  The price bounds interact with this as follows:
+bills nothing. The price bounds interact with this as follows:
 
 - When `min_stroops == 0` (the default), a zero price is permitted as usual.
 - When `min_stroops > 0`, free services are **explicitly forbidden**:
@@ -278,14 +293,14 @@ bills nothing.  The price bounds interact with this as follows:
   floor is lowered back to `0`.
 
 This is intentional policy: a positive floor expresses that all services in
-the band must have a non-zero cost.  Admins who want to allow free services
+the band must have a non-zero cost. Admins who want to allow free services
 alongside bounded paid services should keep `min_stroops = 0`.
 
 #### Error codes (new, append-only)
 
-| Code | Variant | Trigger |
-|---|---|---|
-| `#23` | `PriceOutOfBounds` | `set_service_price` price falls outside `[floor, ceiling]`. |
+| Code  | Variant             | Trigger                                                     |
+| ----- | ------------------- | ----------------------------------------------------------- |
+| `#23` | `PriceOutOfBounds`  | `set_service_price` price falls outside `[floor, ceiling]`. |
 | `#24` | `InvertedPriceBand` | `set_price_bounds` called with `min_stroops > max_stroops`. |
 
 #### Security

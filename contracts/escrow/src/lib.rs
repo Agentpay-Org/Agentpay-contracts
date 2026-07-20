@@ -100,6 +100,10 @@ pub enum DataKey {
     /// Per-agent allowlist flag. When `AllowlistEnabled` is true,
     /// `record_usage` rejects agents whose entry is absent or false.
     AgentAllowed(Address),
+    /// Prepaid credit balance for an agent, in stroops. Settlement draws
+    /// down this balance; `record_usage` rejects a call when the balance is
+    /// insufficient for the bill that will be settled for the new total.
+    AgentCredit(Address),
     /// Master toggle: when true, the per-agent allowlist is enforced.
     AllowlistEnabled,
     /// Cross-service total request count for a given agent.
@@ -269,6 +273,10 @@ pub enum EscrowError {
     /// the existing `InvalidAdminProposal` guard on
     /// `propose_admin_transfer`.
     InvalidOwnerTransfer = 27,
+    /// `record_usage` was called for an agent whose prepaid credit balance is
+    /// insufficient to cover the bill that would be settled for the updated
+    /// usage total.
+    InsufficientCreditBalance = 28,
 }
 
 #[contracttype]
@@ -379,6 +387,35 @@ fn read_usage(env: &Env, agent: &Address, service_id: &Symbol) -> u32 {
         .persistent()
         .get(&DataKey::Usage(agent.clone(), service_id.clone()))
         .unwrap_or(0)
+}
+
+/// Read an agent's prepaid credit balance in stroops.
+/// Returns `0` when no credit balance has been recorded.
+fn read_agent_credit(env: &Env, agent: &Address) -> i128 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::AgentCredit(agent.clone()))
+        .unwrap_or(0)
+}
+
+/// Compute the bill for a given service and request total using the configured
+/// flat price or tier schedule. This is shared by `record_usage`, `settle`,
+/// and the public `compute_billing` read.
+fn compute_billing_for_requests(env: &Env, service_id: &Symbol, requests: u32) -> i128 {
+    if let Some(tiers) = env
+        .storage()
+        .persistent()
+        .get::<DataKey, Vec<PriceTier>>(&DataKey::PriceTiers(service_id.clone()))
+    {
+        compute_billing_tiered(requests, &tiers)
+    } else {
+        let price: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ServicePrice(service_id.clone()))
+            .unwrap_or(0);
+        (requests as i128).saturating_mul(price)
+    }
 }
 
 /// Add `service_id` to the per-agent service index if not already present.
@@ -660,8 +697,15 @@ impl Escrow {
 
         let key = DataKey::Usage(agent.clone(), service_id.clone());
         let prev: u32 = env.storage().persistent().get(&key).unwrap_or(0);
-        // saturate: settlement drains long before u32::MAX; never panic the hot path.
         let total = prev.saturating_add(requests);
+        let credit_balance = read_agent_credit(&env, &agent);
+        if credit_balance > 0 {
+            let projected_bill = compute_billing_for_requests(&env, &service_id, total);
+            if projected_bill > credit_balance {
+                panic_with_error!(&env, EscrowError::InsufficientCreditBalance);
+            }
+        }
+        // saturate: settlement drains long before u32::MAX; never panic the hot path.
         env.storage().persistent().set(&key, &total);
 
         // Maintain per-agent service index. index_agent_service is idempotent
@@ -779,6 +823,29 @@ impl Escrow {
         env.storage()
             .persistent()
             .get(&DataKey::LastSettlement(agent, service_id))
+    }
+
+    /// Credit an agent with prepaid balance in stroops.
+    ///
+    /// Admin-gated and pause-respecting. The balance is drawn down by
+    /// `settle` when a bill is successfully settled and is used by
+    /// `record_usage` to prevent usage from being accepted when the
+    /// prepaid balance is insufficient for the bill that would be settled.
+    pub fn credit_agent(env: Env, agent: Address, amount: i128) {
+        ensure_not_paused(&env);
+        require_admin(&env);
+        if amount <= 0 {
+            panic_with_error!(&env, EscrowError::RequestsMustBePositive);
+        }
+        let current = read_agent_credit(&env, &agent);
+        env.storage()
+            .persistent()
+            .set(&DataKey::AgentCredit(agent), &current.saturating_add(amount));
+    }
+
+    /// Read an agent's prepaid credit balance in stroops.
+    pub fn get_agent_credit(env: Env, agent: Address) -> i128 {
+        read_agent_credit(&env, &agent)
     }
 
     /// Read the protocol-wide lifetime request counter (u64).
@@ -1153,23 +1220,7 @@ impl Escrow {
             .persistent()
             .get(&DataKey::Usage(agent, service_id.clone()))
             .unwrap_or(0);
-        // Use tier schedule when present; fall back to flat price.
-        if let Some(tiers) = env
-            .storage()
-            .persistent()
-            .get::<DataKey, Vec<PriceTier>>(&DataKey::PriceTiers(service_id.clone()))
-        {
-            compute_billing_tiered(requests, &tiers)
-        } else {
-            let price: i128 = env
-                .storage()
-                .persistent()
-                .get(&DataKey::ServicePrice(service_id))
-                .unwrap_or(0);
-            // saturate: read/settle path returns a sentinel-large value rather than
-            // panicking; off-chain loop treats saturation as an error signal.
-            (requests as i128).saturating_mul(price)
-        }
+        compute_billing_for_requests(&env, &service_id, requests)
     }
 
     /// Settle the accumulated usage for an `(agent, service_id)` pair.
@@ -1200,22 +1251,19 @@ impl Escrow {
         let usage_key = DataKey::Usage(agent.clone(), service_id.clone());
         let requests: u32 = env.storage().persistent().get(&usage_key).unwrap_or(0);
         // Use tier schedule when present; fall back to flat price.
-        let billed = if let Some(tiers) = env
-            .storage()
-            .persistent()
-            .get::<DataKey, Vec<PriceTier>>(&DataKey::PriceTiers(service_id.clone()))
-        {
-            compute_billing_tiered(requests, &tiers)
-        } else {
-            let price: i128 = env
-                .storage()
+        let billed = compute_billing_for_requests(&env, &service_id, requests);
+        let credit_balance = read_agent_credit(&env, &agent);
+        if billed > 0 && credit_balance > 0 {
+            let debit = billed.min(credit_balance);
+            let new_balance = credit_balance.saturating_sub(debit);
+            env.storage()
                 .persistent()
-                .get(&DataKey::ServicePrice(service_id.clone()))
-                .unwrap_or(0);
-            // saturate: read/settle path returns a sentinel-large value rather than
-            // panicking; off-chain loop treats saturation as an error signal.
-            (requests as i128).saturating_mul(price)
-        };
+                .set(&DataKey::AgentCredit(agent.clone()), &new_balance);
+            env.events().publish(
+                (symbol_short!("credit_debited"),),
+                (agent.clone(), debit, new_balance),
+            );
+        }
         add_settled_totals(&env, &agent, billed);
         env.storage().persistent().set(&usage_key, &0u32);
         // Prune the service from the agent's index since usage is now zero.
