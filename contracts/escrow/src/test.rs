@@ -495,6 +495,48 @@ fn test_compute_billing_basic() {
     client.record_usage(&agent, &svc, &42u32);
     assert_eq!(client.compute_billing(&agent, &svc), 420i128);
 }
+
+#[test]
+fn test_credit_agent_and_settle_draws_down_balance() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "infer");
+    client.set_service_price(&svc, &10i128);
+    client.credit_agent(&agent, &50i128);
+
+    client.record_usage(&agent, &svc, &3u32);
+    let billed = client.settle(&admin, &agent, &svc);
+
+    assert_eq!(billed, 30i128);
+    assert_eq!(client.get_agent_credit(&agent), 20i128);
+    assert_eq!(client.get_usage(&agent, &svc), 0);
+
+    let events = env.events().all();
+    assert!(!events.is_empty());
+    let (_addr, topics, data) = events.last().unwrap();
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("credit_debited"),).into_val(&env);
+    assert_eq!(topics, expected_topics);
+    let decoded: (Address, i128, i128) = data.into_val(&env);
+    assert_eq!(decoded, (agent.clone(), 30i128, 20i128));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #28)")]
+fn test_record_usage_rejects_insufficient_credit_balance() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "infer");
+    client.set_service_price(&svc, &10i128);
+    client.credit_agent(&agent, &20i128);
+
+    client.record_usage(&agent, &svc, &3u32);
+}
+
 #[test]
 fn test_decrement_usage_basic() {
     let env = Env::default();
