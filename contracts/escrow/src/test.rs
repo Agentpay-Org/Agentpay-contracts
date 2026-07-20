@@ -3,8 +3,6 @@
 #![allow(unused_variables)]
 #![allow(dead_code)]
 
-extern crate alloc;
-
 //! # Escrow contract test suite
 //!
 //! ## Test-harness conventions
@@ -58,6 +56,8 @@ extern crate alloc;
 //! verify that auth *is* enforced, use `setup_scoped_auth` or call
 //! `env.set_auths(&[])` to drop mock authorisations before the call under
 //! test.
+extern crate alloc;
+
 use super::*;
 use soroban_sdk::{
     testutils::{Address as _, Events, Ledger, MockAuth, MockAuthInvoke},
