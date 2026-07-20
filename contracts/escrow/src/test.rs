@@ -1759,6 +1759,62 @@ fn test_resolve_dispute_panics_not_initialized_before_init() {
     let agent = Address::generate(&env);
     client.resolve_dispute(&agent, &Symbol::new(&env, "infer"), &0u32);
 }
+
+#[test]
+fn test_list_open_disputes_returns_empty_for_agent_without_disputes() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "svc_a");
+    client.record_usage(&agent, &svc, &4u32);
+
+    let disputes = client.list_open_disputes(&agent);
+    assert_eq!(disputes.len(), 0);
+}
+
+#[test]
+fn test_list_open_disputes_returns_single_service() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "svc_a");
+    client.record_usage(&agent, &svc, &4u32);
+    client.open_dispute(&agent, &svc);
+
+    let disputes = client.list_open_disputes(&agent);
+    assert_eq!(disputes.len(), 1);
+    assert_eq!(disputes.get(0), Some(svc.clone()));
+}
+
+#[test]
+fn test_list_open_disputes_is_bounded_by_batch_limit() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+
+    let agent = Address::generate(&env);
+    let mut expected: Vec<Symbol> = Vec::new(&env);
+
+    for i in 0..(MAX_BATCH_READ + 5) {
+        let name = format!("svc_{i}");
+        let service_id = Symbol::new(&env, &name);
+        client.record_usage(&agent, &service_id, &1u32);
+        if i < MAX_BATCH_READ {
+            expected.push_back(service_id.clone());
+        }
+        if i < MAX_BATCH_READ {
+            client.open_dispute(&agent, &service_id);
+        }
+    }
+
+    let disputes = client.list_open_disputes(&agent);
+    assert_eq!(disputes.len(), MAX_BATCH_READ as u32);
+    for i in 0..MAX_BATCH_READ {
+        assert_eq!(disputes.get(i), expected.get(i));
+    }
+}
+
 #[test]
 fn test_get_usage_batch_preserves_order() {
     let env = Env::default();

@@ -59,7 +59,8 @@ contract is paused.
 `is_service_disabled`, `is_paused`, `get_service_metadata`,
 `get_price_tiers`, `get_min_service_price`, `get_max_service_price`,
 `get_usage_batch`, `get_agent_services`, `get_agent_usage_page`,
-`get_contract_config`, `get_schema_version`, `version`.
+`has_open_dispute`, `list_open_disputes`, `get_contract_config`,
+`get_schema_version`, `version`.
 
 `compute_billing` saturates at `i128::MAX`; `get_schema_version` defaults
 to 1 when absent; counters default to 0; flags default to `false`.
