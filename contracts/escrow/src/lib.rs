@@ -838,9 +838,10 @@ impl Escrow {
             panic_with_error!(&env, EscrowError::RequestsMustBePositive);
         }
         let current = read_agent_credit(&env, &agent);
-        env.storage()
-            .persistent()
-            .set(&DataKey::AgentCredit(agent), &current.saturating_add(amount));
+        env.storage().persistent().set(
+            &DataKey::AgentCredit(agent),
+            &current.saturating_add(amount),
+        );
     }
 
     /// Read an agent's prepaid credit balance in stroops.
@@ -1260,7 +1261,7 @@ impl Escrow {
                 .persistent()
                 .set(&DataKey::AgentCredit(agent.clone()), &new_balance);
             env.events().publish(
-                (symbol_short!("credit_debited"),),
+                (symbol_short!("cred_deb"),),
                 (agent.clone(), debit, new_balance),
             );
         }
@@ -2110,7 +2111,12 @@ impl Escrow {
             write_flag(&env, &dispute_key, false);
             env.events().publish(
                 (symbol_short!("dispute"),),
-                (symbol_short!("resolve"), agent.clone(), service_id.clone(), current),
+                (
+                    symbol_short!("resolve"),
+                    agent.clone(),
+                    service_id.clone(),
+                    current,
+                ),
             );
         }
     }

@@ -76,6 +76,31 @@ use soroban_sdk::{
 /// **Note on agent auth**: After adding `agent.require_auth()` to `record_usage`,
 /// `mock_all_auths()` will satisfy agent auth checks for any agent address,
 /// allowing the existing test suite to continue working without modification.
+/// Build a `svc_<n>` name without `format!` (the crate is `no_std`).
+fn svc_name(buf: &mut [u8; 8], i: u32) -> &str {
+    buf[0] = b's';
+    buf[1] = b'v';
+    buf[2] = b'c';
+    buf[3] = b'_';
+    let mut n = i;
+    let mut digits = [0u8; 3];
+    let mut len = 0usize;
+    if n == 0 {
+        digits[0] = b'0';
+        len = 1;
+    } else {
+        while n > 0 && len < 3 {
+            digits[len] = b'0' + (n % 10) as u8;
+            n /= 10;
+            len += 1;
+        }
+    }
+    for k in 0..len {
+        buf[4 + k] = digits[len - 1 - k];
+    }
+    core::str::from_utf8(&buf[..4 + len]).unwrap()
+}
+
 fn setup_initialized(env: &Env) -> (EscrowClient<'_>, Address) {
     env.mock_all_auths();
     let contract_id = env.register_contract(None, Escrow);
@@ -510,17 +535,23 @@ fn test_credit_agent_and_settle_draws_down_balance() {
 
     client.record_usage(&agent, &svc, &3u32);
     let billed = client.settle(&admin, &agent, &svc);
+    // Capture events immediately: each later client call resets the
+    // per-invocation event buffer that `events().all()` reads from.
+    let events = env.events().all();
 
     assert_eq!(billed, 30i128);
     assert_eq!(client.get_agent_credit(&agent), 20i128);
     assert_eq!(client.get_usage(&agent, &svc), 0);
 
-    let events = env.events().all();
     assert!(!events.is_empty());
-    let (_addr, topics, data) = events.last().unwrap();
+    // `settle` emits `cred_deb` before `settled`, so select the credit event
+    // by topic rather than assuming its position in the buffer.
     let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
-        (symbol_short!("credit_debited"),).into_val(&env);
-    assert_eq!(topics, expected_topics);
+        (symbol_short!("cred_deb"),).into_val(&env);
+    let (_addr, _topics, data) = events
+        .iter()
+        .find(|(_a, t, _d)| *t == expected_topics)
+        .expect("settle should emit a cred_deb event");
     let decoded: (Address, i128, i128) = data.into_val(&env);
     assert_eq!(decoded, (agent.clone(), 30i128, 20i128));
 }
@@ -1799,8 +1830,9 @@ fn test_list_open_disputes_is_bounded_by_batch_limit() {
     let mut expected: Vec<Symbol> = Vec::new(&env);
 
     for i in 0..(MAX_BATCH_READ + 5) {
-        let name = format!("svc_{i}");
-        let service_id = Symbol::new(&env, &name);
+        let mut buf = [0u8; 8];
+        let name = svc_name(&mut buf, i);
+        let service_id = Symbol::new(&env, name);
         client.record_usage(&agent, &service_id, &1u32);
         if i < MAX_BATCH_READ {
             expected.push_back(service_id.clone());
@@ -4563,16 +4595,15 @@ fn test_refund_batch_emits_one_event_per_service() {
     open_dispute_with_usage(&client, &agent, &svc_a, 30);
     open_dispute_with_usage(&client, &agent, &svc_b, 20);
 
-    let events_before = env.events().all().len();
-
     let mut services: Vec<Symbol> = Vec::new(&env);
     services.push_back(svc_a.clone());
     services.push_back(svc_b.clone());
     client.refund_batch(&agent, &services);
 
+    // `events().all()` only holds the most recent invocation's events,
+    // so the refund_batch call's events are the whole buffer.
     let events = env.events().all();
-    let new_count = events.len() - events_before;
-    assert_eq!(new_count, 2, "one event per refunded service");
+    assert_eq!(events.len(), 2, "one event per refunded service");
 }
 
 /// Each `dispute` event carries the expected resolve payload:
