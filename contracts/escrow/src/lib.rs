@@ -63,6 +63,32 @@ pub struct ContractConfig {
     pub admin: Option<Address>,
 }
 
+/// A combined billing snapshot for an `(agent, service_id)` pair, returned by
+/// [`Escrow::get_billing_summary`].
+///
+/// Provides a coherent, single-round-trip view of usage, price, and the
+/// computed bill, all resolved from the same ledger state. This prevents
+/// race conditions where separate reads could return inconsistent snapshots
+/// (e.g., a usage value from one ledger and a price from another).
+///
+/// For unknown pairs (no usage recorded, no price set), all numeric fields
+/// default to zero and `last_settlement` is `None`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BillingSummary {
+    /// Accumulated request count for the pair. Defaults to `0` when no usage
+    /// has been recorded.
+    pub requests: u32,
+    /// Per-request price in stroops. Defaults to `0` when no price has been set.
+    pub price_stroops: i128,
+    /// Computed bill: `requests * price_stroops` with saturating arithmetic.
+    /// Saturates at `i128::MAX` on overflow.
+    pub billed: i128,
+    /// Ledger timestamp (seconds since unix epoch) of the last `settle` call
+    /// that drained this pair, or `None` if the pair has never been settled.
+    pub last_settlement: Option<u64>,
+}
+
 /// Storage keys used by the escrow contract.
 ///
 /// Persistent slots survive across full TTL cycles and are appropriate for
@@ -1169,6 +1195,51 @@ impl Escrow {
             // saturate: read/settle path returns a sentinel-large value rather than
             // panicking; off-chain loop treats saturation as an error signal.
             (requests as i128).saturating_mul(price)
+        }
+    }
+
+    /// Return a combined billing snapshot for an `(agent, service_id)` pair.
+    ///
+    /// This is a pure read — no `require_auth`, no pause gate — that returns
+    /// usage, price, and the computed bill in a single round-trip, all resolved
+    /// from the same ledger state. This prevents race conditions where separate
+    /// reads could return inconsistent snapshots (e.g., a usage value from one
+    /// ledger and a price from another).
+    ///
+    /// The `billed` field is computed as `requests * price_stroops` using the
+    /// same saturating arithmetic as [`Escrow::compute_billing`]. When a tier
+    /// schedule is configured, the bill uses the tier-aware computation.
+    ///
+    /// For unknown pairs (no usage recorded, no price set), all numeric fields
+    /// default to zero and `last_settlement` is `None`.
+    pub fn get_billing_summary(env: Env, agent: Address, service_id: Symbol) -> BillingSummary {
+        let requests = read_usage(&env, &agent, &service_id);
+        let price_stroops = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ServicePrice(service_id.clone()))
+            .unwrap_or(0);
+        let last_settlement = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LastSettlement(agent, service_id.clone()));
+
+        // Use tier schedule when present; fall back to flat price.
+        let billed = if let Some(tiers) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Vec<PriceTier>>(&DataKey::PriceTiers(service_id.clone()))
+        {
+            compute_billing_tiered(requests, &tiers)
+        } else {
+            (requests as i128).saturating_mul(price_stroops)
+        };
+
+        BillingSummary {
+            requests,
+            price_stroops,
+            billed,
+            last_settlement,
         }
     }
 

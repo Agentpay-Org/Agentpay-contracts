@@ -200,6 +200,33 @@ The struct fields and their defaults when the storage slot is absent:
 The per-field getters remain available and always return values identical to
 the corresponding fields in this struct. `ContractConfig` is a convenience
 snapshot only and does not replace any existing getter.
+
+### Combined billing snapshot: `get_billing_summary`
+
+`get_billing_summary(agent, service_id)` returns a `BillingSummary` struct
+containing usage, price, and the computed bill for an `(agent, service_id)`
+pair in a single round-trip. This is a pure read — no `require_auth`, no pause
+gate — that provides a coherent snapshot from the same ledger state, preventing
+race conditions where separate reads could return inconsistent values (e.g., a
+usage value from one ledger and a price from another).
+
+The struct fields and their defaults when the storage slot is absent:
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `requests` | `u32` | `0` | Accumulated request count for the pair |
+| `price_stroops` | `i128` | `0` | Per-request price in stroops |
+| `billed` | `i128` | `0` | Computed bill: `requests * price_stroops` with saturating arithmetic |
+| `last_settlement` | `Option<u64>` | `None` | Ledger timestamp of the last `settle` call, or `None` if never settled |
+
+The `billed` field uses the same saturating arithmetic as `compute_billing`:
+- When a tier schedule is configured, the bill uses the tier-aware computation
+- Otherwise, the bill is `requests * price_stroops` with saturation at `i128::MAX`
+- For unknown pairs (no usage, no price), all numeric fields default to zero
+
+This combined read is particularly useful for off-chain dashboards that need to
+render a single agent-service row, as it replaces three separate host invocations
+(`get_usage`, `get_service_price`, and `compute_billing`) with one atomic read.
 ### Configuration-change events: `cfg_set`
 
 Every rate-limit and per-call bound setter publishes a `cfg_set` event
