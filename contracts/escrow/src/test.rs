@@ -4712,7 +4712,8 @@ fn test_get_billing_summary_with_price_tiers() {
                                           // Expected: 100*10 + 900*7 + 500*4 = 1000 + 6300 + 2000 = 9300
     assert_eq!(summary.billed, 9300);
     assert_eq!(summary.last_settlement, None);
-=======
+}
+
 // ── refund_batch tests ────────────────────────────────────────────────────────
 //
 // `refund_batch` is a bounded admin batch entrypoint that resolves disputes
