@@ -4493,6 +4493,227 @@ fn test_consistent_bounds_never_brick_metering() {
     assert_eq!(client.get_usage(&agent, &svc), 259);
 }
 
+// ── get_billing_summary tests ────────────────────────────────────────────────
+
+/// get_billing_summary returns a coherent snapshot matching individual getters.
+///
+/// Verifies that the combined read returns the same values as calling
+/// get_usage, get_service_price, and compute_billing separately.
+#[test]
+fn test_get_billing_summary_matches_individual_getters() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+
+    let agent = make_agent(&env);
+    let svc = make_service(&env, "api");
+    let price = 100i128;
+    let requests = 42u32;
+
+    client.set_service_price(&svc, &price);
+    client.record_usage(&agent, &svc, &requests);
+
+    let summary = client.get_billing_summary(&agent, &svc);
+
+    assert_eq!(summary.requests, client.get_usage(&agent, &svc));
+    assert_eq!(summary.price_stroops, client.get_service_price(&svc));
+    assert_eq!(summary.billed, client.compute_billing(&agent, &svc));
+    assert_eq!(
+        summary.last_settlement,
+        client.get_last_settlement(&agent, &svc)
+    );
+}
+
+/// Unknown pair returns zeroed fields and None for last_settlement.
+///
+/// For an (agent, service_id) pair with no usage recorded and no price set,
+/// all numeric fields default to zero and last_settlement is None.
+#[test]
+fn test_get_billing_summary_unknown_pair_returns_zeros() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+
+    let agent = make_agent(&env);
+    let svc = make_service(&env, "never_seen");
+
+    let summary = client.get_billing_summary(&agent, &svc);
+
+    assert_eq!(summary.requests, 0);
+    assert_eq!(summary.price_stroops, 0);
+    assert_eq!(summary.billed, 0);
+    assert_eq!(summary.last_settlement, None);
+}
+
+/// Free service (price 0) returns billed = 0 regardless of usage.
+///
+/// When the service price is set to 0, the billed field is always 0
+/// even with non-zero usage.
+#[test]
+fn test_get_billing_summary_free_service() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+
+    let agent = make_agent(&env);
+    let svc = make_service(&env, "free");
+    let requests = 1000u32;
+
+    client.set_service_price(&svc, &0i128);
+    client.record_usage(&agent, &svc, &requests);
+
+    let summary = client.get_billing_summary(&agent, &svc);
+
+    assert_eq!(summary.requests, requests);
+    assert_eq!(summary.price_stroops, 0);
+    assert_eq!(summary.billed, 0);
+    assert_eq!(summary.last_settlement, None);
+}
+
+/// Never-settled pair has last_settlement = None.
+///
+/// For a pair that has usage but has never been settled, the
+/// last_settlement field should be None.
+#[test]
+fn test_get_billing_summary_never_settled_pair() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+
+    let agent = make_agent(&env);
+    let svc = make_service(&env, "unsettled");
+
+    client.set_service_price(&svc, &50i128);
+    client.record_usage(&agent, &svc, &10u32);
+
+    let summary = client.get_billing_summary(&agent, &svc);
+
+    assert_eq!(summary.requests, 10);
+    assert_eq!(summary.price_stroops, 50);
+    assert_eq!(summary.billed, 500);
+    assert_eq!(summary.last_settlement, None);
+}
+
+/// Post-settle zeroed usage reflects the drained state.
+///
+/// After settlement, the usage counter is reset to zero and
+/// last_settlement is stamped with the ledger timestamp.
+#[test]
+fn test_get_billing_summary_post_settle_zeroed_usage() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+
+    let agent = make_agent(&env);
+    let svc = make_service(&env, "settled");
+
+    client.set_service_price(&svc, &10i128);
+    client.record_usage(&agent, &svc, &100u32);
+
+    // Settle the pair.
+    let billed = client.settle(&admin, &agent, &svc);
+    assert_eq!(billed, 1000);
+
+    let summary = client.get_billing_summary(&agent, &svc);
+
+    assert_eq!(summary.requests, 0);
+    assert_eq!(summary.price_stroops, 10);
+    assert_eq!(summary.billed, 0);
+    assert!(summary.last_settlement.is_some());
+}
+
+/// Saturated billing is reflected in the summary.
+///
+/// When the product of requests and price would overflow i128,
+/// the billed field saturates at i128::MAX.
+#[test]
+fn test_get_billing_summary_saturated_billing() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+
+    let agent = make_agent(&env);
+    let svc = make_service(&env, "expensive");
+
+    // Set a very high price that will saturate when multiplied by usage.
+    let high_price = i128::MAX;
+    client.set_service_price(&svc, &high_price);
+    client.record_usage(&agent, &svc, &2u32);
+
+    let summary = client.get_billing_summary(&agent, &svc);
+
+    assert_eq!(summary.requests, 2);
+    assert_eq!(summary.price_stroops, high_price);
+    assert_eq!(summary.billed, i128::MAX);
+    assert_eq!(summary.last_settlement, None);
+}
+
+/// billed field equals requests * price with saturating arithmetic.
+///
+/// Confirms the documented invariant: billed == requests * price
+/// using the same saturating_mul as compute_billing.
+#[test]
+fn test_get_billing_summary_billed_equals_product() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+
+    let agent = make_agent(&env);
+    let svc = make_service(&env, "product");
+
+    // Test multiple (requests, price) combinations.
+    let test_cases = [
+        (1u32, 10i128, 10i128),
+        (5u32, 20i128, 100i128),
+        (100u32, 7i128, 700i128),
+        (50u32, 0i128, 0i128),
+    ];
+
+    for (requests, price, expected_billed) in test_cases {
+        client.set_service_price(&svc, &price);
+        client.record_usage(&agent, &svc, &requests);
+
+        let summary = client.get_billing_summary(&agent, &svc);
+        assert_eq!(summary.billed, expected_billed);
+
+        // Reset for next test case.
+        client.decrement_usage(&agent, &svc, &requests);
+    }
+}
+
+/// Tier-aware billing is reflected in the summary.
+///
+/// When a price tier schedule is configured, the billed field uses
+/// the tier-aware computation instead of flat price.
+#[test]
+fn test_get_billing_summary_with_price_tiers() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+
+    let agent = make_agent(&env);
+    let svc = make_service(&env, "tiered");
+
+    // Configure tier schedule: first 100 @ 10, next 900 @ 7, remainder @ 4
+    let mut tiers = soroban_sdk::Vec::new(&env);
+    tiers.push_back(PriceTier {
+        threshold_requests: 100,
+        price_stroops: 10,
+    });
+    tiers.push_back(PriceTier {
+        threshold_requests: 1000,
+        price_stroops: 7,
+    });
+    tiers.push_back(PriceTier {
+        threshold_requests: u32::MAX,
+        price_stroops: 4,
+    });
+    client.set_price_tiers(&svc, &tiers);
+
+    // Record 1500 requests.
+    client.record_usage(&agent, &svc, &1500u32);
+
+    let summary = client.get_billing_summary(&agent, &svc);
+
+    assert_eq!(summary.requests, 1500);
+    assert_eq!(summary.price_stroops, 0); // Flat price is not used when tiers are set
+                                          // Expected: 100*10 + 900*7 + 500*4 = 1000 + 6300 + 2000 = 9300
+    assert_eq!(summary.billed, 9300);
+    assert_eq!(summary.last_settlement, None);
+}
+
 // ── refund_batch tests ────────────────────────────────────────────────────────
 //
 // `refund_batch` is a bounded admin batch entrypoint that resolves disputes
