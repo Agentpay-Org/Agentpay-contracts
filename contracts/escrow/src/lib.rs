@@ -126,6 +126,10 @@ pub enum DataKey {
     /// Per-agent allowlist flag. When `AllowlistEnabled` is true,
     /// `record_usage` rejects agents whose entry is absent or false.
     AgentAllowed(Address),
+    /// Prepaid credit balance for an agent, in stroops. Settlement draws
+    /// down this balance; `record_usage` rejects a call when the balance is
+    /// insufficient for the bill that will be settled for the new total.
+    AgentCredit(Address),
     /// Master toggle: when true, the per-agent allowlist is enforced.
     AllowlistEnabled,
     /// Cross-service total request count for a given agent.
@@ -295,6 +299,10 @@ pub enum EscrowError {
     /// the existing `InvalidAdminProposal` guard on
     /// `propose_admin_transfer`.
     InvalidOwnerTransfer = 27,
+    /// `record_usage` was called for an agent whose prepaid credit balance is
+    /// insufficient to cover the bill that would be settled for the updated
+    /// usage total.
+    InsufficientCreditBalance = 28,
 }
 
 #[contracttype]
@@ -405,6 +413,35 @@ fn read_usage(env: &Env, agent: &Address, service_id: &Symbol) -> u32 {
         .persistent()
         .get(&DataKey::Usage(agent.clone(), service_id.clone()))
         .unwrap_or(0)
+}
+
+/// Read an agent's prepaid credit balance in stroops.
+/// Returns `0` when no credit balance has been recorded.
+fn read_agent_credit(env: &Env, agent: &Address) -> i128 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::AgentCredit(agent.clone()))
+        .unwrap_or(0)
+}
+
+/// Compute the bill for a given service and request total using the configured
+/// flat price or tier schedule. This is shared by `record_usage`, `settle`,
+/// and the public `compute_billing` read.
+fn compute_billing_for_requests(env: &Env, service_id: &Symbol, requests: u32) -> i128 {
+    if let Some(tiers) = env
+        .storage()
+        .persistent()
+        .get::<DataKey, Vec<PriceTier>>(&DataKey::PriceTiers(service_id.clone()))
+    {
+        compute_billing_tiered(requests, &tiers)
+    } else {
+        let price: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ServicePrice(service_id.clone()))
+            .unwrap_or(0);
+        (requests as i128).saturating_mul(price)
+    }
 }
 
 /// Add `service_id` to the per-agent service index if not already present.
@@ -686,8 +723,15 @@ impl Escrow {
 
         let key = DataKey::Usage(agent.clone(), service_id.clone());
         let prev: u32 = env.storage().persistent().get(&key).unwrap_or(0);
-        // saturate: settlement drains long before u32::MAX; never panic the hot path.
         let total = prev.saturating_add(requests);
+        let credit_balance = read_agent_credit(&env, &agent);
+        if credit_balance > 0 {
+            let projected_bill = compute_billing_for_requests(&env, &service_id, total);
+            if projected_bill > credit_balance {
+                panic_with_error!(&env, EscrowError::InsufficientCreditBalance);
+            }
+        }
+        // saturate: settlement drains long before u32::MAX; never panic the hot path.
         env.storage().persistent().set(&key, &total);
 
         // Maintain per-agent service index. index_agent_service is idempotent
@@ -805,6 +849,30 @@ impl Escrow {
         env.storage()
             .persistent()
             .get(&DataKey::LastSettlement(agent, service_id))
+    }
+
+    /// Credit an agent with prepaid balance in stroops.
+    ///
+    /// Admin-gated and pause-respecting. The balance is drawn down by
+    /// `settle` when a bill is successfully settled and is used by
+    /// `record_usage` to prevent usage from being accepted when the
+    /// prepaid balance is insufficient for the bill that would be settled.
+    pub fn credit_agent(env: Env, agent: Address, amount: i128) {
+        ensure_not_paused(&env);
+        require_admin(&env);
+        if amount <= 0 {
+            panic_with_error!(&env, EscrowError::RequestsMustBePositive);
+        }
+        let current = read_agent_credit(&env, &agent);
+        env.storage().persistent().set(
+            &DataKey::AgentCredit(agent),
+            &current.saturating_add(amount),
+        );
+    }
+
+    /// Read an agent's prepaid credit balance in stroops.
+    pub fn get_agent_credit(env: Env, agent: Address) -> i128 {
+        read_agent_credit(&env, &agent)
     }
 
     /// Read the protocol-wide lifetime request counter (u64).
@@ -1179,23 +1247,7 @@ impl Escrow {
             .persistent()
             .get(&DataKey::Usage(agent, service_id.clone()))
             .unwrap_or(0);
-        // Use tier schedule when present; fall back to flat price.
-        if let Some(tiers) = env
-            .storage()
-            .persistent()
-            .get::<DataKey, Vec<PriceTier>>(&DataKey::PriceTiers(service_id.clone()))
-        {
-            compute_billing_tiered(requests, &tiers)
-        } else {
-            let price: i128 = env
-                .storage()
-                .persistent()
-                .get(&DataKey::ServicePrice(service_id))
-                .unwrap_or(0);
-            // saturate: read/settle path returns a sentinel-large value rather than
-            // panicking; off-chain loop treats saturation as an error signal.
-            (requests as i128).saturating_mul(price)
-        }
+        compute_billing_for_requests(&env, &service_id, requests)
     }
 
     /// Return a combined billing snapshot for an `(agent, service_id)` pair.
@@ -1271,22 +1323,19 @@ impl Escrow {
         let usage_key = DataKey::Usage(agent.clone(), service_id.clone());
         let requests: u32 = env.storage().persistent().get(&usage_key).unwrap_or(0);
         // Use tier schedule when present; fall back to flat price.
-        let billed = if let Some(tiers) = env
-            .storage()
-            .persistent()
-            .get::<DataKey, Vec<PriceTier>>(&DataKey::PriceTiers(service_id.clone()))
-        {
-            compute_billing_tiered(requests, &tiers)
-        } else {
-            let price: i128 = env
-                .storage()
+        let billed = compute_billing_for_requests(&env, &service_id, requests);
+        let credit_balance = read_agent_credit(&env, &agent);
+        if billed > 0 && credit_balance > 0 {
+            let debit = billed.min(credit_balance);
+            let new_balance = credit_balance.saturating_sub(debit);
+            env.storage()
                 .persistent()
-                .get(&DataKey::ServicePrice(service_id.clone()))
-                .unwrap_or(0);
-            // saturate: read/settle path returns a sentinel-large value rather than
-            // panicking; off-chain loop treats saturation as an error signal.
-            (requests as i128).saturating_mul(price)
-        };
+                .set(&DataKey::AgentCredit(agent.clone()), &new_balance);
+            env.events().publish(
+                (symbol_short!("cred_deb"),),
+                (agent.clone(), debit, new_balance),
+            );
+        }
         add_settled_totals(&env, &agent, billed);
         env.storage().persistent().set(&usage_key, &0u32);
         // Prune the service from the agent's index since usage is now zero.
@@ -1630,6 +1679,32 @@ impl Escrow {
             (symbol_short!("cfg_set"),),
             (symbol_short!("win_sec"), window_seconds),
         );
+    }
+
+    /// Admin-gated, pause-respecting entrypoint that clears the per-agent
+    /// rate-limit window state.
+    ///
+    /// Removes the `DataKey::RateWindow(agent)` storage slot so the next
+    /// `record_usage` call for this agent opens a fresh window with a zero
+    /// count. This lets an operator lift a throttle immediately — for
+    /// example, when a misconfigured cap has been raised, or a legitimate
+    /// burst the operator wants to forgive.
+    ///
+    /// Idempotent: resetting an agent that has no stored rate window is a
+    /// no-op. The configured cap (`MaxRequestsPerWindow`) and window length
+    /// (`WindowSeconds`) are **not** changed — only the agent's accumulated
+    /// count for the current window is cleared.
+    ///
+    /// # Events
+    ///
+    /// Emits `rate_rst(agent)` so the override is auditable.
+    pub fn reset_rate_window(env: Env, agent: Address) {
+        ensure_not_paused(&env);
+        require_admin(&env);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::RateWindow(agent.clone()));
+        env.events().publish((symbol_short!("rate_rst"),), agent);
     }
 
     /// Admin sets the per-call upper bound on `requests` accepted by
@@ -2001,6 +2076,31 @@ impl Escrow {
         );
     }
 
+    /// Return the service ids for an agent that currently have open disputes.
+    ///
+    /// Pure read — no auth, no pause gate. The method reuses the same
+    /// per-agent service index backing as [`Escrow::get_agent_services`] so it
+    /// iterates the active service list in the same order and stops after
+    /// [`MAX_BATCH_READ`] entries to keep the read bounded.
+    pub fn list_open_disputes(env: Env, agent: Address) -> Vec<Symbol> {
+        let index: Vec<Symbol> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AgentServiceIndex(agent.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut disputes: Vec<Symbol> = Vec::new(&env);
+        for service_id in index.iter() {
+            if disputes.len() >= MAX_BATCH_READ {
+                break;
+            }
+            if read_flag(&env, &DataKey::Dispute(agent.clone(), service_id.clone())) {
+                disputes.push_back(service_id);
+            }
+        }
+        disputes
+    }
+
     /// Returns `true` iff there is currently an open dispute for the
     /// given `(agent, service_id)` pair. Pure read — no auth, no pause gate.
     pub fn has_open_dispute(env: Env, agent: Address, service_id: Symbol) -> bool {
@@ -2047,6 +2147,49 @@ impl Escrow {
             (symbol_short!("dispute"),),
             (symbol_short!("resolve"), agent, service_id, refund_requests),
         );
+    }
+
+    /// Admin-only batch entrypoint that resolves disputes for multiple
+    /// services of one agent, zeroing the full disputed usage in a single
+    /// transaction.
+    ///
+    /// Accepts a bounded `Vec<Symbol>` of service ids. For each service:
+    /// - Skips the service if no dispute is open (no-op).
+    /// - Reads the current accumulated usage and uses that as the refund
+    ///   amount (the counter is then reset to zero).
+    /// - Clears the dispute flag.
+    /// - Emits a `dispute` event with
+    ///   `("resolve", agent, service_id, refunded)`.
+    ///
+    /// Rejects oversized batches (more than [`MAX_BATCH_READ`] entries) with
+    /// [`EscrowError::BatchTooLarge`]. Honours the pause gate.
+    pub fn refund_batch(env: Env, agent: Address, services: Vec<Symbol>) {
+        ensure_not_paused(&env);
+        require_admin(&env);
+        if services.len() > MAX_BATCH_READ {
+            panic_with_error!(&env, EscrowError::BatchTooLarge);
+        }
+        for service_id in services.iter() {
+            let dispute_key = DataKey::Dispute(agent.clone(), service_id.clone());
+            if !read_flag(&env, &dispute_key) {
+                continue;
+            }
+            let usage_key = DataKey::Usage(agent.clone(), service_id.clone());
+            let current: u32 = env.storage().persistent().get(&usage_key).unwrap_or(0);
+            // Zero the usage counter.
+            env.storage().persistent().set(&usage_key, &0u32);
+            // Clear the dispute flag so settle can proceed.
+            write_flag(&env, &dispute_key, false);
+            env.events().publish(
+                (symbol_short!("dispute"),),
+                (
+                    symbol_short!("resolve"),
+                    agent.clone(),
+                    service_id.clone(),
+                    current,
+                ),
+            );
+        }
     }
 }
 

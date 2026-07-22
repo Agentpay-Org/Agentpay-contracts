@@ -56,6 +56,8 @@
 //! verify that auth *is* enforced, use `setup_scoped_auth` or call
 //! `env.set_auths(&[])` to drop mock authorisations before the call under
 //! test.
+extern crate alloc;
+
 use super::*;
 use soroban_sdk::{
     testutils::{Address as _, Events, Ledger, MockAuth, MockAuthInvoke},
@@ -74,6 +76,31 @@ use soroban_sdk::{
 /// **Note on agent auth**: After adding `agent.require_auth()` to `record_usage`,
 /// `mock_all_auths()` will satisfy agent auth checks for any agent address,
 /// allowing the existing test suite to continue working without modification.
+/// Build a `svc_<n>` name without `format!` (the crate is `no_std`).
+fn svc_name(buf: &mut [u8; 8], i: u32) -> &str {
+    buf[0] = b's';
+    buf[1] = b'v';
+    buf[2] = b'c';
+    buf[3] = b'_';
+    let mut n = i;
+    let mut digits = [0u8; 3];
+    let mut len = 0usize;
+    if n == 0 {
+        digits[0] = b'0';
+        len = 1;
+    } else {
+        while n > 0 && len < 3 {
+            digits[len] = b'0' + (n % 10) as u8;
+            n /= 10;
+            len += 1;
+        }
+    }
+    for k in 0..len {
+        buf[4 + k] = digits[len - 1 - k];
+    }
+    core::str::from_utf8(&buf[..4 + len]).unwrap()
+}
+
 fn setup_initialized(env: &Env) -> (EscrowClient<'_>, Address) {
     env.mock_all_auths();
     let contract_id = env.register_contract(None, Escrow);
@@ -495,6 +522,54 @@ fn test_compute_billing_basic() {
     client.record_usage(&agent, &svc, &42u32);
     assert_eq!(client.compute_billing(&agent, &svc), 420i128);
 }
+
+#[test]
+fn test_credit_agent_and_settle_draws_down_balance() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "infer");
+    client.set_service_price(&svc, &10i128);
+    client.credit_agent(&agent, &50i128);
+
+    client.record_usage(&agent, &svc, &3u32);
+    let billed = client.settle(&admin, &agent, &svc);
+    // Capture events immediately: each later client call resets the
+    // per-invocation event buffer that `events().all()` reads from.
+    let events = env.events().all();
+
+    assert_eq!(billed, 30i128);
+    assert_eq!(client.get_agent_credit(&agent), 20i128);
+    assert_eq!(client.get_usage(&agent, &svc), 0);
+
+    assert!(!events.is_empty());
+    // `settle` emits `cred_deb` before `settled`, so select the credit event
+    // by topic rather than assuming its position in the buffer.
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("cred_deb"),).into_val(&env);
+    let (_addr, _topics, data) = events
+        .iter()
+        .find(|(_a, t, _d)| *t == expected_topics)
+        .expect("settle should emit a cred_deb event");
+    let decoded: (Address, i128, i128) = data.into_val(&env);
+    assert_eq!(decoded, (agent.clone(), 30i128, 20i128));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #28)")]
+fn test_record_usage_rejects_insufficient_credit_balance() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "infer");
+    client.set_service_price(&svc, &10i128);
+    client.credit_agent(&agent, &20i128);
+
+    client.record_usage(&agent, &svc, &3u32);
+}
+
 #[test]
 fn test_decrement_usage_basic() {
     let env = Env::default();
@@ -1717,6 +1792,63 @@ fn test_resolve_dispute_panics_not_initialized_before_init() {
     let agent = Address::generate(&env);
     client.resolve_dispute(&agent, &Symbol::new(&env, "infer"), &0u32);
 }
+
+#[test]
+fn test_list_open_disputes_returns_empty_for_agent_without_disputes() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "svc_a");
+    client.record_usage(&agent, &svc, &4u32);
+
+    let disputes = client.list_open_disputes(&agent);
+    assert_eq!(disputes.len(), 0);
+}
+
+#[test]
+fn test_list_open_disputes_returns_single_service() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "svc_a");
+    client.record_usage(&agent, &svc, &4u32);
+    client.open_dispute(&agent, &svc);
+
+    let disputes = client.list_open_disputes(&agent);
+    assert_eq!(disputes.len(), 1);
+    assert_eq!(disputes.get(0), Some(svc.clone()));
+}
+
+#[test]
+fn test_list_open_disputes_is_bounded_by_batch_limit() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+
+    let agent = Address::generate(&env);
+    let mut expected: Vec<Symbol> = Vec::new(&env);
+
+    for i in 0..(MAX_BATCH_READ + 5) {
+        let mut buf = [0u8; 8];
+        let name = svc_name(&mut buf, i);
+        let service_id = Symbol::new(&env, name);
+        client.record_usage(&agent, &service_id, &1u32);
+        if i < MAX_BATCH_READ {
+            expected.push_back(service_id.clone());
+        }
+        if i < MAX_BATCH_READ {
+            client.open_dispute(&agent, &service_id);
+        }
+    }
+
+    let disputes = client.list_open_disputes(&agent);
+    assert_eq!(disputes.len(), MAX_BATCH_READ as u32);
+    for i in 0..MAX_BATCH_READ {
+        assert_eq!(disputes.get(i), expected.get(i));
+    }
+}
+
 #[test]
 fn test_get_usage_batch_preserves_order() {
     let env = Env::default();
@@ -3291,6 +3423,168 @@ fn test_rate_limit_is_per_agent() {
     let rec_b = client.record_usage(&b, &svc, &5u32); // b independent
     assert_eq!(rec_b.requests, 5);
 }
+// ── reset_rate_window tests ──────────────────────────────────────────────────
+//
+// `reset_rate_window(agent)` clears the per-agent `RateWindow` storage slot
+// so the next `record_usage` opens a fresh window. It is admin-gated,
+// pause-respecting, idempotent (no-op when no window exists), and emits
+// a `rate_rst(agent)` event. Covered scenarios:
+//   1. Throttle → reset → record succeeds in the same ledger.
+//   2. No-op when no window exists (limiter never hit).
+//   3. Non-admin caller is rejected.
+//   4. Paused contract is rejected.
+//   5. Reset mid-window, then re-throttle in the same window.
+//   6. Reset with limiter disabled (no window state, still emits event).
+//   7. Reset then immediately re-throttle.
+
+/// Throttle an agent to the cap, reset the window, then record usage
+/// again — all within the same fixed window. Demonstrates the admin
+/// override lifts the throttle without waiting for window rollover.
+#[test]
+fn test_reset_rate_window_lifts_throttle() {
+    let env = Env::default();
+    env.ledger().with_mut(|li| li.timestamp = 1_000);
+    let (client, _admin) = setup_initialized(&env);
+    client.set_max_requests_per_window(&10u32);
+    client.set_rate_window_seconds(&100u64);
+
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "infer");
+
+    // Fill the window (count = 10).
+    client.record_usage(&agent, &svc, &10u32);
+    // The next call would be rejected (RateLimitExceeded #15).
+    assert!(client.try_record_usage(&agent, &svc, &1u32).is_err());
+
+    // Reset the rate window — clears the agent's accumulated count.
+    client.reset_rate_window(&agent);
+
+    // Now the agent can record again even though the window hasn't rolled.
+    let rec = client.record_usage(&agent, &svc, &5u32);
+    assert_eq!(rec.requests, 15);
+}
+
+/// Resetting an agent that has no stored rate window is a no-op (no panic).
+#[test]
+fn test_reset_rate_window_noop_when_no_window() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+
+    let agent = Address::generate(&env);
+    // No record_usage has been called, so no RateWindow exists.
+    client.reset_rate_window(&agent);
+    // Event is still emitted for auditability.
+    let events = env.events().all();
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("rate_rst"),).into_val(&env);
+    let has_rate_rst = events.iter().any(|(_, t, _)| t == expected_topics);
+    assert!(has_rate_rst);
+}
+
+/// A non-admin caller is rejected with `Unauthorized`.
+#[test]
+#[should_panic(expected = "Unauthorized")]
+fn test_reset_rate_window_non_admin_rejected() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    env.set_auths(&[]);
+
+    let agent = Address::generate(&env);
+    client.reset_rate_window(&agent);
+}
+
+/// Calling while the contract is paused panics with ContractPaused (#4).
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")]
+fn test_reset_rate_window_paused_rejected() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    client.pause();
+
+    let agent = Address::generate(&env);
+    client.reset_rate_window(&agent);
+}
+
+/// Reset the window mid-window, re-fill it, and verify the cap is enforced
+/// again within the same fixed window.
+#[test]
+fn test_reset_rate_window_mid_window_rethrottle() {
+    let env = Env::default();
+    env.ledger().with_mut(|li| li.timestamp = 1_000);
+    let (client, _admin) = setup_initialized(&env);
+    client.set_max_requests_per_window(&5u32);
+    client.set_rate_window_seconds(&100u64);
+
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "infer");
+
+    // Record up to the cap.
+    client.record_usage(&agent, &svc, &5u32);
+    assert!(client.try_record_usage(&agent, &svc, &1u32).is_err());
+
+    // Reset mid-window — count goes back to 0.
+    client.reset_rate_window(&agent);
+
+    // Re-fill the window.
+    client.record_usage(&agent, &svc, &5u32);
+    // Now it should be throttled again.
+    assert!(client.try_record_usage(&agent, &svc, &1u32).is_err());
+}
+
+/// When the limiter is disabled (cap = 0 or window = 0), `record_usage`
+/// never writes a `RateWindow` slot, so reset is a no-op.
+#[test]
+fn test_reset_rate_window_limiter_disabled() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    // Limiter is disabled by default (cap = 0, window = 0).
+
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "infer");
+
+    // Record some usage — RateWindow is never written.
+    client.record_usage(&agent, &svc, &100u32);
+
+    // Reset has no effect but should not panic.
+    client.reset_rate_window(&agent);
+
+    // Recording still works.
+    let rec = client.record_usage(&agent, &svc, &50u32);
+    assert_eq!(rec.requests, 150);
+}
+
+/// Reset emits a `rate_rst(agent)` event that indexers can observe.
+#[test]
+fn test_reset_rate_window_emits_event() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+
+    client.reset_rate_window(&agent);
+
+    let events = env.events().all();
+    assert!(!events.is_empty());
+    let (_addr, topics, data) = events.last().unwrap();
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("rate_rst"),).into_val(&env);
+    assert_eq!(topics, expected_topics);
+    let decoded: Address = data.into_val(&env);
+    assert_eq!(decoded, agent);
+}
+
+/// Reset is idempotent: calling it twice in a row does not panic.
+#[test]
+fn test_reset_rate_window_idempotent() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+
+    // First reset (no window yet — no-op).
+    client.reset_rate_window(&agent);
+    // Second reset — must also succeed.
+    client.reset_rate_window(&agent);
+}
+
 // ── compute_billing tests ────────────────────────────────────────────────────
 //
 // `compute_billing(agent, service_id)` returns `accumulated_requests * price_per_request`
@@ -4418,4 +4712,371 @@ fn test_get_billing_summary_with_price_tiers() {
                                           // Expected: 100*10 + 900*7 + 500*4 = 1000 + 6300 + 2000 = 9300
     assert_eq!(summary.billed, 9300);
     assert_eq!(summary.last_settlement, None);
+=======
+// ── refund_batch tests ────────────────────────────────────────────────────────
+//
+// `refund_batch` is a bounded admin batch entrypoint that resolves disputes
+// for multiple services of one agent, zeroing their full usage in a single
+// transaction.  It reuses `MAX_BATCH_READ` as the batch-size cap and emits
+// one `dispute` event per refunded pair.
+//
+// Covered scenarios:
+//   1. Single service
+//   2. Multiple services (all usage zeroed, all disputes cleared)
+//   3. One event emitted per refunded service
+//   4. Event payload carries "resolve", agent, service_id, and the refunded
+//      amount (= the full usage before zeroing)
+//   5. Oversized batch (exceeds MAX_BATCH_READ) → BatchTooLarge (#16)
+//   6. Service with no open dispute → silently skipped
+//   7. Contract paused → ContractPaused (#4)
+//   8. Non-admin caller → Unauthorized
+//   9. Service with zero usage: still clears dispute, refunds 0
+//  10. Duplicate service ids: each occurrence is processed independently
+
+/// Helper: record usage for an `(agent, service_id)` pair and open a dispute.
+fn open_dispute_with_usage(
+    client: &EscrowClient<'_>,
+    agent: &Address,
+    service_id: &Symbol,
+    requests: u32,
+) {
+    client.record_usage(agent, service_id, &requests);
+    client.open_dispute(agent, service_id);
+}
+
+/// refund_batch resolves a single service dispute, zeroing the usage.
+#[test]
+fn test_refund_batch_single_service() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let agent = make_agent(&env);
+    let svc = make_service(&env, "svc_a");
+
+    open_dispute_with_usage(&client, &agent, &svc, 75);
+
+    assert!(client.has_open_dispute(&agent, &svc));
+    assert_eq!(client.get_usage(&agent, &svc), 75);
+
+    let mut services: Vec<Symbol> = Vec::new(&env);
+    services.push_back(svc.clone());
+    client.refund_batch(&agent, &services);
+
+    // Usage is zeroed.
+    assert_eq!(client.get_usage(&agent, &svc), 0);
+    // Dispute is cleared.
+    assert!(!client.has_open_dispute(&agent, &svc));
+}
+
+/// refund_batch resolves multiple services, zeroing all usage and clearing
+/// all disputes.
+#[test]
+fn test_refund_batch_multiple_services() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let agent = make_agent(&env);
+    let svc_a = make_service(&env, "svc_a");
+    let svc_b = make_service(&env, "svc_b");
+    let svc_c = make_service(&env, "svc_c");
+
+    open_dispute_with_usage(&client, &agent, &svc_a, 100);
+    open_dispute_with_usage(&client, &agent, &svc_b, 50);
+    open_dispute_with_usage(&client, &agent, &svc_c, 25);
+
+    assert!(client.has_open_dispute(&agent, &svc_a));
+    assert!(client.has_open_dispute(&agent, &svc_b));
+    assert!(client.has_open_dispute(&agent, &svc_c));
+    assert_eq!(client.get_usage(&agent, &svc_a), 100);
+    assert_eq!(client.get_usage(&agent, &svc_b), 50);
+    assert_eq!(client.get_usage(&agent, &svc_c), 25);
+
+    let mut services: Vec<Symbol> = Vec::new(&env);
+    services.push_back(svc_a.clone());
+    services.push_back(svc_b.clone());
+    services.push_back(svc_c.clone());
+    client.refund_batch(&agent, &services);
+
+    assert_eq!(client.get_usage(&agent, &svc_a), 0);
+    assert_eq!(client.get_usage(&agent, &svc_b), 0);
+    assert_eq!(client.get_usage(&agent, &svc_c), 0);
+    assert!(!client.has_open_dispute(&agent, &svc_a));
+    assert!(!client.has_open_dispute(&agent, &svc_b));
+    assert!(!client.has_open_dispute(&agent, &svc_c));
+}
+
+/// refund_batch emits exactly one `dispute` event per refunded service.
+#[test]
+fn test_refund_batch_emits_one_event_per_service() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let agent = make_agent(&env);
+    let svc_a = make_service(&env, "svc_a");
+    let svc_b = make_service(&env, "svc_b");
+
+    open_dispute_with_usage(&client, &agent, &svc_a, 30);
+    open_dispute_with_usage(&client, &agent, &svc_b, 20);
+
+    let mut services: Vec<Symbol> = Vec::new(&env);
+    services.push_back(svc_a.clone());
+    services.push_back(svc_b.clone());
+    client.refund_batch(&agent, &services);
+
+    // `events().all()` only holds the most recent invocation's events,
+    // so the refund_batch call's events are the whole buffer.
+    let events = env.events().all();
+    assert_eq!(events.len(), 2, "one event per refunded service");
+}
+
+/// Each `dispute` event carries the expected resolve payload:
+/// `("resolve", agent, service_id, refunded)`.
+#[test]
+fn test_refund_batch_event_payload() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let agent = make_agent(&env);
+    let svc = make_service(&env, "svc_a");
+
+    open_dispute_with_usage(&client, &agent, &svc, 42);
+
+    let mut services: Vec<Symbol> = Vec::new(&env);
+    services.push_back(svc.clone());
+    client.refund_batch(&agent, &services);
+
+    let events = env.events().all();
+    let (_addr, topics, data) = events.last().unwrap();
+
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("dispute"),).into_val(&env);
+    assert_eq!(topics, expected_topics);
+
+    let decoded: (Symbol, Address, Symbol, u32) = data.into_val(&env);
+    assert_eq!(decoded.0, symbol_short!("resolve"));
+    assert_eq!(decoded.1, agent);
+    assert_eq!(decoded.2, svc);
+    assert_eq!(decoded.3, 42, "refunded amount equals the pre-zero usage");
+}
+
+/// Oversized batch (exceeding MAX_BATCH_READ) is rejected with BatchTooLarge (#16).
+#[test]
+#[should_panic(expected = "Error(Contract, #16)")]
+fn test_refund_batch_oversized_panics() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let agent = make_agent(&env);
+    let svc = make_service(&env, "svc");
+
+    // Open disputes on enough services to fill beyond MAX_BATCH_READ.
+    // We reuse the same (agent, svc) pair to keep the test short — the
+    // dispute flag is per-pair, so we open/close it for each synthetic
+    // service created below.
+    let mut services: Vec<Symbol> = Vec::new(&env);
+    for i in 0..=MAX_BATCH_READ {
+        let s = Symbol::new(&env, &alloc::format!("svc_{}", i));
+        client.record_usage(&agent, &s, &1u32);
+        client.open_dispute(&agent, &s);
+        services.push_back(s);
+    }
+    // services.len() == MAX_BATCH_READ + 1 → must panic.
+    client.refund_batch(&agent, &services);
+}
+
+/// refund_batch silently skips services without an open dispute.
+#[test]
+fn test_refund_batch_no_open_dispute_skips_silently() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let agent = make_agent(&env);
+    let svc = make_service(&env, "svc");
+
+    // Record usage but do NOT open a dispute.
+    client.record_usage(&agent, &svc, &50u32);
+
+    let mut services: Vec<Symbol> = Vec::new(&env);
+    services.push_back(svc.clone());
+    client.refund_batch(&agent, &services);
+
+    // Service without dispute is untouched.
+    assert_eq!(client.get_usage(&agent, &svc), 50);
+    assert!(!client.has_open_dispute(&agent, &svc));
+}
+
+/// refund_batch skips services without a dispute and processes the rest.
+#[test]
+fn test_refund_batch_skips_missing_disputes() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let agent = make_agent(&env);
+    let svc_a = make_service(&env, "svc_a");
+    let svc_b = make_service(&env, "svc_b");
+
+    // Only svc_b has an open dispute — svc_a does not.
+    open_dispute_with_usage(&client, &agent, &svc_b, 100);
+
+    let mut services: Vec<Symbol> = Vec::new(&env);
+    services.push_back(svc_a.clone());
+    services.push_back(svc_b.clone());
+    client.refund_batch(&agent, &services);
+
+    // svc_a (no dispute) is untouched.
+    assert_eq!(client.get_usage(&agent, &svc_a), 0);
+    assert!(!client.has_open_dispute(&agent, &svc_a));
+
+    // svc_b (had dispute) is resolved.
+    assert_eq!(client.get_usage(&agent, &svc_b), 0);
+    assert!(!client.has_open_dispute(&agent, &svc_b));
+}
+
+/// refund_batch panics with ContractPaused (#4) when the contract is paused.
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")]
+fn test_refund_batch_paused_panics() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let agent = make_agent(&env);
+    let svc = make_service(&env, "svc");
+
+    open_dispute_with_usage(&client, &agent, &svc, 10);
+    client.pause();
+
+    let mut services: Vec<Symbol> = Vec::new(&env);
+    services.push_back(svc.clone());
+    client.refund_batch(&agent, &services);
+}
+
+/// refund_batch panics when called by a non-admin.
+#[test]
+#[should_panic]
+fn test_refund_batch_requires_admin_auth() {
+    let env = Env::default();
+    let client = setup_scoped_auth(&env);
+    let agent = make_agent(&env);
+    let svc = make_service(&env, "svc");
+
+    // The contract is initialised but no admin auth is mocked beyond init.
+    let mut services: Vec<Symbol> = Vec::new(&env);
+    services.push_back(svc.clone());
+    client.refund_batch(&agent, &services);
+}
+
+/// refund_batch handles a service with zero usage: dispute is cleared and
+/// the event carries refund=0.
+#[test]
+fn test_refund_batch_zero_usage_still_clears_dispute() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let agent = make_agent(&env);
+    let svc = make_service(&env, "svc");
+
+    // Open a dispute without any recorded usage.
+    client.open_dispute(&agent, &svc);
+    assert!(client.has_open_dispute(&agent, &svc));
+    assert_eq!(client.get_usage(&agent, &svc), 0);
+
+    let mut services: Vec<Symbol> = Vec::new(&env);
+    services.push_back(svc.clone());
+    client.refund_batch(&agent, &services);
+
+    // Dispute is cleared, usage stays 0.
+    assert!(!client.has_open_dispute(&agent, &svc));
+    assert_eq!(client.get_usage(&agent, &svc), 0);
+}
+
+/// Duplicate service ids in the batch are processed independently: each
+/// occurrence clears the dispute and zeroes usage, and subsequent
+/// occurrences see the same post-zero state.
+#[test]
+fn test_refund_batch_duplicate_services_processed_independently() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let agent = make_agent(&env);
+    let svc = make_service(&env, "svc");
+
+    open_dispute_with_usage(&client, &agent, &svc, 60);
+
+    let mut services: Vec<Symbol> = Vec::new(&env);
+    services.push_back(svc.clone());
+    services.push_back(svc.clone());
+    client.refund_batch(&agent, &services);
+
+    // After processing, usage is zero and dispute is cleared.
+    assert_eq!(client.get_usage(&agent, &svc), 0);
+    assert!(!client.has_open_dispute(&agent, &svc));
+}
+
+/// Two agents with independent disputes: refund_batch only touches the
+/// specified agent.
+#[test]
+fn test_refund_batch_only_touches_specified_agent() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let agent_a = make_agent(&env);
+    let agent_b = make_agent(&env);
+    let svc = make_service(&env, "svc");
+
+    open_dispute_with_usage(&client, &agent_a, &svc, 80);
+    open_dispute_with_usage(&client, &agent_b, &svc, 40);
+
+    let mut services: Vec<Symbol> = Vec::new(&env);
+    services.push_back(svc.clone());
+    client.refund_batch(&agent_a, &services);
+
+    // agent_a's usage is zeroed and dispute cleared.
+    assert_eq!(client.get_usage(&agent_a, &svc), 0);
+    assert!(!client.has_open_dispute(&agent_a, &svc));
+
+    // agent_b is untouched.
+    assert_eq!(client.get_usage(&agent_b, &svc), 40);
+    assert!(client.has_open_dispute(&agent_b, &svc));
+}
+
+/// Empty batch is accepted and is a no-op.
+#[test]
+fn test_refund_batch_empty_list_is_noop() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let agent = make_agent(&env);
+
+    let services: Vec<Symbol> = Vec::new(&env);
+    client.refund_batch(&agent, &services);
+    // No panic — empty batch is valid.
+}
+
+/// Batch at the MAX_BATCH_READ boundary succeeds.
+#[test]
+fn test_refund_batch_at_boundary_succeeds() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let agent = make_agent(&env);
+
+    let mut services: Vec<Symbol> = Vec::new(&env);
+    for i in 0..MAX_BATCH_READ {
+        let s = Symbol::new(&env, &alloc::format!("svc_{}", i));
+        client.record_usage(&agent, &s, &1u32);
+        client.open_dispute(&agent, &s);
+        services.push_back(s);
+    }
+    assert_eq!(services.len(), MAX_BATCH_READ);
+
+    client.refund_batch(&agent, &services);
+
+    // All disputes cleared, all usage zeroed.
+    for i in 0..MAX_BATCH_READ {
+        let s = Symbol::new(&env, &alloc::format!("svc_{}", i));
+        assert!(!client.has_open_dispute(&agent, &s));
+        assert_eq!(client.get_usage(&agent, &s), 0);
+    }
+}
+
+/// refund_batch panics with NotInitialized (#3) when the contract has not
+/// been initialised.
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn test_refund_batch_panics_not_initialized() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, Escrow);
+    let client = EscrowClient::new(&env, &contract_id);
+    let agent = make_agent(&env);
+
+    let services: Vec<Symbol> = Vec::new(&env);
+    client.refund_batch(&agent, &services);
 }
