@@ -60,7 +60,7 @@ extern crate alloc;
 
 use super::*;
 use soroban_sdk::{
-    testutils::{Address as _, Events, Ledger, MockAuth, MockAuthInvoke},
+    testutils::{storage::Persistent as _, Address as _, Events, Ledger, MockAuth, MockAuthInvoke},
     Address, IntoVal, Symbol,
 };
 
@@ -5080,4 +5080,316 @@ fn test_refund_batch_panics_not_initialized() {
 
     let services: Vec<Symbol> = Vec::new(&env);
     client.refund_batch(&agent, &services);
+}
+
+// ── TTL tests ───────────────────────────────────────────────────────────────
+
+/// Create an `Env` with explicit network TTL parameters so tests are
+/// deterministic regardless of SDK defaults.  Matches the Stellar
+/// Cookbook recommendation: "define the custom values of TTL-related
+/// network settings, since the defaults are defined by the SDK and
+/// aren't immediately obvious for the reader of the tests."
+fn setup_ttl_env() -> soroban_sdk::Env {
+    let env = soroban_sdk::Env::default();
+    env.ledger().with_mut(|li| {
+        li.sequence_number = 100_000;
+        li.min_persistent_entry_ttl = 500;
+        li.min_temp_entry_ttl = 100;
+        li.max_entry_ttl = 6_400_000;
+    });
+    env
+}
+
+/// Setting price tiers extends the entry's persistent TTL.
+#[test]
+fn test_set_price_tiers_extends_ttl() {
+    let env = setup_ttl_env();
+    let (client, admin) = setup_initialized(&env);
+    let svc = make_service(&env, "tier_ttl");
+
+    let mut tiers = soroban_sdk::Vec::new(&env);
+    tiers.push_back(PriceTier {
+        threshold_requests: 100,
+        price_stroops: 10,
+    });
+
+    client.set_price_tiers(&svc, &tiers);
+
+    env.as_contract(&contract_address_from_client(&client), || {
+        let ttl = env
+            .storage()
+            .persistent()
+            .get_ttl(&DataKey::PriceTiers(svc));
+        assert!(
+            ttl >= LEDGERS_TTL_EXTEND_TO,
+            "expected TTL >= {} after set_price_tiers, got {}",
+            LEDGERS_TTL_EXTEND_TO,
+            ttl
+        );
+    });
+}
+
+/// Reading price tiers extends the entry's persistent TTL when below
+/// threshold.
+#[test]
+fn test_get_price_tiers_extends_ttl_when_below_threshold() {
+    let env = setup_ttl_env();
+    let (client, admin) = setup_initialized(&env);
+    let svc = make_service(&env, "tier_read_ttl");
+
+    let mut tiers = soroban_sdk::Vec::new(&env);
+    tiers.push_back(PriceTier {
+        threshold_requests: 50,
+        price_stroops: 5,
+    });
+    client.set_price_tiers(&svc, &tiers);
+
+    // Bump the contract instance so it survives the large ledger advance.
+    env.as_contract(&contract_address_from_client(&client), || {
+        env.storage()
+            .instance()
+            .extend_ttl(LEDGERS_TTL_EXTEND_TO, LEDGERS_TTL_EXTEND_TO);
+    });
+
+    // Advance the ledger sequence so the TTL drops below threshold.
+    env.ledger().with_mut(|li| {
+        li.sequence_number += LEDGERS_TTL_THRESHOLD + 1;
+    });
+
+    client.get_price_tiers(&svc);
+
+    env.as_contract(&contract_address_from_client(&client), || {
+        let ttl = env
+            .storage()
+            .persistent()
+            .get_ttl(&DataKey::PriceTiers(svc));
+        assert!(
+            ttl >= LEDGERS_TTL_EXTEND_TO,
+            "expected TTL >= {} after get_price_tiers below threshold, got {}",
+            LEDGERS_TTL_EXTEND_TO,
+            ttl
+        );
+    });
+}
+
+/// Reading price tiers does NOT extend the TTL when already above
+/// threshold (no unnecessary host work).
+#[test]
+fn test_get_price_tiers_no_extend_when_above_threshold() {
+    let env = setup_ttl_env();
+    let (client, admin) = setup_initialized(&env);
+    let svc = make_service(&env, "tier_no_ext");
+
+    let mut tiers = soroban_sdk::Vec::new(&env);
+    tiers.push_back(PriceTier {
+        threshold_requests: 10,
+        price_stroops: 2,
+    });
+    client.set_price_tiers(&svc, &tiers);
+
+    // Capture TTL right after set — should already be at EXTEND_TO.
+    let ttl_before = env.as_contract(&contract_address_from_client(&client), || {
+        env.storage()
+            .persistent()
+            .get_ttl(&DataKey::PriceTiers(svc.clone()))
+    });
+    assert!(ttl_before >= LEDGERS_TTL_EXTEND_TO);
+
+    // Advance just 1 ledger — still above threshold.
+    env.ledger().with_mut(|li| {
+        li.sequence_number += 1;
+    });
+
+    client.get_price_tiers(&svc);
+
+    // TTL should not have been bumped again (no meaningful change).
+    let ttl_after = env.as_contract(&contract_address_from_client(&client), || {
+        env.storage()
+            .persistent()
+            .get_ttl(&DataKey::PriceTiers(svc.clone()))
+    });
+    assert_eq!(
+        ttl_after,
+        ttl_before - 1,
+        "TTL should decrease by 1 ledger, not be bumped"
+    );
+}
+
+/// Setting service metadata extends the entry's persistent TTL.
+#[test]
+fn test_set_service_metadata_extends_ttl() {
+    let env = setup_ttl_env();
+    let (client, admin) = setup_initialized(&env);
+    let svc = make_service(&env, "meta_ttl");
+    let owner = Address::generate(&env);
+    let desc = String::from_str(&env, "TTL test service");
+
+    client.set_service_metadata(&svc, &desc, &owner);
+
+    env.as_contract(&contract_address_from_client(&client), || {
+        let ttl = env
+            .storage()
+            .persistent()
+            .get_ttl(&DataKey::ServiceMetadata(svc));
+        assert!(
+            ttl >= LEDGERS_TTL_EXTEND_TO,
+            "expected TTL >= {} after set_service_metadata, got {}",
+            LEDGERS_TTL_EXTEND_TO,
+            ttl
+        );
+    });
+}
+
+/// Reading service metadata extends the entry's persistent TTL when below
+/// threshold.
+#[test]
+fn test_get_service_metadata_extends_ttl_when_below_threshold() {
+    let env = setup_ttl_env();
+    let (client, admin) = setup_initialized(&env);
+    let svc = make_service(&env, "meta_read_ttl");
+    let owner = Address::generate(&env);
+    let desc = String::from_str(&env, "metadata TTL test");
+
+    client.set_service_metadata(&svc, &desc, &owner);
+
+    // Bump the contract instance so it survives the large ledger advance.
+    env.as_contract(&contract_address_from_client(&client), || {
+        env.storage()
+            .instance()
+            .extend_ttl(LEDGERS_TTL_EXTEND_TO, LEDGERS_TTL_EXTEND_TO);
+    });
+
+    // Advance the ledger sequence so the TTL drops below threshold.
+    env.ledger().with_mut(|li| {
+        li.sequence_number += LEDGERS_TTL_THRESHOLD + 1;
+    });
+
+    client.get_service_metadata(&svc);
+
+    env.as_contract(&contract_address_from_client(&client), || {
+        let ttl = env
+            .storage()
+            .persistent()
+            .get_ttl(&DataKey::ServiceMetadata(svc));
+        assert!(
+            ttl >= LEDGERS_TTL_EXTEND_TO,
+            "expected TTL >= {} after get_service_metadata below threshold, got {}",
+            LEDGERS_TTL_EXTEND_TO,
+            ttl
+        );
+    });
+}
+
+/// Reading service metadata does NOT extend the TTL when already above
+/// threshold.
+#[test]
+fn test_get_service_metadata_no_extend_when_above_threshold() {
+    let env = setup_ttl_env();
+    let (client, admin) = setup_initialized(&env);
+    let svc = make_service(&env, "meta_no_ext");
+    let owner = Address::generate(&env);
+    let desc = String::from_str(&env, "no-extend test");
+
+    client.set_service_metadata(&svc, &desc, &owner);
+
+    let ttl_before = env.as_contract(&contract_address_from_client(&client), || {
+        env.storage()
+            .persistent()
+            .get_ttl(&DataKey::ServiceMetadata(svc.clone()))
+    });
+    assert!(ttl_before >= LEDGERS_TTL_EXTEND_TO);
+
+    // Advance just 1 ledger — still above threshold.
+    env.ledger().with_mut(|li| {
+        li.sequence_number += 1;
+    });
+
+    client.get_service_metadata(&svc);
+
+    let ttl_after = env.as_contract(&contract_address_from_client(&client), || {
+        env.storage()
+            .persistent()
+            .get_ttl(&DataKey::ServiceMetadata(svc.clone()))
+    });
+    assert_eq!(
+        ttl_after,
+        ttl_before - 1,
+        "TTL should decrease by 1 ledger, not be bumped"
+    );
+}
+
+/// register_service_with_metadata extends the metadata entry's TTL.
+#[test]
+fn test_register_service_with_metadata_extends_ttl() {
+    let env = setup_ttl_env();
+    let (client, admin) = setup_initialized(&env);
+    let svc = make_service(&env, "reg_ttl");
+    let owner = Address::generate(&env);
+    let desc = String::from_str(&env, "registration TTL");
+
+    client.register_service_with_metadata(&svc, &desc, &owner);
+
+    env.as_contract(&contract_address_from_client(&client), || {
+        let ttl = env
+            .storage()
+            .persistent()
+            .get_ttl(&DataKey::ServiceMetadata(svc));
+        assert!(
+            ttl >= LEDGERS_TTL_EXTEND_TO,
+            "expected TTL >= {} after register_service_with_metadata, got {}",
+            LEDGERS_TTL_EXTEND_TO,
+            ttl
+        );
+    });
+}
+
+/// transfer_service_ownership extends the metadata entry's TTL.
+#[test]
+fn test_transfer_service_ownership_extends_ttl() {
+    let env = setup_ttl_env();
+    let (client, admin) = setup_initialized(&env);
+    let svc = make_service(&env, "xfer_ttl");
+    let owner = Address::generate(&env);
+    let new_owner = Address::generate(&env);
+    let desc = String::from_str(&env, "transfer TTL");
+
+    client.set_service_metadata(&svc, &desc, &owner);
+
+    // Bump the contract instance AND the Admin entry so they survive the
+    // large ledger advance.
+    env.as_contract(&contract_address_from_client(&client), || {
+        env.storage()
+            .instance()
+            .extend_ttl(LEDGERS_TTL_EXTEND_TO, LEDGERS_TTL_EXTEND_TO);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Admin,
+            LEDGERS_TTL_EXTEND_TO,
+            LEDGERS_TTL_EXTEND_TO,
+        );
+    });
+
+    // Advance so TTL is below threshold.
+    env.ledger().with_mut(|li| {
+        li.sequence_number += LEDGERS_TTL_THRESHOLD + 1;
+    });
+
+    client.transfer_service_ownership(&owner, &svc, &new_owner);
+
+    env.as_contract(&contract_address_from_client(&client), || {
+        let ttl = env
+            .storage()
+            .persistent()
+            .get_ttl(&DataKey::ServiceMetadata(svc));
+        assert!(
+            ttl >= LEDGERS_TTL_EXTEND_TO,
+            "expected TTL >= {} after transfer_service_ownership, got {}",
+            LEDGERS_TTL_EXTEND_TO,
+            ttl
+        );
+    });
+}
+
+/// Helper: extract the contract address from a client for `as_contract` calls.
+fn contract_address_from_client<'a>(client: &EscrowClient<'a>) -> soroban_sdk::Address {
+    client.address.clone()
 }

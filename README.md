@@ -338,6 +338,29 @@ alongside bounded paid services should keep `min_stroops = 0`.
 - An inverted band (`min > max`) is rejected immediately, so the stored
   bounds are always a valid interval `min ≤ max`.
 
+### Persistent storage TTL management
+
+Soroban persistent entries have a TTL (measured in ledgers). Without periodic
+extension, entries that are not frequently rewritten will eventually expire
+and be archived off-chain, breaking reads until restored. The escrow contract
+manages TTL automatically for price-tier and service-metadata entries:
+
+- **Shared constants:** `LEDGERS_TTL_THRESHOLD` (100 800 ledgers, ~7 days)
+  and `LEDGERS_TTL_EXTEND_TO` (201 600 ledgers, ~14 days) define the
+  bump policy.
+- **Shared helper:** `bump_persistent(env, key)` extends the TTL of any
+  persistent entry whose remaining TTL is at or below the threshold.
+- **Reads:** `get_price_tiers` and `get_service_metadata` call
+  `bump_persistent` after reading, keeping actively-queried entries alive.
+- **Writes:** `set_price_tiers`, `set_service_metadata`,
+  `register_service_with_metadata`, and `transfer_service_ownership` call
+  `bump_persistent` after writing.
+- **Deletes:** `remove_price_tiers` and `clear_service_metadata` delete the
+  entry outright — no TTL extension is performed.
+
+When the current TTL is above the threshold the `extend_ttl` call is a
+host-level no-op, so there is negligible cost for frequently-accessed entries.
+
 ## Prerequisites
 
 - [Rust](https://rustup.rs/) (stable, with `rustfmt`)

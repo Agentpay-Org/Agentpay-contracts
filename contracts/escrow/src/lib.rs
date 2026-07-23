@@ -397,6 +397,33 @@ fn ensure_not_paused(env: &Env) {
     }
 }
 
+/// Remaining-ledger threshold below which a persistent entry's TTL is
+/// refreshed.  Chosen as ~7 days (100 800 ledgers at ~1440 ledgers/day)
+/// so entries are bumped well before archival while keeping the cost of
+/// the no-op path (TTL above threshold) negligible.
+const LEDGERS_TTL_THRESHOLD: u32 = 100_800;
+
+/// Target TTL (in ledgers) applied when an entry falls below the
+/// threshold.  ~14 days (201 600 ledgers) provides a comfortable margin
+/// before the next required bump.
+const LEDGERS_TTL_EXTEND_TO: u32 = 201_600;
+
+/// Extend the TTL of a persistent storage entry when it falls at or
+/// below [`LEDGERS_TTL_THRESHOLD`].  The entry's TTL is then set to
+/// [`LEDGERS_TTL_EXTEND_TO`].  When the current TTL is already above
+/// the threshold the call is a host-level no-op and costs essentially
+/// nothing.
+///
+/// This is the single shared helper for TTL bumping so the policy lives
+/// in one place and is easy to audit.
+fn bump_persistent(env: &Env, key: &DataKey) {
+    if env.storage().persistent().has(key) {
+        env.storage()
+            .persistent()
+            .extend_ttl(key, LEDGERS_TTL_THRESHOLD, LEDGERS_TTL_EXTEND_TO);
+    }
+}
+
 /// Read the admin address without requiring auth. Used by helpers that need
 /// the admin value for comparison but do not gate on it themselves.
 fn get_admin_address(env: &Env) -> Address {
@@ -1160,7 +1187,8 @@ impl Escrow {
     /// restored by removing the tier schedule via `remove_price_tiers`.
     ///
     /// Admin-gated and honours the pause gate. Emits
-    /// `tiers_set(service_id)` on success.
+    /// `tiers_set(service_id)` on success.  Extends the entry's
+    /// persistent TTL on write.
     ///
     /// # Tier-schedule invariants (enforced at set-time)
     /// - Must contain at least one entry.
@@ -1195,22 +1223,26 @@ impl Escrow {
         env.storage()
             .persistent()
             .set(&DataKey::PriceTiers(service_id.clone()), &tiers);
+        bump_persistent(&env, &DataKey::PriceTiers(service_id.clone()));
         env.events()
             .publish((symbol_short!("tiers_set"),), service_id);
     }
 
     /// Read the tier schedule for a service, or `None` if no schedule has
-    /// been set (the service uses flat `ServicePrice` billing).
+    /// been set (the service uses flat `ServicePrice` billing).  Extends
+    /// the entry's persistent TTL on read.
     pub fn get_price_tiers(env: Env, service_id: Symbol) -> Option<Vec<PriceTier>> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::PriceTiers(service_id))
+        let key = DataKey::PriceTiers(service_id);
+        let result: Option<Vec<PriceTier>> = env.storage().persistent().get(&key);
+        bump_persistent(&env, &key);
+        result
     }
 
     /// Admin removes the tier schedule for a service, reverting billing to
     /// the flat `ServicePrice`. Idempotent — removing an absent schedule is
     /// a no-op. Admin-gated and honours the pause gate. Emits
-    /// `tiers_rm(service_id)`.
+    /// `tiers_rm(service_id)`.  The entry is deleted, so no TTL
+    /// extension is performed.
     pub fn remove_price_tiers(env: Env, service_id: Symbol) {
         require_admin(&env);
         ensure_not_paused(&env);
@@ -1806,7 +1838,8 @@ impl Escrow {
     /// in a single topic.
     ///
     /// Idempotent — re-registering an existing id overwrites its
-    /// metadata.  An empty `description` is accepted.
+    /// metadata.  An empty `description` is accepted.  Extends the
+    /// metadata entry's persistent TTL on write.
     pub fn register_service_with_metadata(
         env: Env,
         service_id: Symbol,
@@ -1823,6 +1856,7 @@ impl Escrow {
                 owner: owner.clone(),
             },
         );
+        bump_persistent(&env, &DataKey::ServiceMetadata(service_id.clone()));
         env.events()
             .publish((symbol_short!("svc_reg"),), (service_id, owner));
     }
@@ -1915,10 +1949,12 @@ impl Escrow {
     }
 
     /// Read the metadata for a service, or `None` if none has been set.
+    /// Extends the entry's persistent TTL on read.
     pub fn get_service_metadata(env: Env, service_id: Symbol) -> Option<ServiceMetadata> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::ServiceMetadata(service_id))
+        let key = DataKey::ServiceMetadata(service_id);
+        let result: Option<ServiceMetadata> = env.storage().persistent().get(&key);
+        bump_persistent(&env, &key);
+        result
     }
 
     /// Returns `true` iff the service has been disabled.
@@ -1936,13 +1972,15 @@ impl Escrow {
 
     /// Admin sets human-readable metadata for a service. Persisted
     /// under `DataKey::ServiceMetadata(service_id)`. Description is
-    /// capped at 256 UTF-8 bytes to bound storage cost.
+    /// capped at 256 UTF-8 bytes to bound storage cost.  Extends the
+    /// entry's persistent TTL on write.
     pub fn set_service_metadata(env: Env, service_id: Symbol, description: String, owner: Address) {
         require_admin(&env);
         env.storage().persistent().set(
-            &DataKey::ServiceMetadata(service_id),
+            &DataKey::ServiceMetadata(service_id.clone()),
             &ServiceMetadata { description, owner },
         );
+        bump_persistent(&env, &DataKey::ServiceMetadata(service_id));
     }
 
     /// Transfer ownership of a service's metadata to `new_owner`,
@@ -1954,7 +1992,8 @@ impl Escrow {
     /// not the owner or admin.
     /// Emits `owner_chg(service_id, old_owner, new_owner)` for indexers
     /// only on genuine transfers (no-op self-transfers are rejected
-    /// before any storage write or event emission).
+    /// before any storage write or event emission).  Extends the
+    /// metadata entry's persistent TTL on write.
     /// Honours the pause gate.
     pub fn transfer_service_ownership(
         env: Env,
@@ -1986,6 +2025,7 @@ impl Escrow {
         env.storage()
             .persistent()
             .set(&DataKey::ServiceMetadata(service_id.clone()), &meta);
+        bump_persistent(&env, &DataKey::ServiceMetadata(service_id.clone()));
         env.events().publish(
             (symbol_short!("owner_chg"),),
             (service_id, old_owner, new_owner),
@@ -1997,7 +2037,8 @@ impl Escrow {
     /// `get_service_metadata` reads back `None`. Registration and usage
     /// history live in independent slots and are untouched. Emits
     /// `meta_clr(service_id)` (topic shortened to satisfy the 9-char
-    /// `symbol_short!` limit).
+    /// `symbol_short!` limit).  The entry is deleted, so no TTL
+    /// extension is performed.
     pub fn clear_service_metadata(env: Env, service_id: Symbol) {
         require_admin(&env);
         env.storage()
