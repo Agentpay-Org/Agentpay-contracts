@@ -424,6 +424,39 @@ fn read_agent_credit(env: &Env, agent: &Address) -> i128 {
         .unwrap_or(0)
 }
 
+/// Check that an agent's prepaid credit balance (if set) can cover the projected bill for `total_requests`.
+///
+/// Panics with [`EscrowError::InsufficientCreditBalance`] when `credit_balance > 0`
+/// and the projected bill for `total_requests` exceeds that balance.
+fn check_debit_precondition(env: &Env, agent: &Address, service_id: &Symbol, total_requests: u32) {
+    let credit_balance = read_agent_credit(env, agent);
+    if credit_balance > 0 {
+        let projected_bill = compute_billing_for_requests(env, service_id, total_requests);
+        if projected_bill > credit_balance {
+            panic_with_error!(env, EscrowError::InsufficientCreditBalance);
+        }
+    }
+}
+
+/// Draw down an agent's prepaid credit balance by `billed` stroops.
+///
+/// If `billed > 0` and `credit_balance > 0`, deducts `min(billed, credit_balance)` from the agent's
+/// prepaid credit balance, updates storage, and publishes a `cred_deb` event.
+fn debit_agent_credit(env: &Env, agent: &Address, billed: i128) {
+    let credit_balance = read_agent_credit(env, agent);
+    if billed > 0 && credit_balance > 0 {
+        let debit = billed.min(credit_balance);
+        let new_balance = credit_balance.saturating_sub(debit);
+        env.storage()
+            .persistent()
+            .set(&DataKey::AgentCredit(agent.clone()), &new_balance);
+        env.events().publish(
+            (symbol_short!("cred_deb"),),
+            (agent.clone(), debit, new_balance),
+        );
+    }
+}
+
 /// Compute the bill for a given service and request total using the configured
 /// flat price or tier schedule. This is shared by `record_usage`, `settle`,
 /// and the public `compute_billing` read.
@@ -724,13 +757,7 @@ impl Escrow {
         let key = DataKey::Usage(agent.clone(), service_id.clone());
         let prev: u32 = env.storage().persistent().get(&key).unwrap_or(0);
         let total = prev.saturating_add(requests);
-        let credit_balance = read_agent_credit(&env, &agent);
-        if credit_balance > 0 {
-            let projected_bill = compute_billing_for_requests(&env, &service_id, total);
-            if projected_bill > credit_balance {
-                panic_with_error!(&env, EscrowError::InsufficientCreditBalance);
-            }
-        }
+        check_debit_precondition(&env, &agent, &service_id, total);
         // saturate: settlement drains long before u32::MAX; never panic the hot path.
         env.storage().persistent().set(&key, &total);
 
@@ -1324,18 +1351,7 @@ impl Escrow {
         let requests: u32 = env.storage().persistent().get(&usage_key).unwrap_or(0);
         // Use tier schedule when present; fall back to flat price.
         let billed = compute_billing_for_requests(&env, &service_id, requests);
-        let credit_balance = read_agent_credit(&env, &agent);
-        if billed > 0 && credit_balance > 0 {
-            let debit = billed.min(credit_balance);
-            let new_balance = credit_balance.saturating_sub(debit);
-            env.storage()
-                .persistent()
-                .set(&DataKey::AgentCredit(agent.clone()), &new_balance);
-            env.events().publish(
-                (symbol_short!("cred_deb"),),
-                (agent.clone(), debit, new_balance),
-            );
-        }
+        debit_agent_credit(&env, &agent, billed);
         add_settled_totals(&env, &agent, billed);
         env.storage().persistent().set(&usage_key, &0u32);
         // Prune the service from the agent's index since usage is now zero.

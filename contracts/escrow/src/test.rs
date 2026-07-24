@@ -1,4 +1,3 @@
-#![cfg(test)]
 #![allow(deprecated)]
 #![allow(unused_variables)]
 #![allow(dead_code)]
@@ -568,6 +567,66 @@ fn test_record_usage_rejects_insufficient_credit_balance() {
     client.credit_agent(&agent, &20i128);
 
     client.record_usage(&agent, &svc, &3u32);
+}
+
+#[test]
+fn test_record_usage_allows_exact_credit_balance() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "infer");
+    client.set_service_price(&svc, &10i128);
+    client.credit_agent(&agent, &30i128);
+
+    // Projected bill is 3 * 10 = 30, exactly equal to credit balance.
+    client.record_usage(&agent, &svc, &3u32);
+    assert_eq!(client.get_usage(&agent, &svc), 3u32);
+}
+
+#[test]
+fn test_record_usage_allows_uncredited_agent() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "infer");
+    client.set_service_price(&svc, &10i128);
+
+    // Agent has 0 credit balance recorded; check should not panic.
+    client.record_usage(&agent, &svc, &100u32);
+    assert_eq!(client.get_usage(&agent, &svc), 100u32);
+}
+
+#[test]
+fn test_settle_partial_credit_balance_drawdown() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "infer");
+    client.set_service_price(&svc, &10i128);
+    // Record usage while credit balance is 0.
+    client.record_usage(&agent, &svc, &5u32);
+
+    // Credit agent with less than total bill (15 stroops vs 50 stroops bill).
+    client.credit_agent(&agent, &15i128);
+
+    let billed = client.settle(&admin, &agent, &svc);
+    let events = env.events().all();
+
+    assert_eq!(billed, 50i128);
+    // Debit is min(50, 15) = 15; new credit balance is 0.
+    assert_eq!(client.get_agent_credit(&agent), 0i128);
+
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("cred_deb"),).into_val(&env);
+    let (_addr, _topics, data) = events
+        .iter()
+        .find(|(_a, t, _d)| *t == expected_topics)
+        .expect("settle should emit a cred_deb event for partial credit drawdown");
+    let decoded: (Address, i128, i128) = data.into_val(&env);
+    assert_eq!(decoded, (agent.clone(), 15i128, 0i128));
 }
 
 #[test]
@@ -1843,7 +1902,7 @@ fn test_list_open_disputes_is_bounded_by_batch_limit() {
     }
 
     let disputes = client.list_open_disputes(&agent);
-    assert_eq!(disputes.len(), MAX_BATCH_READ as u32);
+    assert_eq!(disputes.len(), MAX_BATCH_READ);
     for i in 0..MAX_BATCH_READ {
         assert_eq!(disputes.get(i), expected.get(i));
     }
