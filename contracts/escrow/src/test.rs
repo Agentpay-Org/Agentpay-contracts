@@ -1026,6 +1026,19 @@ fn test_transfer_service_ownership_genuine_transfer_emits_event() {
     let decoded: (Symbol, Address, Address) = data.into_val(&env);
     assert_eq!(decoded, (svc, owner, new_owner));
 }
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")]
+fn test_transfer_service_ownership_rejected_while_paused() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let svc = Symbol::new(&env, "infer");
+    let owner = Address::generate(&env);
+    let new_owner = Address::generate(&env);
+    let desc = String::from_str(&env, "inference service");
+    client.set_service_metadata(&svc, &desc, &owner);
+    client.pause();
+    client.transfer_service_ownership(&owner, &svc, &new_owner);
+}
 
 #[test]
 #[should_panic(expected = "Unauthorized")]
