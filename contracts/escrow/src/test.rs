@@ -5620,8 +5620,11 @@ fn test_debit_event_payload_on_settle() {
         .find(|(_, t, _)| *t == expected_topics)
         .expect("settle must emit a cred_deb event");
     let decoded: (Address, i128, i128) = cred_deb_event.2.into_val(&env);
-    assert_eq!(decoded, (agent.clone(), 50i128, 150i128),
-        "cred_deb payload must be (agent, debit=50, new_balance=150)");
+    assert_eq!(
+        decoded,
+        (agent.clone(), 50i128, 150i128),
+        "cred_deb payload must be (agent, debit=50, new_balance=150)"
+    );
 }
 
 /// `cred_deb` is emitted exactly once per settle, not per record_usage.
@@ -5691,8 +5694,11 @@ fn test_debit_partial_credit_clamped_to_balance() {
         .find(|(_, t, _)| *t == expected_topics)
         .expect("settle must emit cred_deb for partial credit");
     let decoded: (Address, i128, i128) = cred_deb_event.2.into_val(&env);
-    assert_eq!(decoded, (agent.clone(), 15i128, 0i128),
-        "cred_deb payload: debit=min(50,15)=15, new_balance=0");
+    assert_eq!(
+        decoded,
+        (agent.clone(), 15i128, 0i128),
+        "cred_deb payload: debit=min(50,15)=15, new_balance=0"
+    );
 }
 
 /// Tier-aware billing: the precondition uses tier math, not flat price.
@@ -5726,8 +5732,10 @@ fn test_debit_boundary_tier_aware_precondition() {
     client.credit_agent(&agent, &100i128);
 
     let record = client.record_usage(&agent, &svc, &15u32);
-    assert_eq!(record.requests, 15,
-        "projected_bill(tier, 15 req) = 100 == credit_balance → accepted");
+    assert_eq!(
+        record.requests, 15,
+        "projected_bill(tier, 15 req) = 100 == credit_balance → accepted"
+    );
 }
 
 /// Tier-aware billing reject: one stroop under the tier-computed bill.
@@ -5857,8 +5865,10 @@ fn test_debit_boundary_free_service_no_check() {
 
     // Even with credit = 1 and requests = 1_000_000, bill = 0 → accepted.
     let record = client.record_usage(&agent, &svc, &1_000_000u32);
-    assert_eq!(record.requests, 1_000_000,
-        "free service must never trigger the debit precondition");
+    assert_eq!(
+        record.requests, 1_000_000,
+        "free service must never trigger the debit precondition"
+    );
 }
 
 /// settle emits `cred_deb` exactly once even when called twice.
@@ -5887,7 +5897,10 @@ fn test_debit_event_emitted_exactly_once_per_settle_with_credit() {
         .iter()
         .filter(|(_, t, _)| *t == expected_topics)
         .count();
-    assert_eq!(first_count, 1, "first settle (non-zero bill) must emit one cred_deb");
+    assert_eq!(
+        first_count, 1,
+        "first settle (non-zero bill) must emit one cred_deb"
+    );
 
     // Second settle with no new usage: billed = 0 → no cred_deb emitted.
     client.settle(&admin, &agent, &svc);
@@ -5896,6 +5909,8 @@ fn test_debit_event_emitted_exactly_once_per_settle_with_credit() {
         .iter()
         .filter(|(_, t, _)| *t == expected_topics)
         .count();
-    assert_eq!(second_count, 0,
-        "second settle (zero bill) must not emit cred_deb");
+    assert_eq!(
+        second_count, 0,
+        "second settle (zero bill) must not emit cred_deb"
+    );
 }
