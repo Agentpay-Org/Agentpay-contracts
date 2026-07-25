@@ -5465,3 +5465,437 @@ fn test_transfer_service_ownership_extends_ttl() {
 fn contract_address_from_client<'a>(client: &EscrowClient<'a>) -> soroban_sdk::Address {
     client.address.clone()
 }
+
+// ── Debit boundary tests ─────────────────────────────────────────────────────
+//
+// The debit precondition in `record_usage` checks whether the agent's prepaid
+// credit balance can cover the *projected* bill for the new cumulative total.
+// If the balance is positive and the projected bill exceeds it, the call is
+// rejected with `InsufficientCreditBalance` (#28).
+//
+// Key invariants to cover:
+//   1. Exact balance: projected_bill == credit_balance → accepted
+//   2. One-over: projected_bill == credit_balance + 1 → rejected with #28
+//   3. Zero credit: no check is performed, any usage accepted
+//   4. Unauthorized caller (no agent auth) → auth error before any debit check
+//   5. Event: successful debit emits `cred_deb(agent, debit, new_balance)`
+//   6. cred_deb event is emitted exactly once per settle drain (not per record)
+//   7. Settle drains full bill, emits `cred_deb` with correct remainder
+//   8. Tier-aware billing: precondition uses tier math, not flat price
+//   9. Accumulating across calls: each record_usage re-checks the *new total*
+//  10. Paused contract beats debit check (#4 before #28)
+//
+// Note: `check_debit_precondition` is called AFTER the usage counter is read
+// (to get prev) and BEFORE the counter is written. This means the check sees
+// the projected post-write total, not the pre-write total.
+
+/// Exactly at the credit boundary: projected_bill == credit_balance.
+///
+/// The precondition is `projected_bill > credit_balance`, so equality is
+/// accepted. This is the accept side of the boundary.
+#[test]
+fn test_debit_boundary_exact_balance_accepted() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+
+    let agent = make_agent(&env);
+    let svc = make_service(&env, "pay_svc");
+    let price = 10i128;
+    let requests = 5u32; // bill = 50
+
+    client.set_service_price(&svc, &price);
+    // Credit the agent with exactly the projected bill.
+    client.credit_agent(&agent, &50i128);
+
+    // projected_bill(5 requests × 10 stroops) = 50 == credit_balance → accepted.
+    let record = client.record_usage(&agent, &svc, &requests);
+    assert_eq!(record.requests, requests);
+    assert_eq!(client.get_usage(&agent, &svc), requests);
+}
+
+/// One unit over the credit boundary: projected_bill == credit_balance + 1.
+///
+/// This is the reject side of the boundary: the projected bill exceeds the
+/// balance by a single stroop, which must trigger #28.
+#[test]
+#[should_panic(expected = "Error(Contract, #28)")]
+fn test_debit_boundary_one_over_balance_rejected() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+
+    let agent = make_agent(&env);
+    let svc = make_service(&env, "pay_svc");
+    let price = 10i128;
+    let requests = 5u32; // projected_bill = 50
+
+    client.set_service_price(&svc, &price);
+    // Credit the agent with one stroop less than the projected bill.
+    client.credit_agent(&agent, &49i128);
+
+    // projected_bill(5 × 10) = 50 > 49 → InsufficientCreditBalance (#28).
+    client.record_usage(&agent, &svc, &requests);
+}
+
+/// Zero credit balance: the debit check is skipped entirely.
+///
+/// When `credit_balance == 0`, `check_debit_precondition` returns early
+/// without consulting the billing math. Any usage count is then accepted
+/// regardless of the configured price.
+#[test]
+fn test_debit_boundary_zero_credit_skips_check() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+
+    let agent = make_agent(&env);
+    let svc = make_service(&env, "pay_svc");
+
+    client.set_service_price(&svc, &100i128);
+    // Agent has no credit balance recorded (implicit zero).
+    assert_eq!(client.get_agent_credit(&agent), 0i128);
+
+    // Large usage that would fail the check if credit were positive.
+    let record = client.record_usage(&agent, &svc, &1_000_000u32);
+    assert_eq!(record.requests, 1_000_000);
+}
+
+/// Unauthorized caller: auth failure before the debit precondition.
+///
+/// `record_usage` enforces `agent.require_auth()` before entering any
+/// validation gate. A call with no agent signature must fail before reaching
+/// the credit-balance check. This test uses `set_auths(&[])` to simulate
+/// missing agent auth.
+#[test]
+#[should_panic]
+fn test_debit_boundary_unauthorized_caller_before_check() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, Escrow);
+    let client = EscrowClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+
+    env.mock_all_auths();
+    client.init(&admin);
+    let agent = make_agent(&env);
+    let svc = make_service(&env, "pay_svc");
+    client.set_service_price(&svc, &10i128);
+    client.credit_agent(&agent, &1000i128);
+
+    // Drop all mocked auth — the agent's require_auth must reject the call.
+    env.set_auths(&[]);
+    client.record_usage(&agent, &svc, &50u32);
+}
+
+/// Settle emits `cred_deb(agent, debit, new_balance)` with correct values.
+///
+/// After a successful settlement, `debit_agent_credit` draws down the
+/// balance and emits a single `cred_deb` event. The payload must carry
+/// the exact debit amount and the resulting balance.
+#[test]
+fn test_debit_event_payload_on_settle() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+
+    let agent = make_agent(&env);
+    let svc = make_service(&env, "pay_svc");
+    let price = 10i128;
+    let credit = 200i128;
+    let requests = 5u32; // bill = 50, new_balance = 200 - 50 = 150
+
+    client.set_service_price(&svc, &price);
+    client.credit_agent(&agent, &credit);
+    client.record_usage(&agent, &svc, &requests);
+
+    let billed = client.settle(&admin, &agent, &svc);
+    // Capture events immediately after settle — `events().all()` only
+    // surfaces events from the most recent invocation.
+    let events = env.events().all();
+
+    assert_eq!(billed, 50i128);
+    assert_eq!(client.get_agent_credit(&agent), 150i128);
+
+    // Locate the `cred_deb` event by topic (settle also emits `settled`).
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("cred_deb"),).into_val(&env);
+    let cred_deb_event = events
+        .iter()
+        .find(|(_, t, _)| *t == expected_topics)
+        .expect("settle must emit a cred_deb event");
+    let decoded: (Address, i128, i128) = cred_deb_event.2.into_val(&env);
+    assert_eq!(decoded, (agent.clone(), 50i128, 150i128),
+        "cred_deb payload must be (agent, debit=50, new_balance=150)");
+}
+
+/// `cred_deb` is emitted exactly once per settle, not per record_usage.
+///
+/// The debit event is emitted by `debit_agent_credit` inside `settle`, not
+/// inside `record_usage`. A `record_usage` call that passes the precondition
+/// should not emit a `cred_deb` event.
+#[test]
+fn test_debit_event_not_emitted_on_record_usage() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+
+    let agent = make_agent(&env);
+    let svc = make_service(&env, "pay_svc");
+
+    client.set_service_price(&svc, &10i128);
+    client.credit_agent(&agent, &500i128);
+
+    // record_usage must NOT emit a cred_deb event.
+    client.record_usage(&agent, &svc, &5u32);
+
+    let events = env.events().all();
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("cred_deb"),).into_val(&env);
+    let cred_deb_count = events
+        .iter()
+        .filter(|(_, t, _)| *t == expected_topics)
+        .count();
+    assert_eq!(
+        cred_deb_count, 0,
+        "record_usage must not emit a cred_deb event; debit only happens at settle"
+    );
+}
+
+/// Settle with partial credit: debit is capped at `min(billed, credit)`.
+///
+/// When the bill exceeds the credit balance, `debit_agent_credit` clamps
+/// the debit to the full credit balance (saturating_sub to zero). The
+/// event payload must reflect the clamped debit, not the full bill.
+#[test]
+fn test_debit_partial_credit_clamped_to_balance() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+
+    let agent = make_agent(&env);
+    let svc = make_service(&env, "pay_svc");
+    let price = 10i128;
+    let credit = 15i128;
+    let requests = 5u32; // bill = 50, credit = 15 → debit = min(50, 15) = 15
+
+    client.set_service_price(&svc, &price);
+    // Record before crediting so the precondition check sees credit = 0.
+    client.record_usage(&agent, &svc, &requests);
+    client.credit_agent(&agent, &credit);
+
+    let billed = client.settle(&admin, &agent, &svc);
+    let events = env.events().all();
+
+    assert_eq!(billed, 50i128);
+    // Credit is fully consumed (min(50, 15) = 15 → 0 remaining).
+    assert_eq!(client.get_agent_credit(&agent), 0i128);
+
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("cred_deb"),).into_val(&env);
+    let cred_deb_event = events
+        .iter()
+        .find(|(_, t, _)| *t == expected_topics)
+        .expect("settle must emit cred_deb for partial credit");
+    let decoded: (Address, i128, i128) = cred_deb_event.2.into_val(&env);
+    assert_eq!(decoded, (agent.clone(), 15i128, 0i128),
+        "cred_deb payload: debit=min(50,15)=15, new_balance=0");
+}
+
+/// Tier-aware billing: the precondition uses tier math, not flat price.
+///
+/// When a price-tier schedule is configured, `check_debit_precondition`
+/// must call `compute_billing_for_requests` which routes through the tier
+/// schedule. The boundary test verifies the tier computation reaches the
+/// debit check (instead of silently falling back to flat-price 0).
+#[test]
+fn test_debit_boundary_tier_aware_precondition() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+
+    let agent = make_agent(&env);
+    let svc = make_service(&env, "pay_svc");
+
+    // Tier schedule: first 10 requests @ 5 stroops, rest @ 10 stroops.
+    let mut tiers = soroban_sdk::Vec::new(&env);
+    tiers.push_back(PriceTier {
+        threshold_requests: 10,
+        price_stroops: 5,
+    });
+    tiers.push_back(PriceTier {
+        threshold_requests: u32::MAX,
+        price_stroops: 10,
+    });
+    client.set_price_tiers(&svc, &tiers);
+
+    // For 15 requests: 10 × 5 + 5 × 10 = 100 stroops.
+    // Credit the agent with exactly 100 stroops (accept boundary).
+    client.credit_agent(&agent, &100i128);
+
+    let record = client.record_usage(&agent, &svc, &15u32);
+    assert_eq!(record.requests, 15,
+        "projected_bill(tier, 15 req) = 100 == credit_balance → accepted");
+}
+
+/// Tier-aware billing reject: one stroop under the tier-computed bill.
+///
+/// Confirms the tier calculation is actually used (not flat price fallback)
+/// by placing the credit one unit below the tier-computed boundary.
+#[test]
+#[should_panic(expected = "Error(Contract, #28)")]
+fn test_debit_boundary_tier_aware_one_under_rejected() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+
+    let agent = make_agent(&env);
+    let svc = make_service(&env, "pay_svc");
+
+    let mut tiers = soroban_sdk::Vec::new(&env);
+    tiers.push_back(PriceTier {
+        threshold_requests: 10,
+        price_stroops: 5,
+    });
+    tiers.push_back(PriceTier {
+        threshold_requests: u32::MAX,
+        price_stroops: 10,
+    });
+    client.set_price_tiers(&svc, &tiers);
+
+    // Tier-computed bill for 15 requests = 100 stroops.
+    // Credit one stroop less → projected_bill(100) > credit(99) → #28.
+    client.credit_agent(&agent, &99i128);
+    client.record_usage(&agent, &svc, &15u32);
+}
+
+/// Accumulating across calls: precondition checks the new cumulative total.
+///
+/// Each call to `record_usage` evaluates the precondition against
+/// `prev + requests` (the projected post-write total). This test confirms
+/// the check correctly accounts for previously accumulated usage when
+/// deciding whether the credit balance is sufficient.
+#[test]
+fn test_debit_boundary_accumulates_across_calls() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+
+    let agent = make_agent(&env);
+    let svc = make_service(&env, "pay_svc");
+    let price = 10i128;
+
+    client.set_service_price(&svc, &price);
+    // Credit for exactly 30 requests: 30 × 10 = 300 stroops.
+    client.credit_agent(&agent, &300i128);
+
+    // First call: 15 requests, projected total = 15, bill = 150 ≤ 300 → accepted.
+    client.record_usage(&agent, &svc, &15u32);
+    assert_eq!(client.get_usage(&agent, &svc), 15);
+
+    // Second call: 15 more, projected total = 30, bill = 300 == 300 → accepted (exact boundary).
+    client.record_usage(&agent, &svc, &15u32);
+    assert_eq!(client.get_usage(&agent, &svc), 30);
+}
+
+/// Accumulating across calls reject: one request over the boundary.
+///
+/// After accumulating to 29 requests (bill = 290 ≤ 300), one more
+/// request pushes the projected total to 30 (bill = 300... wait, let's
+/// use 31 requests total: bill = 310 > 300 → #28).
+#[test]
+#[should_panic(expected = "Error(Contract, #28)")]
+fn test_debit_boundary_accumulates_rejects_one_over() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+
+    let agent = make_agent(&env);
+    let svc = make_service(&env, "pay_svc");
+    let price = 10i128;
+
+    client.set_service_price(&svc, &price);
+    // Credit for exactly 30 requests (300 stroops).
+    client.credit_agent(&agent, &300i128);
+
+    // Accumulate 30 requests across two calls (each exactly at limit).
+    client.record_usage(&agent, &svc, &15u32); // total = 15, bill = 150 ≤ 300 ✓
+    client.record_usage(&agent, &svc, &15u32); // total = 30, bill = 300 = 300 ✓
+
+    // One more request: projected total = 31, bill = 310 > 300 → #28.
+    client.record_usage(&agent, &svc, &1u32);
+}
+
+/// Paused contract beats the debit check.
+///
+/// `ensure_not_paused` (#4) is checked before the debit precondition (#28).
+/// Even with an insufficient credit balance, a paused contract returns #4.
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")]
+fn test_debit_boundary_paused_beats_insufficient_credit() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+
+    let agent = make_agent(&env);
+    let svc = make_service(&env, "pay_svc");
+
+    client.set_service_price(&svc, &10i128);
+    // Clearly insufficient credit: 1 stroop for a 10-stroop bill.
+    client.credit_agent(&agent, &1i128);
+    client.pause();
+
+    // Must panic with #4 (ContractPaused), not #28 (InsufficientCreditBalance).
+    client.record_usage(&agent, &svc, &1u32);
+}
+
+/// Zero-price service with positive credit: no debit check is triggered.
+///
+/// When `price == 0`, `compute_billing_for_requests` returns 0. The
+/// precondition `projected_bill > credit_balance` is `0 > N` which is
+/// always false, so the call is accepted regardless of credit balance.
+#[test]
+fn test_debit_boundary_free_service_no_check() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+
+    let agent = make_agent(&env);
+    let svc = make_service(&env, "free_svc");
+
+    // Free service: price = 0.
+    client.set_service_price(&svc, &0i128);
+    // Set a very small credit that would block any real bill.
+    client.credit_agent(&agent, &1i128);
+
+    // Even with credit = 1 and requests = 1_000_000, bill = 0 → accepted.
+    let record = client.record_usage(&agent, &svc, &1_000_000u32);
+    assert_eq!(record.requests, 1_000_000,
+        "free service must never trigger the debit precondition");
+}
+
+/// settle emits `cred_deb` exactly once even when called twice.
+///
+/// Verifies that two sequential settle calls each emit at most one
+/// `cred_deb` event, and that the second call (with zero usage) does
+/// not emit a debit event (since `billed == 0` and `debit_agent_credit`
+/// short-circuits on zero billed amounts).
+#[test]
+fn test_debit_event_emitted_exactly_once_per_settle_with_credit() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+
+    let agent = make_agent(&env);
+    let svc = make_service(&env, "pay_svc");
+    client.set_service_price(&svc, &10i128);
+    client.credit_agent(&agent, &200i128);
+    client.record_usage(&agent, &svc, &5u32); // bill = 50
+
+    // First settle: billed = 50 > 0 and credit > 0 → emits cred_deb.
+    client.settle(&admin, &agent, &svc);
+    let events_first = env.events().all();
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("cred_deb"),).into_val(&env);
+    let first_count = events_first
+        .iter()
+        .filter(|(_, t, _)| *t == expected_topics)
+        .count();
+    assert_eq!(first_count, 1, "first settle (non-zero bill) must emit one cred_deb");
+
+    // Second settle with no new usage: billed = 0 → no cred_deb emitted.
+    client.settle(&admin, &agent, &svc);
+    let events_second = env.events().all();
+    let second_count = events_second
+        .iter()
+        .filter(|(_, t, _)| *t == expected_topics)
+        .count();
+    assert_eq!(second_count, 0,
+        "second settle (zero bill) must not emit cred_deb");
+}

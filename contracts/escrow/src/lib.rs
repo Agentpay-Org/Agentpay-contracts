@@ -401,12 +401,12 @@ fn ensure_not_paused(env: &Env) {
 /// refreshed.  Chosen as ~7 days (100 800 ledgers at ~1440 ledgers/day)
 /// so entries are bumped well before archival while keeping the cost of
 /// the no-op path (TTL above threshold) negligible.
-const LEDGERS_TTL_THRESHOLD: u32 = 100_800;
+pub(crate) const LEDGERS_TTL_THRESHOLD: u32 = 100_800;
 
 /// Target TTL (in ledgers) applied when an entry falls below the
 /// threshold.  ~14 days (201 600 ledgers) provides a comfortable margin
 /// before the next required bump.
-const LEDGERS_TTL_EXTEND_TO: u32 = 201_600;
+pub(crate) const LEDGERS_TTL_EXTEND_TO: u32 = 201_600;
 
 /// Extend the TTL of a persistent storage entry when it falls at or
 /// below [`LEDGERS_TTL_THRESHOLD`].  The entry's TTL is then set to
