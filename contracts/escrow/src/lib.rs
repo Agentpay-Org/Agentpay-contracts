@@ -401,12 +401,12 @@ fn ensure_not_paused(env: &Env) {
 /// refreshed.  Chosen as ~7 days (100 800 ledgers at ~1440 ledgers/day)
 /// so entries are bumped well before archival while keeping the cost of
 /// the no-op path (TTL above threshold) negligible.
-const LEDGERS_TTL_THRESHOLD: u32 = 100_800;
+pub(crate) const LEDGERS_TTL_THRESHOLD: u32 = 100_800;
 
 /// Target TTL (in ledgers) applied when an entry falls below the
 /// threshold.  ~14 days (201 600 ledgers) provides a comfortable margin
 /// before the next required bump.
-const LEDGERS_TTL_EXTEND_TO: u32 = 201_600;
+pub(crate) const LEDGERS_TTL_EXTEND_TO: u32 = 201_600;
 
 /// Extend the TTL of a persistent storage entry when it falls at or
 /// below [`LEDGERS_TTL_THRESHOLD`].  The entry's TTL is then set to
@@ -1835,14 +1835,22 @@ impl Escrow {
         require_admin(&env);
         env.storage()
             .persistent()
-            .remove(&DataKey::ServiceRegistered(service_id));
+            .remove(&DataKey::ServiceRegistered(service_id.clone()));
+        // Emit svc_rm so indexers can observe the deregistration without
+        // polling ServiceRegistered storage directly.
+        env.events()
+            .publish((symbol_short!("svc_rm"),), service_id);
     }
 
     /// Register a service so `record_usage` accepts it under strict
     /// registration. Admin-gated and idempotent.
     pub fn register_service(env: Env, service_id: Symbol) {
         require_admin(&env);
-        write_flag(&env, &DataKey::ServiceRegistered(service_id), true);
+        write_flag(&env, &DataKey::ServiceRegistered(service_id.clone()), true);
+        // Emit svc_add so indexers observe plain registrations (no metadata)
+        // without having to infer the state change from absent events.
+        env.events()
+            .publish((symbol_short!("svc_add"),), service_id);
     }
 
     /// Atomically register a service AND set its metadata in one
@@ -1981,22 +1989,33 @@ impl Escrow {
     /// Admin sets the disabled flag for a service. Disabling a service
     /// causes `record_usage` to panic with `ServiceDisabled` for that
     /// id; registration and metadata are preserved.
+    /// Emits `svc_dis(service_id, disabled)` so indexers observe both
+    /// disable and re-enable transitions from a single event topic.
     pub fn set_service_disabled(env: Env, service_id: Symbol, disabled: bool) {
         require_admin(&env);
-        write_flag(&env, &DataKey::ServiceDisabled(service_id), disabled);
+        write_flag(&env, &DataKey::ServiceDisabled(service_id.clone()), disabled);
+        env.events()
+            .publish((symbol_short!("svc_dis"),), (service_id, disabled));
     }
 
     /// Admin sets human-readable metadata for a service. Persisted
     /// under `DataKey::ServiceMetadata(service_id)`. Description is
     /// capped at 256 UTF-8 bytes to bound storage cost.  Extends the
     /// entry's persistent TTL on write.
+    /// Emits `meta_set(service_id, owner)` so indexers observe metadata
+    /// writes without polling storage.
     pub fn set_service_metadata(env: Env, service_id: Symbol, description: String, owner: Address) {
         require_admin(&env);
         env.storage().persistent().set(
             &DataKey::ServiceMetadata(service_id.clone()),
-            &ServiceMetadata { description, owner },
+            &ServiceMetadata {
+                description,
+                owner: owner.clone(),
+            },
         );
-        bump_persistent(&env, &DataKey::ServiceMetadata(service_id));
+        bump_persistent(&env, &DataKey::ServiceMetadata(service_id.clone()));
+        env.events()
+            .publish((symbol_short!("meta_set"),), (service_id, owner));
     }
 
     /// Transfer ownership of a service's metadata to `new_owner`,
