@@ -5980,6 +5980,9 @@ fn test_svc_catalog_register_svc_add_captured_immediately() {
 }
 
 /// svc_add does not collide with svc_reg (register_service_with_metadata).
+///
+/// Captured separately per-call because env.events().all() surfaces events
+/// from the most recent invocation only, not accumulated across calls.
 #[test]
 fn test_svc_catalog_no_topic_collision_svc_add_vs_svc_reg() {
     let env = Env::default();
@@ -5988,25 +5991,27 @@ fn test_svc_catalog_no_topic_collision_svc_add_vs_svc_reg() {
     let svc_meta = make_service(&env, "withmeta");
     let owner = Address::generate(&env);
 
-    client.register_service(&svc_plain);
-    client.register_service_with_metadata(
-        &svc_meta,
-        &soroban_sdk::String::from_str(&env, "desc"),
-        &owner,
-    );
-
-    let events = env.events().all();
-
     let svc_add_topic: soroban_sdk::Vec<soroban_sdk::Val> =
         (symbol_short!("svc_add"),).into_val(&env);
     let svc_reg_topic: soroban_sdk::Vec<soroban_sdk::Val> =
         (symbol_short!("svc_reg"),).into_val(&env);
 
-    let add_count = events.iter().filter(|(_, t, _)| t == &svc_add_topic).count();
-    let reg_count = events.iter().filter(|(_, t, _)| t == &svc_reg_topic).count();
-
+    // Capture svc_add immediately after register_service.
+    client.register_service(&svc_plain);
+    let events_add = env.events().all();
+    let add_count = events_add.iter().filter(|(_, t, _)| t == &svc_add_topic).count();
     assert_eq!(add_count, 1, "register_service must emit exactly one svc_add");
+
+    // Capture svc_reg immediately after register_service_with_metadata.
+    client.register_service_with_metadata(
+        &svc_meta,
+        &soroban_sdk::String::from_str(&env, "desc"),
+        &owner,
+    );
+    let events_reg = env.events().all();
+    let reg_count = events_reg.iter().filter(|(_, t, _)| t == &svc_reg_topic).count();
     assert_eq!(reg_count, 1, "register_service_with_metadata must emit exactly one svc_reg");
+
     assert_ne!(
         svc_add_topic, svc_reg_topic,
         "svc_add and svc_reg must be distinct topics"
@@ -6057,25 +6062,30 @@ fn test_svc_catalog_unregister_svc_rm_payload() {
 }
 
 /// svc_rm is distinct from svc_add — no topic collision.
+///
+/// Captured separately per-call because env.events().all() surfaces events
+/// from the most recent invocation only, not accumulated across calls.
 #[test]
 fn test_svc_catalog_no_topic_collision_svc_add_vs_svc_rm() {
     let env = Env::default();
     let (client, _admin) = setup_initialized(&env);
     let svc = make_service(&env, "my_svc");
 
-    client.register_service(&svc);
-    client.unregister_service(&svc);
-
-    let events = env.events().all();
-
     let svc_add_topic: soroban_sdk::Vec<soroban_sdk::Val> =
         (symbol_short!("svc_add"),).into_val(&env);
     let svc_rm_topic: soroban_sdk::Vec<soroban_sdk::Val> =
         (symbol_short!("svc_rm"),).into_val(&env);
 
-    // Both events are present but under distinct topics.
-    assert!(events.iter().any(|(_, t, _)| t == svc_add_topic), "svc_add must be present");
-    assert!(events.iter().any(|(_, t, _)| t == svc_rm_topic), "svc_rm must be present");
+    // Capture svc_add immediately after register_service.
+    client.register_service(&svc);
+    let events_add = env.events().all();
+    assert!(events_add.iter().any(|(_, t, _)| t == svc_add_topic), "svc_add must be present");
+
+    // Capture svc_rm immediately after unregister_service.
+    client.unregister_service(&svc);
+    let events_rm = env.events().all();
+    assert!(events_rm.iter().any(|(_, t, _)| t == svc_rm_topic), "svc_rm must be present");
+
     assert_ne!(svc_add_topic, svc_rm_topic, "svc_add and svc_rm must be distinct topics");
 }
 
@@ -6211,6 +6221,9 @@ fn test_svc_catalog_set_metadata_meta_set_payload() {
 }
 
 /// meta_set does not collide with meta_clr (clear_service_metadata).
+///
+/// Captured separately per-call because env.events().all() surfaces events
+/// from the most recent invocation only, not accumulated across calls.
 #[test]
 fn test_svc_catalog_no_topic_collision_meta_set_vs_meta_clr() {
     let env = Env::default();
@@ -6218,22 +6231,25 @@ fn test_svc_catalog_no_topic_collision_meta_set_vs_meta_clr() {
     let svc = make_service(&env, "my_svc");
     let owner = Address::generate(&env);
 
-    client.set_service_metadata(
-        &svc,
-        &soroban_sdk::String::from_str(&env, "desc"),
-        &owner,
-    );
-    client.clear_service_metadata(&svc);
-
-    let events = env.events().all();
     let meta_set_topic: soroban_sdk::Vec<soroban_sdk::Val> =
         (symbol_short!("meta_set"),).into_val(&env);
     let meta_clr_topic: soroban_sdk::Vec<soroban_sdk::Val> =
         (symbol_short!("meta_clr"),).into_val(&env);
 
-    // Both events must be present under distinct topics.
-    assert!(events.iter().any(|(_, t, _)| t == meta_set_topic), "meta_set must be present");
-    assert!(events.iter().any(|(_, t, _)| t == meta_clr_topic), "meta_clr must be present");
+    // Capture meta_set immediately after set_service_metadata.
+    client.set_service_metadata(
+        &svc,
+        &soroban_sdk::String::from_str(&env, "desc"),
+        &owner,
+    );
+    let events_set = env.events().all();
+    assert!(events_set.iter().any(|(_, t, _)| t == meta_set_topic), "meta_set must be present");
+
+    // Capture meta_clr immediately after clear_service_metadata.
+    client.clear_service_metadata(&svc);
+    let events_clr = env.events().all();
+    assert!(events_clr.iter().any(|(_, t, _)| t == meta_clr_topic), "meta_clr must be present");
+
     assert_ne!(
         meta_set_topic, meta_clr_topic,
         "meta_set and meta_clr must be distinct topics"
@@ -6325,7 +6341,7 @@ fn test_svc_catalog_all_new_topics_distinct_from_existing() {
     for new_t in &new_topics {
         for ex in &existing {
             assert_ne!(
-                new_t.clone(), ex.clone(),
+                (*new_t).clone(), (*ex).clone(),
                 "new service-catalog topic must not collide with existing topic"
             );
         }
