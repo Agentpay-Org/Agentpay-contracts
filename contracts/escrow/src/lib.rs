@@ -1838,8 +1838,7 @@ impl Escrow {
             .remove(&DataKey::ServiceRegistered(service_id.clone()));
         // Emit svc_rm so indexers can observe the deregistration without
         // polling ServiceRegistered storage directly.
-        env.events()
-            .publish((symbol_short!("svc_rm"),), service_id);
+        env.events().publish((symbol_short!("svc_rm"),), service_id);
     }
 
     /// Register a service so `record_usage` accepts it under strict
@@ -1993,7 +1992,11 @@ impl Escrow {
     /// disable and re-enable transitions from a single event topic.
     pub fn set_service_disabled(env: Env, service_id: Symbol, disabled: bool) {
         require_admin(&env);
-        write_flag(&env, &DataKey::ServiceDisabled(service_id.clone()), disabled);
+        write_flag(
+            &env,
+            &DataKey::ServiceDisabled(service_id.clone()),
+            disabled,
+        );
         env.events()
             .publish((symbol_short!("svc_dis"),), (service_id, disabled));
     }

@@ -5620,8 +5620,11 @@ fn test_debit_event_payload_on_settle() {
         .find(|(_, t, _)| *t == expected_topics)
         .expect("settle must emit a cred_deb event");
     let decoded: (Address, i128, i128) = cred_deb_event.2.into_val(&env);
-    assert_eq!(decoded, (agent.clone(), 50i128, 150i128),
-        "cred_deb payload must be (agent, debit=50, new_balance=150)");
+    assert_eq!(
+        decoded,
+        (agent.clone(), 50i128, 150i128),
+        "cred_deb payload must be (agent, debit=50, new_balance=150)"
+    );
 }
 
 /// `cred_deb` is emitted exactly once per settle, not per record_usage.
@@ -5691,8 +5694,11 @@ fn test_debit_partial_credit_clamped_to_balance() {
         .find(|(_, t, _)| *t == expected_topics)
         .expect("settle must emit cred_deb for partial credit");
     let decoded: (Address, i128, i128) = cred_deb_event.2.into_val(&env);
-    assert_eq!(decoded, (agent.clone(), 15i128, 0i128),
-        "cred_deb payload: debit=min(50,15)=15, new_balance=0");
+    assert_eq!(
+        decoded,
+        (agent.clone(), 15i128, 0i128),
+        "cred_deb payload: debit=min(50,15)=15, new_balance=0"
+    );
 }
 
 /// Tier-aware billing: the precondition uses tier math, not flat price.
@@ -5726,8 +5732,10 @@ fn test_debit_boundary_tier_aware_precondition() {
     client.credit_agent(&agent, &100i128);
 
     let record = client.record_usage(&agent, &svc, &15u32);
-    assert_eq!(record.requests, 15,
-        "projected_bill(tier, 15 req) = 100 == credit_balance → accepted");
+    assert_eq!(
+        record.requests, 15,
+        "projected_bill(tier, 15 req) = 100 == credit_balance → accepted"
+    );
 }
 
 /// Tier-aware billing reject: one stroop under the tier-computed bill.
@@ -5857,8 +5865,10 @@ fn test_debit_boundary_free_service_no_check() {
 
     // Even with credit = 1 and requests = 1_000_000, bill = 0 → accepted.
     let record = client.record_usage(&agent, &svc, &1_000_000u32);
-    assert_eq!(record.requests, 1_000_000,
-        "free service must never trigger the debit precondition");
+    assert_eq!(
+        record.requests, 1_000_000,
+        "free service must never trigger the debit precondition"
+    );
 }
 
 /// settle emits `cred_deb` exactly once even when called twice.
@@ -5887,7 +5897,10 @@ fn test_debit_event_emitted_exactly_once_per_settle_with_credit() {
         .iter()
         .filter(|(_, t, _)| *t == expected_topics)
         .count();
-    assert_eq!(first_count, 1, "first settle (non-zero bill) must emit one cred_deb");
+    assert_eq!(
+        first_count, 1,
+        "first settle (non-zero bill) must emit one cred_deb"
+    );
 
     // Second settle with no new usage: billed = 0 → no cred_deb emitted.
     client.settle(&admin, &agent, &svc);
@@ -5896,10 +5909,11 @@ fn test_debit_event_emitted_exactly_once_per_settle_with_credit() {
         .iter()
         .filter(|(_, t, _)| *t == expected_topics)
         .count();
-    assert_eq!(second_count, 0,
-        "second settle (zero bill) must not emit cred_deb");
+    assert_eq!(
+        second_count, 0,
+        "second settle (zero bill) must not emit cred_deb"
+    );
 }
-
 
 // ── Service-catalog event tests ──────────────────────────────────────────────
 //
@@ -5936,7 +5950,11 @@ fn test_svc_catalog_register_emits_svc_add() {
         .iter()
         .filter(|(_, t, _)| t == &expected_topic)
         .collect();
-    assert_eq!(matching.len(), 1, "register_service must emit exactly one svc_add event");
+    assert_eq!(
+        matching.len(),
+        1,
+        "register_service must emit exactly one svc_add event"
+    );
 }
 
 /// svc_add payload is the service_id Symbol.
@@ -5956,7 +5974,10 @@ fn test_svc_catalog_register_svc_add_payload() {
         .find(|(_, t, _)| t == &expected_topic)
         .expect("svc_add event must be present");
     let payload: Symbol = event.2.into_val(&env);
-    assert_eq!(payload, svc, "svc_add payload must be the registered service_id");
+    assert_eq!(
+        payload, svc,
+        "svc_add payload must be the registered service_id"
+    );
 }
 
 /// svc_add is captured immediately after the call (not deferred).
@@ -5999,8 +6020,14 @@ fn test_svc_catalog_no_topic_collision_svc_add_vs_svc_reg() {
     // Capture svc_add immediately after register_service.
     client.register_service(&svc_plain);
     let events_add = env.events().all();
-    let add_count = events_add.iter().filter(|(_, t, _)| t == &svc_add_topic).count();
-    assert_eq!(add_count, 1, "register_service must emit exactly one svc_add");
+    let add_count = events_add
+        .iter()
+        .filter(|(_, t, _)| t == &svc_add_topic)
+        .count();
+    assert_eq!(
+        add_count, 1,
+        "register_service must emit exactly one svc_add"
+    );
 
     // Capture svc_reg immediately after register_service_with_metadata.
     client.register_service_with_metadata(
@@ -6009,8 +6036,14 @@ fn test_svc_catalog_no_topic_collision_svc_add_vs_svc_reg() {
         &owner,
     );
     let events_reg = env.events().all();
-    let reg_count = events_reg.iter().filter(|(_, t, _)| t == &svc_reg_topic).count();
-    assert_eq!(reg_count, 1, "register_service_with_metadata must emit exactly one svc_reg");
+    let reg_count = events_reg
+        .iter()
+        .filter(|(_, t, _)| t == &svc_reg_topic)
+        .count();
+    assert_eq!(
+        reg_count, 1,
+        "register_service_with_metadata must emit exactly one svc_reg"
+    );
 
     assert_ne!(
         svc_add_topic, svc_reg_topic,
@@ -6037,7 +6070,11 @@ fn test_svc_catalog_unregister_emits_svc_rm() {
         .iter()
         .filter(|(_, t, _)| t == &expected_topic)
         .collect();
-    assert_eq!(matching.len(), 1, "unregister_service must emit exactly one svc_rm event");
+    assert_eq!(
+        matching.len(),
+        1,
+        "unregister_service must emit exactly one svc_rm event"
+    );
 }
 
 /// svc_rm payload is the service_id Symbol.
@@ -6058,7 +6095,10 @@ fn test_svc_catalog_unregister_svc_rm_payload() {
         .find(|(_, t, _)| t == &expected_topic)
         .expect("svc_rm event must be present");
     let payload: Symbol = event.2.into_val(&env);
-    assert_eq!(payload, svc, "svc_rm payload must be the unregistered service_id");
+    assert_eq!(
+        payload, svc,
+        "svc_rm payload must be the unregistered service_id"
+    );
 }
 
 /// svc_rm is distinct from svc_add — no topic collision.
@@ -6079,14 +6119,23 @@ fn test_svc_catalog_no_topic_collision_svc_add_vs_svc_rm() {
     // Capture svc_add immediately after register_service.
     client.register_service(&svc);
     let events_add = env.events().all();
-    assert!(events_add.iter().any(|(_, t, _)| t == svc_add_topic), "svc_add must be present");
+    assert!(
+        events_add.iter().any(|(_, t, _)| t == svc_add_topic),
+        "svc_add must be present"
+    );
 
     // Capture svc_rm immediately after unregister_service.
     client.unregister_service(&svc);
     let events_rm = env.events().all();
-    assert!(events_rm.iter().any(|(_, t, _)| t == svc_rm_topic), "svc_rm must be present");
+    assert!(
+        events_rm.iter().any(|(_, t, _)| t == svc_rm_topic),
+        "svc_rm must be present"
+    );
 
-    assert_ne!(svc_add_topic, svc_rm_topic, "svc_add and svc_rm must be distinct topics");
+    assert_ne!(
+        svc_add_topic, svc_rm_topic,
+        "svc_add and svc_rm must be distinct topics"
+    );
 }
 
 // ── svc_dis: set_service_disabled ──────────────────────────────────────────
@@ -6109,7 +6158,11 @@ fn test_svc_catalog_disable_emits_svc_dis_true() {
         .find(|(_, t, _)| t == &expected_topic)
         .expect("set_service_disabled must emit svc_dis");
     let payload: (Symbol, bool) = event.2.into_val(&env);
-    assert_eq!(payload, (svc, true), "svc_dis payload must be (service_id, true) when disabling");
+    assert_eq!(
+        payload,
+        (svc, true),
+        "svc_dis payload must be (service_id, true) when disabling"
+    );
 }
 
 /// set_service_disabled(false) emits svc_dis with disabled=false (re-enable).
@@ -6158,11 +6211,23 @@ fn test_svc_catalog_no_topic_collision_svc_dis() {
     let paused_topic: soroban_sdk::Vec<soroban_sdk::Val> =
         (symbol_short!("paused"),).into_val(&env);
 
-    assert_ne!(svc_dis_topic, svc_add_topic, "svc_dis must not collide with svc_add");
-    assert_ne!(svc_dis_topic, paused_topic, "svc_dis must not collide with paused");
+    assert_ne!(
+        svc_dis_topic, svc_add_topic,
+        "svc_dis must not collide with svc_add"
+    );
+    assert_ne!(
+        svc_dis_topic, paused_topic,
+        "svc_dis must not collide with paused"
+    );
 
-    let dis_count = events.iter().filter(|(_, t, _)| t == &svc_dis_topic).count();
-    assert_eq!(dis_count, 1, "exactly one svc_dis event must be emitted per call");
+    let dis_count = events
+        .iter()
+        .filter(|(_, t, _)| t == &svc_dis_topic)
+        .count();
+    assert_eq!(
+        dis_count, 1,
+        "exactly one svc_dis event must be emitted per call"
+    );
 }
 
 // ── meta_set: set_service_metadata ─────────────────────────────────────────
@@ -6188,7 +6253,11 @@ fn test_svc_catalog_set_metadata_emits_meta_set() {
         .iter()
         .filter(|(_, t, _)| t == &expected_topic)
         .collect();
-    assert_eq!(matching.len(), 1, "set_service_metadata must emit exactly one meta_set event");
+    assert_eq!(
+        matching.len(),
+        1,
+        "set_service_metadata must emit exactly one meta_set event"
+    );
 }
 
 /// meta_set payload is (service_id, owner).
@@ -6199,11 +6268,7 @@ fn test_svc_catalog_set_metadata_meta_set_payload() {
     let svc = make_service(&env, "my_svc");
     let owner = Address::generate(&env);
 
-    client.set_service_metadata(
-        &svc,
-        &soroban_sdk::String::from_str(&env, "desc"),
-        &owner,
-    );
+    client.set_service_metadata(&svc, &soroban_sdk::String::from_str(&env, "desc"), &owner);
 
     let events = env.events().all();
     let expected_topic: soroban_sdk::Vec<soroban_sdk::Val> =
@@ -6237,18 +6302,20 @@ fn test_svc_catalog_no_topic_collision_meta_set_vs_meta_clr() {
         (symbol_short!("meta_clr"),).into_val(&env);
 
     // Capture meta_set immediately after set_service_metadata.
-    client.set_service_metadata(
-        &svc,
-        &soroban_sdk::String::from_str(&env, "desc"),
-        &owner,
-    );
+    client.set_service_metadata(&svc, &soroban_sdk::String::from_str(&env, "desc"), &owner);
     let events_set = env.events().all();
-    assert!(events_set.iter().any(|(_, t, _)| t == meta_set_topic), "meta_set must be present");
+    assert!(
+        events_set.iter().any(|(_, t, _)| t == meta_set_topic),
+        "meta_set must be present"
+    );
 
     // Capture meta_clr immediately after clear_service_metadata.
     client.clear_service_metadata(&svc);
     let events_clr = env.events().all();
-    assert!(events_clr.iter().any(|(_, t, _)| t == meta_clr_topic), "meta_clr must be present");
+    assert!(
+        events_clr.iter().any(|(_, t, _)| t == meta_clr_topic),
+        "meta_clr must be present"
+    );
 
     assert_ne!(
         meta_set_topic, meta_clr_topic,
@@ -6301,19 +6368,15 @@ fn test_svc_catalog_all_new_topics_distinct_from_existing() {
 
     // Trigger all four new topics.
     client.register_service(&svc);
-    client.set_service_metadata(
-        &svc,
-        &soroban_sdk::String::from_str(&env, "d"),
-        &owner,
-    );
+    client.set_service_metadata(&svc, &soroban_sdk::String::from_str(&env, "d"), &owner);
     client.set_service_disabled(&svc, &true);
     client.set_service_disabled(&svc, &false);
     client.unregister_service(&svc);
 
     let svc_add: soroban_sdk::Vec<soroban_sdk::Val> = (symbol_short!("svc_add"),).into_val(&env);
-    let svc_rm: soroban_sdk::Vec<soroban_sdk::Val>  = (symbol_short!("svc_rm"),).into_val(&env);
+    let svc_rm: soroban_sdk::Vec<soroban_sdk::Val> = (symbol_short!("svc_rm"),).into_val(&env);
     let svc_dis: soroban_sdk::Vec<soroban_sdk::Val> = (symbol_short!("svc_dis"),).into_val(&env);
-    let meta_set: soroban_sdk::Vec<soroban_sdk::Val>= (symbol_short!("meta_set"),).into_val(&env);
+    let meta_set: soroban_sdk::Vec<soroban_sdk::Val> = (symbol_short!("meta_set"),).into_val(&env);
 
     let new_topics = [&svc_add, &svc_rm, &svc_dis, &meta_set];
 
@@ -6341,7 +6404,8 @@ fn test_svc_catalog_all_new_topics_distinct_from_existing() {
     for new_t in &new_topics {
         for ex in &existing {
             assert_ne!(
-                (*new_t).clone(), (*ex).clone(),
+                (*new_t).clone(),
+                (*ex).clone(),
                 "new service-catalog topic must not collide with existing topic"
             );
         }
@@ -6351,7 +6415,8 @@ fn test_svc_catalog_all_new_topics_distinct_from_existing() {
     for i in 0..new_topics.len() {
         for j in (i + 1)..new_topics.len() {
             assert_ne!(
-                new_topics[i].clone(), new_topics[j].clone(),
+                new_topics[i].clone(),
+                new_topics[j].clone(),
                 "new service-catalog topics must all be mutually distinct"
             );
         }
