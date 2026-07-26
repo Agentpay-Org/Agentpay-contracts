@@ -5914,3 +5914,511 @@ fn test_debit_event_emitted_exactly_once_per_settle_with_credit() {
         "second settle (zero bill) must not emit cred_deb"
     );
 }
+
+// ── Service-catalog event tests ──────────────────────────────────────────────
+//
+// Four service-catalog mutating entrypoints previously emitted no events,
+// forcing indexers to infer state changes from storage reads or absence of
+// other events. This section adds events to all four and tests them.
+//
+// New topics (all <= 9 chars, no collision with existing topics):
+//   svc_add  — register_service(service_id)               payload: service_id
+//   svc_rm   — unregister_service(service_id)             payload: service_id
+//   svc_dis  — set_service_disabled(service_id, disabled) payload: (service_id, bool)
+//   meta_set — set_service_metadata(...)                  payload: (service_id, owner)
+//
+// Existing topics for reference (must not collide):
+//   svc_reg, owner_chg, meta_clr, price_set, price_rmv,
+//   tiers_set, tiers_rm, settled, bnd_set, cfg_set, rate_rst,
+//   paused, cred_deb, usage, usage_hi, usage_dec, dispute.
+
+// ── svc_add: register_service ──────────────────────────────────────────────
+
+/// register_service emits exactly one svc_add event.
+#[test]
+fn test_svc_catalog_register_emits_svc_add() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let svc = make_service(&env, "my_svc");
+
+    client.register_service(&svc);
+
+    let events = env.events().all();
+    let expected_topic: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("svc_add"),).into_val(&env);
+    let matching: alloc::vec::Vec<_> = events
+        .iter()
+        .filter(|(_, t, _)| t == &expected_topic)
+        .collect();
+    assert_eq!(
+        matching.len(),
+        1,
+        "register_service must emit exactly one svc_add event"
+    );
+}
+
+/// svc_add payload is the service_id Symbol.
+#[test]
+fn test_svc_catalog_register_svc_add_payload() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let svc = make_service(&env, "my_svc");
+
+    client.register_service(&svc);
+
+    let events = env.events().all();
+    let expected_topic: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("svc_add"),).into_val(&env);
+    let event = events
+        .iter()
+        .find(|(_, t, _)| t == &expected_topic)
+        .expect("svc_add event must be present");
+    let payload: Symbol = event.2.into_val(&env);
+    assert_eq!(
+        payload, svc,
+        "svc_add payload must be the registered service_id"
+    );
+}
+
+/// svc_add is captured immediately after the call (not deferred).
+#[test]
+fn test_svc_catalog_register_svc_add_captured_immediately() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let svc = make_service(&env, "my_svc");
+
+    // No events before the call.
+    assert_eq!(env.events().all().len(), 0);
+    client.register_service(&svc);
+    // Event must appear in the very next events().all() call.
+    let events = env.events().all();
+    let expected_topic: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("svc_add"),).into_val(&env);
+    assert!(
+        events.iter().any(|(_, t, _)| t == expected_topic),
+        "svc_add must be captured immediately after register_service"
+    );
+}
+
+/// svc_add does not collide with svc_reg (register_service_with_metadata).
+///
+/// Captured separately per-call because env.events().all() surfaces events
+/// from the most recent invocation only, not accumulated across calls.
+#[test]
+fn test_svc_catalog_no_topic_collision_svc_add_vs_svc_reg() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let svc_plain = make_service(&env, "plain");
+    let svc_meta = make_service(&env, "withmeta");
+    let owner = Address::generate(&env);
+
+    let svc_add_topic: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("svc_add"),).into_val(&env);
+    let svc_reg_topic: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("svc_reg"),).into_val(&env);
+
+    // Capture svc_add immediately after register_service.
+    client.register_service(&svc_plain);
+    let events_add = env.events().all();
+    let add_count = events_add
+        .iter()
+        .filter(|(_, t, _)| t == &svc_add_topic)
+        .count();
+    assert_eq!(
+        add_count, 1,
+        "register_service must emit exactly one svc_add"
+    );
+
+    // Capture svc_reg immediately after register_service_with_metadata.
+    client.register_service_with_metadata(
+        &svc_meta,
+        &soroban_sdk::String::from_str(&env, "desc"),
+        &owner,
+    );
+    let events_reg = env.events().all();
+    let reg_count = events_reg
+        .iter()
+        .filter(|(_, t, _)| t == &svc_reg_topic)
+        .count();
+    assert_eq!(
+        reg_count, 1,
+        "register_service_with_metadata must emit exactly one svc_reg"
+    );
+
+    assert_ne!(
+        svc_add_topic, svc_reg_topic,
+        "svc_add and svc_reg must be distinct topics"
+    );
+}
+
+// ── svc_rm: unregister_service ─────────────────────────────────────────────
+
+/// unregister_service emits exactly one svc_rm event.
+#[test]
+fn test_svc_catalog_unregister_emits_svc_rm() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let svc = make_service(&env, "my_svc");
+
+    client.register_service(&svc);
+    client.unregister_service(&svc);
+
+    let events = env.events().all();
+    let expected_topic: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("svc_rm"),).into_val(&env);
+    let matching: alloc::vec::Vec<_> = events
+        .iter()
+        .filter(|(_, t, _)| t == &expected_topic)
+        .collect();
+    assert_eq!(
+        matching.len(),
+        1,
+        "unregister_service must emit exactly one svc_rm event"
+    );
+}
+
+/// svc_rm payload is the service_id Symbol.
+#[test]
+fn test_svc_catalog_unregister_svc_rm_payload() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let svc = make_service(&env, "my_svc");
+
+    client.register_service(&svc);
+    client.unregister_service(&svc);
+
+    let events = env.events().all();
+    let expected_topic: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("svc_rm"),).into_val(&env);
+    let event = events
+        .iter()
+        .find(|(_, t, _)| t == &expected_topic)
+        .expect("svc_rm event must be present");
+    let payload: Symbol = event.2.into_val(&env);
+    assert_eq!(
+        payload, svc,
+        "svc_rm payload must be the unregistered service_id"
+    );
+}
+
+/// svc_rm is distinct from svc_add — no topic collision.
+///
+/// Captured separately per-call because env.events().all() surfaces events
+/// from the most recent invocation only, not accumulated across calls.
+#[test]
+fn test_svc_catalog_no_topic_collision_svc_add_vs_svc_rm() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let svc = make_service(&env, "my_svc");
+
+    let svc_add_topic: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("svc_add"),).into_val(&env);
+    let svc_rm_topic: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("svc_rm"),).into_val(&env);
+
+    // Capture svc_add immediately after register_service.
+    client.register_service(&svc);
+    let events_add = env.events().all();
+    assert!(
+        events_add.iter().any(|(_, t, _)| t == svc_add_topic),
+        "svc_add must be present"
+    );
+
+    // Capture svc_rm immediately after unregister_service.
+    client.unregister_service(&svc);
+    let events_rm = env.events().all();
+    assert!(
+        events_rm.iter().any(|(_, t, _)| t == svc_rm_topic),
+        "svc_rm must be present"
+    );
+
+    assert_ne!(
+        svc_add_topic, svc_rm_topic,
+        "svc_add and svc_rm must be distinct topics"
+    );
+}
+
+// ── svc_dis: set_service_disabled ──────────────────────────────────────────
+
+/// set_service_disabled(true) emits svc_dis with disabled=true.
+#[test]
+fn test_svc_catalog_disable_emits_svc_dis_true() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let svc = make_service(&env, "my_svc");
+
+    client.register_service(&svc);
+    client.set_service_disabled(&svc, &true);
+
+    let events = env.events().all();
+    let expected_topic: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("svc_dis"),).into_val(&env);
+    let event = events
+        .iter()
+        .find(|(_, t, _)| t == &expected_topic)
+        .expect("set_service_disabled must emit svc_dis");
+    let payload: (Symbol, bool) = event.2.into_val(&env);
+    assert_eq!(
+        payload,
+        (svc, true),
+        "svc_dis payload must be (service_id, true) when disabling"
+    );
+}
+
+/// set_service_disabled(false) emits svc_dis with disabled=false (re-enable).
+#[test]
+fn test_svc_catalog_reenable_emits_svc_dis_false() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let svc = make_service(&env, "my_svc");
+
+    client.register_service(&svc);
+    client.set_service_disabled(&svc, &true);
+    client.set_service_disabled(&svc, &false);
+
+    // Capture events after the re-enable call only.
+    let events = env.events().all();
+    let expected_topic: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("svc_dis"),).into_val(&env);
+    let event = events
+        .iter()
+        .find(|(_, t, _)| t == &expected_topic)
+        .expect("set_service_disabled(false) must emit svc_dis");
+    let payload: (Symbol, bool) = event.2.into_val(&env);
+    assert_eq!(
+        payload,
+        (svc, false),
+        "svc_dis payload must be (service_id, false) when re-enabling"
+    );
+}
+
+/// svc_dis does not collide with svc_add, svc_rm, or paused topics.
+#[test]
+fn test_svc_catalog_no_topic_collision_svc_dis() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let svc = make_service(&env, "my_svc");
+
+    client.register_service(&svc);
+    client.set_service_disabled(&svc, &true);
+
+    let events = env.events().all();
+
+    let svc_dis_topic: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("svc_dis"),).into_val(&env);
+    let svc_add_topic: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("svc_add"),).into_val(&env);
+    let paused_topic: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("paused"),).into_val(&env);
+
+    assert_ne!(
+        svc_dis_topic, svc_add_topic,
+        "svc_dis must not collide with svc_add"
+    );
+    assert_ne!(
+        svc_dis_topic, paused_topic,
+        "svc_dis must not collide with paused"
+    );
+
+    let dis_count = events
+        .iter()
+        .filter(|(_, t, _)| t == &svc_dis_topic)
+        .count();
+    assert_eq!(
+        dis_count, 1,
+        "exactly one svc_dis event must be emitted per call"
+    );
+}
+
+// ── meta_set: set_service_metadata ─────────────────────────────────────────
+
+/// set_service_metadata emits exactly one meta_set event.
+#[test]
+fn test_svc_catalog_set_metadata_emits_meta_set() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let svc = make_service(&env, "my_svc");
+    let owner = Address::generate(&env);
+
+    client.set_service_metadata(
+        &svc,
+        &soroban_sdk::String::from_str(&env, "A description"),
+        &owner,
+    );
+
+    let events = env.events().all();
+    let expected_topic: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("meta_set"),).into_val(&env);
+    let matching: alloc::vec::Vec<_> = events
+        .iter()
+        .filter(|(_, t, _)| t == &expected_topic)
+        .collect();
+    assert_eq!(
+        matching.len(),
+        1,
+        "set_service_metadata must emit exactly one meta_set event"
+    );
+}
+
+/// meta_set payload is (service_id, owner).
+#[test]
+fn test_svc_catalog_set_metadata_meta_set_payload() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let svc = make_service(&env, "my_svc");
+    let owner = Address::generate(&env);
+
+    client.set_service_metadata(&svc, &soroban_sdk::String::from_str(&env, "desc"), &owner);
+
+    let events = env.events().all();
+    let expected_topic: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("meta_set"),).into_val(&env);
+    let event = events
+        .iter()
+        .find(|(_, t, _)| t == &expected_topic)
+        .expect("meta_set event must be present");
+    let payload: (Symbol, Address) = event.2.into_val(&env);
+    assert_eq!(
+        payload,
+        (svc, owner),
+        "meta_set payload must be (service_id, owner)"
+    );
+}
+
+/// meta_set does not collide with meta_clr (clear_service_metadata).
+///
+/// Captured separately per-call because env.events().all() surfaces events
+/// from the most recent invocation only, not accumulated across calls.
+#[test]
+fn test_svc_catalog_no_topic_collision_meta_set_vs_meta_clr() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let svc = make_service(&env, "my_svc");
+    let owner = Address::generate(&env);
+
+    let meta_set_topic: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("meta_set"),).into_val(&env);
+    let meta_clr_topic: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("meta_clr"),).into_val(&env);
+
+    // Capture meta_set immediately after set_service_metadata.
+    client.set_service_metadata(&svc, &soroban_sdk::String::from_str(&env, "desc"), &owner);
+    let events_set = env.events().all();
+    assert!(
+        events_set.iter().any(|(_, t, _)| t == meta_set_topic),
+        "meta_set must be present"
+    );
+
+    // Capture meta_clr immediately after clear_service_metadata.
+    client.clear_service_metadata(&svc);
+    let events_clr = env.events().all();
+    assert!(
+        events_clr.iter().any(|(_, t, _)| t == meta_clr_topic),
+        "meta_clr must be present"
+    );
+
+    assert_ne!(
+        meta_set_topic, meta_clr_topic,
+        "meta_set and meta_clr must be distinct topics"
+    );
+}
+
+/// Overwriting metadata emits a second meta_set with the updated owner.
+#[test]
+fn test_svc_catalog_overwrite_metadata_emits_meta_set_with_new_owner() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let svc = make_service(&env, "my_svc");
+    let owner_new = Address::generate(&env);
+
+    // Second call overwrites the first.
+    client.set_service_metadata(
+        &svc,
+        &soroban_sdk::String::from_str(&env, "updated"),
+        &owner_new,
+    );
+
+    let events = env.events().all();
+    let expected_topic: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("meta_set"),).into_val(&env);
+    let event = events
+        .iter()
+        .find(|(_, t, _)| t == &expected_topic)
+        .expect("meta_set must be emitted on overwrite");
+    let payload: (Symbol, Address) = event.2.into_val(&env);
+    assert_eq!(
+        payload.1, owner_new,
+        "meta_set payload must reflect the new owner after overwrite"
+    );
+}
+
+// ── Cross-event topic uniqueness sweep ─────────────────────────────────────
+
+/// All four new topics are distinct from every existing topic in the contract.
+///
+/// This is a compile-time-friendly snapshot check: if any future edit
+/// accidentally reuses a topic string, the collision shows up immediately
+/// in the events collected from a single synthetic call sequence.
+#[test]
+fn test_svc_catalog_all_new_topics_distinct_from_existing() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let svc = make_service(&env, "sweep_svc");
+    let owner = Address::generate(&env);
+
+    // Trigger all four new topics.
+    client.register_service(&svc);
+    client.set_service_metadata(&svc, &soroban_sdk::String::from_str(&env, "d"), &owner);
+    client.set_service_disabled(&svc, &true);
+    client.set_service_disabled(&svc, &false);
+    client.unregister_service(&svc);
+
+    let svc_add: soroban_sdk::Vec<soroban_sdk::Val> = (symbol_short!("svc_add"),).into_val(&env);
+    let svc_rm: soroban_sdk::Vec<soroban_sdk::Val> = (symbol_short!("svc_rm"),).into_val(&env);
+    let svc_dis: soroban_sdk::Vec<soroban_sdk::Val> = (symbol_short!("svc_dis"),).into_val(&env);
+    let meta_set: soroban_sdk::Vec<soroban_sdk::Val> = (symbol_short!("meta_set"),).into_val(&env);
+
+    let new_topics = [&svc_add, &svc_rm, &svc_dis, &meta_set];
+
+    // Known existing topics.
+    let existing: [soroban_sdk::Vec<soroban_sdk::Val>; 17] = [
+        (symbol_short!("svc_reg"),).into_val(&env),
+        (symbol_short!("owner_chg"),).into_val(&env),
+        (symbol_short!("meta_clr"),).into_val(&env),
+        (symbol_short!("price_set"),).into_val(&env),
+        (symbol_short!("price_rmv"),).into_val(&env),
+        (symbol_short!("tiers_set"),).into_val(&env),
+        (symbol_short!("tiers_rm"),).into_val(&env),
+        (symbol_short!("settled"),).into_val(&env),
+        (symbol_short!("bnd_set"),).into_val(&env),
+        (symbol_short!("cfg_set"),).into_val(&env),
+        (symbol_short!("rate_rst"),).into_val(&env),
+        (symbol_short!("paused"),).into_val(&env),
+        (symbol_short!("cred_deb"),).into_val(&env),
+        (symbol_short!("usage"),).into_val(&env),
+        (symbol_short!("usage_hi"),).into_val(&env),
+        (symbol_short!("usage_dec"),).into_val(&env),
+        (symbol_short!("dispute"),).into_val(&env),
+    ];
+
+    for new_t in &new_topics {
+        for ex in &existing {
+            assert_ne!(
+                (*new_t).clone(),
+                (*ex).clone(),
+                "new service-catalog topic must not collide with existing topic"
+            );
+        }
+    }
+
+    // Also assert all four new topics are mutually distinct.
+    for i in 0..new_topics.len() {
+        for j in (i + 1)..new_topics.len() {
+            assert_ne!(
+                new_topics[i].clone(),
+                new_topics[j].clone(),
+                "new service-catalog topics must all be mutually distinct"
+            );
+        }
+    }
+}
