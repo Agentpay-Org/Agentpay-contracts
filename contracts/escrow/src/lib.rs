@@ -378,11 +378,7 @@ fn write_flag(env: &Env, key: &DataKey, value: bool) {
 /// returns the admin address. This is the canonical admin gate for
 /// admin-only entrypoints.
 fn require_admin(env: &Env) -> Address {
-    let admin: Address = env
-        .storage()
-        .persistent()
-        .get(&DataKey::Admin)
-        .unwrap_or_else(|| panic_with_error!(env, EscrowError::NotInitialized));
+    let admin = get_admin_address(env);
     admin.require_auth();
     admin
 }
@@ -424,8 +420,11 @@ fn bump_persistent(env: &Env, key: &DataKey) {
     }
 }
 
-/// Read the admin address without requiring auth. Used by helpers that need
-/// the admin value for comparison but do not gate on it themselves.
+/// Read the admin address without requiring auth.
+///
+/// This is the shared storage precondition for entrypoints that accept either
+/// the admin or another authorized caller. It preserves the canonical
+/// [`EscrowError::NotInitialized`] rejection when `init` has not run.
 fn get_admin_address(env: &Env) -> Address {
     env.storage()
         .persistent()
@@ -1364,11 +1363,7 @@ impl Escrow {
     pub fn settle(env: Env, caller: Address, agent: Address, service_id: Symbol) -> i128 {
         ensure_not_paused(&env);
         caller.require_auth();
-        let admin: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Admin)
-            .unwrap_or_else(|| panic_with_error!(&env, EscrowError::NotInitialized));
+        let admin = get_admin_address(&env);
         if caller != admin {
             let meta: ServiceMetadata = env
                 .storage()
@@ -1429,15 +1424,9 @@ impl Escrow {
     /// Honours the pause gate: panics with [`EscrowError::ContractPaused`]
     /// when paused.
     pub fn settle_all(env: Env, caller: Address, agent: Address) -> Vec<(Symbol, i128)> {
-        if read_flag(&env, &DataKey::Paused) {
-            panic_with_error!(&env, EscrowError::ContractPaused);
-        }
+        ensure_not_paused(&env);
         caller.require_auth();
-        let admin: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Admin)
-            .unwrap_or_else(|| panic_with_error!(&env, EscrowError::NotInitialized));
+        let admin = get_admin_address(&env);
 
         // Load the agent's active-service index.
         let svc_list: Vec<Symbol> = env
