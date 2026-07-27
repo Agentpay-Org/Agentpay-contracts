@@ -1866,6 +1866,43 @@ fn test_resolve_dispute_panics_not_initialized_before_init() {
 }
 
 #[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn test_settle_panics_not_initialized_via_storage_helper() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, Escrow);
+    let client = EscrowClient::new(&env, &contract_id);
+    let caller = Address::generate(&env);
+    let agent = Address::generate(&env);
+
+    client.settle(&caller, &agent, &Symbol::new(&env, "infer"));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn test_settle_all_panics_not_initialized_via_storage_helper() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, Escrow);
+    let client = EscrowClient::new(&env, &contract_id);
+    let caller = Address::generate(&env);
+    let agent = Address::generate(&env);
+
+    client.settle_all(&caller, &agent);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")]
+fn test_settle_all_panics_paused_via_shared_helper() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    client.pause();
+    let agent = Address::generate(&env);
+
+    client.settle_all(&admin, &agent);
+}
+
+#[test]
 fn test_list_open_disputes_returns_empty_for_agent_without_disputes() {
     let env = Env::default();
     let (client, admin) = setup_initialized(&env);
