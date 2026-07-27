@@ -3670,6 +3670,8 @@ fn test_reset_rate_window_idempotent() {
 //   4. Normal product                 → requests * price
 //   5. Saturation edge                → i128::MAX (no overflow)
 //   6. compute_billing agrees with settle billed value
+//   7. Removing tiers restores flat-price billing for unchanged usage
+//   8. Removing tiers from an untiered service is idempotent
 
 /// Helper: register a service price for `service_id`.
 fn set_price(client: &EscrowClient, service_id: &Symbol, price: i128) {
@@ -3753,6 +3755,53 @@ fn test_compute_billing_accumulated_usage() {
         bill, 200,
         "accumulated usage across calls must sum correctly"
     );
+}
+
+/// Removing a tier schedule restores flat-price billing without changing usage.
+#[test]
+fn test_remove_price_tiers_falls_back_to_flat_service_price() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let agent = make_agent(&env);
+    let svc = make_service(&env, "tier_fallback");
+
+    client.set_service_price(&svc, &10i128);
+
+    let mut tiers = soroban_sdk::Vec::new(&env);
+    tiers.push_back(PriceTier {
+        threshold_requests: 10,
+        price_stroops: 3,
+    });
+    tiers.push_back(PriceTier {
+        threshold_requests: 20,
+        price_stroops: 2,
+    });
+    client.set_price_tiers(&svc, &tiers);
+    client.record_usage(&agent, &svc, &15u32);
+
+    assert_eq!(client.compute_billing(&agent, &svc), 40i128);
+
+    client.remove_price_tiers(&svc);
+
+    assert_eq!(client.get_price_tiers(&svc), None);
+    assert_eq!(client.get_usage(&agent, &svc), 15u32);
+    assert_eq!(client.compute_billing(&agent, &svc), 150i128);
+}
+
+/// Removing absent tiers repeatedly is a no-op for a service that never had them.
+#[test]
+fn test_remove_price_tiers_is_idempotent_when_never_configured() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let svc = make_service(&env, "no_tiers");
+
+    assert_eq!(client.get_price_tiers(&svc), None);
+
+    client.remove_price_tiers(&svc);
+    assert_eq!(client.get_price_tiers(&svc), None);
+
+    client.remove_price_tiers(&svc);
+    assert_eq!(client.get_price_tiers(&svc), None);
 }
 
 /// Saturation edge: large requests × large price saturates at i128::MAX.
