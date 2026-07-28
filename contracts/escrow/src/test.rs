@@ -903,6 +903,41 @@ fn test_accept_admin_transfer_rotates_admin() {
     assert_eq!(client.get_admin(), Some(next));
 }
 #[test]
+fn test_accept_admin_transfer_emits_admin_chg_event() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let next = Address::generate(&env);
+    client.propose_admin_transfer(&next);
+
+    client.accept_admin_transfer(&next);
+
+    let events = env.events().all();
+    assert!(!events.is_empty());
+    let (_addr, topics, data) = events.last().unwrap();
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("admin_chg"),).into_val(&env);
+    assert_eq!(topics, expected_topics);
+    let decoded: (Address, Address) = data.into_val(&env);
+    assert_eq!(decoded, (admin, next));
+}
+#[test]
+fn test_propose_admin_transfer_does_not_emit_admin_chg_event() {
+    // Only the completed handover (accept_admin_transfer) is a genuine
+    // admin state change; a mere proposal must not emit admin_chg.
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let next = Address::generate(&env);
+
+    client.propose_admin_transfer(&next);
+
+    let events = env.events().all();
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("admin_chg"),).into_val(&env);
+    for (_addr, topics, _data) in events.iter() {
+        assert_ne!(topics, expected_topics);
+    }
+}
+#[test]
 #[should_panic(expected = "Error(Contract, #5)")]
 fn test_accept_admin_transfer_panics_with_no_pending() {
     let env = Env::default();
