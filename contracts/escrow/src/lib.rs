@@ -39,6 +39,22 @@ pub struct ServiceMetadata {
     pub owner: Address,
 }
 
+/// A snapshot of the current admin-handover state, returned by
+/// [`Escrow::get_admin_summary`].
+///
+/// Combines `get_admin` and `get_pending_admin` into one read so callers
+/// (dashboards, migration tooling) can check whether a handover is in
+/// progress without two round trips. Both fields default to `None` — before
+/// `init`, and whenever no handover is pending, respectively — never a
+/// panic. The individual getters remain available and always agree with the
+/// corresponding field here.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminSummary {
+    pub admin: Option<Address>,
+    pub pending_admin: Option<Address>,
+}
+
 /// A snapshot of all global contract configuration, returned by
 /// [`Escrow::get_contract_config`].
 ///
@@ -86,6 +102,36 @@ pub struct BillingSummary {
     pub billed: i128,
     /// Ledger timestamp (seconds since unix epoch) of the last `settle` call
     /// that drained this pair, or `None` if the pair has never been settled.
+    pub last_settlement: Option<u64>,
+}
+
+/// A cross-service settlement snapshot for one agent, returned by
+/// [`Escrow::get_agent_settlement_summary`].
+///
+/// [`BillingSummary`] covers a single `(agent, service_id)` pair; this
+/// covers the agent's whole active-service index in one bounded read (see
+/// `MAX_AGENT_SERVICE_INDEX`), so callers don't have to fan out a
+/// `get_billing_summary` call per service to answer "is this agent fully
+/// settled, and when did they last settle?"
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentSettlementSummary {
+    /// Lifetime settled amount for this agent across all services, in
+    /// stroops. Same value as `get_total_settled_by_agent`. Defaults to `0`.
+    pub total_settled: i128,
+    /// Number of services in the agent's active-service index that
+    /// currently carry non-zero (unsettled) usage.
+    pub outstanding_services: u32,
+    /// The most recent `LastSettlement` timestamp among services *currently
+    /// in the agent's active-service index*, or `None` if none of them
+    /// carry a stamp (including when the index is empty).
+    ///
+    /// Caveat: `settle` removes a service from the index once it is fully
+    /// drained, so a service settled individually (rather than via
+    /// `settle_all`, which does not deindex) stops contributing to this
+    /// field the moment it is settled. Use `get_last_settlement` for the
+    /// authoritative per-`(agent, service_id)` timestamp regardless of
+    /// index membership.
     pub last_settlement: Option<u64>,
 }
 
@@ -381,6 +427,19 @@ fn require_admin(env: &Env) -> Address {
     let admin = get_admin_address(env);
     admin.require_auth();
     admin
+}
+
+/// Returns `true` iff `caller` is the admin or the given service `owner`.
+///
+/// Several entrypoints (`settle`, `settle_all`,
+/// `transfer_service_ownership`) authorize either the contract admin or a
+/// specific service's `ServiceMetadata.owner`. This centralises that
+/// comparison; call sites remain responsible for loading the relevant
+/// `owner` and for panicking with their own (call-site-specific) error
+/// code, since existing call sites do not all use the same code for this
+/// rejection.
+fn is_owner_or_admin(admin: &Address, caller: &Address, owner: &Address) -> bool {
+    caller == admin || caller == owner
 }
 
 /// Reject the call if the contract is currently paused.
@@ -904,6 +963,48 @@ impl Escrow {
             .get(&DataKey::LastSettlement(agent, service_id))
     }
 
+    /// Return a cross-service settlement snapshot for one agent.
+    ///
+    /// Pure read — no `require_auth`, no pause gate. Reuses
+    /// `get_total_settled_by_agent` for the lifetime total, then does one
+    /// bounded pass over the agent's active-service index (capped at
+    /// `MAX_AGENT_SERVICE_INDEX`) to count services with outstanding usage
+    /// and find the most recent settlement timestamp. Returns
+    /// `outstanding_services: 0` and `last_settlement: None` for an agent
+    /// with an empty or absent index — never a panic.
+    pub fn get_agent_settlement_summary(env: Env, agent: Address) -> AgentSettlementSummary {
+        let total_settled = Self::get_total_settled_by_agent(env.clone(), agent.clone());
+        let index: Vec<Symbol> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AgentServiceIndex(agent.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut outstanding_services: u32 = 0;
+        let mut last_settlement: Option<u64> = None;
+        for service_id in index.iter() {
+            if read_usage(&env, &agent, &service_id) > 0 {
+                outstanding_services = outstanding_services.saturating_add(1);
+            }
+            let stamped: Option<u64> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::LastSettlement(agent.clone(), service_id));
+            last_settlement = match (last_settlement, stamped) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            };
+        }
+
+        AgentSettlementSummary {
+            total_settled,
+            outstanding_services,
+            last_settlement,
+        }
+    }
+
     /// Credit an agent with prepaid balance in stroops.
     ///
     /// Admin-gated and pause-respecting. The balance is drawn down by
@@ -1370,7 +1471,7 @@ impl Escrow {
                 .persistent()
                 .get(&DataKey::ServiceMetadata(service_id.clone()))
                 .unwrap_or_else(|| panic_with_error!(&env, EscrowError::ServiceMetadataNotFound));
-            if caller != meta.owner {
+            if !is_owner_or_admin(&admin, &caller, &meta.owner) {
                 panic_with_error!(&env, EscrowError::NotPendingAdmin);
             }
         }
@@ -1419,7 +1520,12 @@ impl Escrow {
     /// zeroed, `LastSettlement` stamped, `settled` event emitted) matching
     /// the semantics of a direct `settle` call. Services with zero usage
     /// are still included in the return value (with a billed amount of 0)
-    /// so callers can confirm the full sweep.
+    /// so callers can confirm the full sweep. After the sweep, emits one
+    /// `settl_all(agent, count, total_billed)` batch-summary event so
+    /// indexers can track a full drain without summing the per-service
+    /// `settled` events themselves. `count` is the number of services in
+    /// the index (including zero-billed ones); `total_billed` is the sum
+    /// of every `billed` amount, saturating at `i128::MAX`.
     ///
     /// Honours the pause gate: panics with [`EscrowError::ContractPaused`]
     /// when paused.
@@ -1442,6 +1548,7 @@ impl Escrow {
 
         let now = env.ledger().timestamp();
         let mut results: Vec<(Symbol, i128)> = Vec::new(&env);
+        let mut total_billed: i128 = 0;
 
         for service_id in svc_list.iter() {
             // Non-admin callers must own this specific service.
@@ -1453,7 +1560,7 @@ impl Escrow {
                     .unwrap_or_else(|| {
                         panic_with_error!(&env, EscrowError::ServiceMetadataNotFound)
                     });
-                if caller != meta.owner {
+                if !is_owner_or_admin(&admin, &caller, &meta.owner) {
                     panic_with_error!(&env, EscrowError::Unauthorized);
                 }
             }
@@ -1482,8 +1589,14 @@ impl Escrow {
                 (agent.clone(), service_id.clone(), requests, billed),
             );
 
+            total_billed = total_billed.saturating_add(billed);
             results.push_back((service_id.clone(), billed));
         }
+
+        env.events().publish(
+            (symbol_short!("settl_all"),),
+            (agent, results.len(), total_billed),
+        );
 
         results
     }
@@ -1589,9 +1702,16 @@ impl Escrow {
     }
 
     /// Admin sets the allowlist status for a specific agent.
+    ///
+    /// Emits an `agt_alw` event with `(agent, allowed)` after the storage
+    /// write so indexers can observe every per-agent allowlist change
+    /// on-chain, mirroring the `cfg_set` event already emitted by
+    /// [`Self::set_allowlist_enabled`] for the master toggle.
     pub fn set_agent_allowed(env: Env, agent: Address, allowed: bool) {
         require_admin(&env);
-        write_flag(&env, &DataKey::AgentAllowed(agent), allowed);
+        write_flag(&env, &DataKey::AgentAllowed(agent.clone()), allowed);
+        env.events()
+            .publish((symbol_short!("agt_alw"),), (agent, allowed));
     }
 
     /// Read whether an agent is on the blocklist (false for never-set).
@@ -1603,9 +1723,15 @@ impl Escrow {
     /// agent is rejected by `record_usage` with `AgentBlocked`,
     /// independent of the allowlist and taking precedence over it: an
     /// agent that is both allow-listed and blocked is still rejected.
+    ///
+    /// Emits an `agt_blk` event with `(agent, blocked)` after the storage
+    /// write so indexers can observe every per-agent blocklist change
+    /// on-chain.
     pub fn set_agent_blocked(env: Env, agent: Address, blocked: bool) {
         require_admin(&env);
-        write_flag(&env, &DataKey::AgentBlocked(agent), blocked);
+        write_flag(&env, &DataKey::AgentBlocked(agent.clone()), blocked);
+        env.events()
+            .publish((symbol_short!("agt_blk"),), (agent, blocked));
     }
 
     /// Admin sets the per-call lower bound on `requests` for batched
@@ -1885,10 +2011,25 @@ impl Escrow {
         env.storage().persistent().get(&DataKey::PendingAdmin)
     }
 
+    /// Return the current admin and any pending handover in a single read.
+    ///
+    /// Pure read — no `require_auth`, no pause gate. Equivalent to calling
+    /// `get_admin` and `get_pending_admin` separately; this is a convenience
+    /// snapshot only, for callers (dashboards, migration tooling) that want
+    /// both in one round trip.
+    pub fn get_admin_summary(env: Env) -> AdminSummary {
+        AdminSummary {
+            admin: Self::get_admin(env.clone()),
+            pending_admin: Self::get_pending_admin(env),
+        }
+    }
+
     /// Step 2 of admin handover. The pending admin (set by step 1)
     /// claims the role; this proves they control the key. Panics with
     /// NoPendingAdminTransfer if none is pending, or NotPendingAdmin
-    /// if the caller does not match the pending entry.
+    /// if the caller does not match the pending entry. On success, emits
+    /// `admin_chg(old_admin, new_admin)` so indexers can track admin
+    /// rotations without polling `get_admin`.
     pub fn accept_admin_transfer(env: Env, caller: Address) {
         caller.require_auth();
         let pending: Address = env
@@ -1899,8 +2040,11 @@ impl Escrow {
         if pending != caller {
             panic_with_error!(&env, EscrowError::NotPendingAdmin);
         }
+        let old_admin = get_admin_address(&env);
         env.storage().persistent().set(&DataKey::Admin, &caller);
         env.storage().persistent().remove(&DataKey::PendingAdmin);
+        env.events()
+            .publish((symbol_short!("admin_chg"),), (old_admin, caller));
     }
 
     /// Step 1 of admin handover. Current admin proposes a new admin
@@ -2036,7 +2180,7 @@ impl Escrow {
             .persistent()
             .get(&DataKey::ServiceMetadata(service_id.clone()))
             .unwrap_or_else(|| panic_with_error!(&env, EscrowError::ServiceMetadataNotFound));
-        if caller != meta.owner && caller != admin {
+        if !is_owner_or_admin(&admin, &caller, &meta.owner) {
             panic_with_error!(&env, EscrowError::Unauthorized);
         }
         // Reject a no-op transfer to the current owner. Mirrors the

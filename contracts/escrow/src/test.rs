@@ -903,6 +903,41 @@ fn test_accept_admin_transfer_rotates_admin() {
     assert_eq!(client.get_admin(), Some(next));
 }
 #[test]
+fn test_accept_admin_transfer_emits_admin_chg_event() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let next = Address::generate(&env);
+    client.propose_admin_transfer(&next);
+
+    client.accept_admin_transfer(&next);
+
+    let events = env.events().all();
+    assert!(!events.is_empty());
+    let (_addr, topics, data) = events.last().unwrap();
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("admin_chg"),).into_val(&env);
+    assert_eq!(topics, expected_topics);
+    let decoded: (Address, Address) = data.into_val(&env);
+    assert_eq!(decoded, (admin, next));
+}
+#[test]
+fn test_propose_admin_transfer_does_not_emit_admin_chg_event() {
+    // Only the completed handover (accept_admin_transfer) is a genuine
+    // admin state change; a mere proposal must not emit admin_chg.
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let next = Address::generate(&env);
+
+    client.propose_admin_transfer(&next);
+
+    let events = env.events().all();
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("admin_chg"),).into_val(&env);
+    for (_addr, topics, _data) in events.iter() {
+        assert_ne!(topics, expected_topics);
+    }
+}
+#[test]
 #[should_panic(expected = "Error(Contract, #5)")]
 fn test_accept_admin_transfer_panics_with_no_pending() {
     let env = Env::default();
@@ -1068,13 +1103,21 @@ fn test_transfer_service_ownership_genuine_transfer_emits_event() {
     client.set_service_metadata(&svc, &desc, &owner);
     // Perform genuine transfer.
     client.transfer_service_ownership(&owner, &svc, &new_owner);
-    // The owner_chg event is the most recent publish: (contract, topics, data).
-    // `env.events().all()` is scoped to the current top-level invocation (see
-    // test_settle_emits_settled_event_with_payload for the same pattern), so
-    // this only reflects transfer_service_ownership's own publish, not a
-    // before/after delta across the earlier set_service_metadata call.
+    // env.events().all() reflects only the most recent contract invocation
+    // (confirmed by every other event test in this file, e.g.
+    // assert_usage_event_count re-checking a count of 1 after each of
+    // several sequential record_usage calls), not a running total since
+    // the start of the test. The prior `set_service_metadata` call's
+    // `meta_set` event is therefore not present here — only this
+    // transfer's own event is. Comparing against a pre-call count of
+    // events from a *different* invocation was the bug; checking this
+    // call's own event count directly is the fix.
     let events_after = env.events().all();
-    assert!(!events_after.is_empty());
+    assert_eq!(
+        events_after.len(),
+        1,
+        "genuine transfer must emit exactly one event"
+    );
     let (_addr, topics, data) = events_after.last().unwrap();
     let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
         (symbol_short!("owner_chg"),).into_val(&env);
@@ -1316,6 +1359,74 @@ fn test_total_settled_getters_default_to_zero() {
     assert_eq!(client.get_total_settled_all_time(), 0i128);
 }
 #[test]
+fn test_agent_settlement_summary_defaults_for_unseen_agent() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+
+    let summary = client.get_agent_settlement_summary(&agent);
+    assert_eq!(summary.total_settled, 0i128);
+    assert_eq!(summary.outstanding_services, 0);
+    assert_eq!(summary.last_settlement, None);
+}
+#[test]
+fn test_agent_settlement_summary_counts_outstanding_and_settled() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let inference = Symbol::new(&env, "infer");
+    let storage = Symbol::new(&env, "storage");
+    client.set_service_price(&inference, &10i128);
+    client.set_service_price(&storage, &5i128);
+
+    client.record_usage(&agent, &inference, &4u32);
+    client.record_usage(&agent, &storage, &2u32);
+
+    // Nothing settled yet: both services outstanding, no settlement stamp.
+    let before = client.get_agent_settlement_summary(&agent);
+    assert_eq!(before.total_settled, 0i128);
+    assert_eq!(before.outstanding_services, 2);
+    assert_eq!(before.last_settlement, None);
+
+    // Settle only `inference` via settle() (not settle_all): it drains and
+    // is immediately deindexed, so it stops counting as outstanding *and*
+    // stops contributing to last_settlement (see the field's doc comment).
+    // `storage` remains outstanding.
+    client.settle(&admin, &agent, &inference);
+
+    let after = client.get_agent_settlement_summary(&agent);
+    assert_eq!(
+        after.total_settled,
+        client.get_total_settled_by_agent(&agent)
+    );
+    assert_eq!(after.total_settled, 40i128);
+    assert_eq!(after.outstanding_services, 1);
+    assert_eq!(after.last_settlement, None);
+}
+#[test]
+fn test_agent_settlement_summary_reflects_settle_all_timestamp() {
+    // Unlike settle(), settle_all() does not deindex, so a service it
+    // settles keeps contributing its LastSettlement stamp to the summary.
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let inference = Symbol::new(&env, "infer");
+    client.set_service_price(&inference, &10i128);
+    client.record_usage(&agent, &inference, &1u32);
+
+    advance_ledger(&env, 100);
+    client.settle_all(&admin, &agent);
+
+    let summary = client.get_agent_settlement_summary(&agent);
+    assert_eq!(
+        summary.last_settlement,
+        client.get_last_settlement(&agent, &inference)
+    );
+    assert!(summary.last_settlement.is_some());
+    // Already drained by settle_all, so no longer outstanding.
+    assert_eq!(summary.outstanding_services, 0);
+}
+#[test]
 fn test_total_settled_counters_sum_across_settles_and_agents() {
     let env = Env::default();
     let (client, admin) = setup_initialized(&env);
@@ -1384,6 +1495,57 @@ fn test_total_settled_counters_include_settle_all() {
     assert_eq!(settled.get(1), Some((storage.clone(), 75i128)));
     assert_eq!(client.get_total_settled_by_agent(&agent), 95i128);
     assert_eq!(client.get_total_settled_all_time(), 95i128);
+}
+#[test]
+fn test_settle_all_emits_settl_all_batch_summary_event() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let inference = Symbol::new(&env, "infer");
+    let storage = Symbol::new(&env, "storage");
+
+    client.set_service_price(&inference, &10i128);
+    client.set_service_price(&storage, &25i128);
+    client.record_usage(&agent, &inference, &2u32);
+    client.record_usage(&agent, &storage, &3u32);
+
+    client.settle_all(&admin, &agent);
+
+    // The batch summary is the most recent publish — one per-service
+    // `settled` event fires per iteration, then exactly one `settl_all`
+    // after the loop.
+    let events = env.events().all();
+    assert!(!events.is_empty());
+    let (_addr, topics, data) = events.last().unwrap();
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("settl_all"),).into_val(&env);
+    assert_eq!(topics, expected_topics);
+    let decoded: (Address, u32, i128) = data.into_val(&env);
+    assert_eq!(decoded, (agent, 2u32, 95i128));
+}
+#[test]
+fn test_settle_all_batch_summary_reflects_zero_usage_services() {
+    // settle_all does not deindex (unlike settle()), so a service it just
+    // drained stays in the index. A second settle_all sweep therefore
+    // covers the same service with zero usage — the batch event must
+    // still fire, with total_billed = 0.
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "infer");
+    client.set_service_price(&svc, &10i128);
+    client.record_usage(&agent, &svc, &1u32);
+    client.settle_all(&admin, &agent);
+
+    client.settle_all(&admin, &agent);
+    let events_after = env.events().all();
+    assert!(!events_after.is_empty());
+    let (_addr, topics, data) = events_after.last().unwrap();
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("settl_all"),).into_val(&env);
+    assert_eq!(topics, expected_topics);
+    let decoded: (Address, u32, i128) = data.into_val(&env);
+    assert_eq!(decoded, (agent, 1u32, 0i128));
 }
 #[test]
 fn test_total_settled_counters_saturate_at_i128_max() {
@@ -1899,6 +2061,64 @@ fn test_settle_all_panics_paused_via_shared_helper() {
     client.settle_all(&admin, &agent);
 }
 
+// ── settle_all MAX_SETTLE_ALL boundary ─────────────────────────────────────
+//
+// record_usage caps the per-agent service index at MAX_AGENT_SERVICE_INDEX,
+// which equals MAX_SETTLE_ALL, so the SettleAllTooLarge guard in settle_all
+// can never fire through the public API alone — it exists to protect a
+// future migration that could write a larger index. These tests exercise
+// the guard directly by writing an oversized index via `as_contract`,
+// bypassing the normal write path the way the existing
+// `..._via_storage_helper` tests already do for other invariants.
+
+#[test]
+fn test_settle_all_at_exactly_max_settle_all_succeeds() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    // Settling 256 services in one call is exactly the kind of large batch
+    // the default test budget isn't sized for; this only relaxes the test
+    // harness's metering, not the contract's own MAX_SETTLE_ALL guard.
+    env.budget().reset_unlimited();
+
+    env.as_contract(&contract_address_from_client(&client), || {
+        let mut index: Vec<Symbol> = Vec::new(&env);
+        let mut buf = [0u8; 8];
+        for i in 0..MAX_SETTLE_ALL {
+            index.push_back(Symbol::new(&env, svc_name(&mut buf, i)));
+        }
+        assert_eq!(index.len(), MAX_SETTLE_ALL);
+        env.storage()
+            .persistent()
+            .set(&DataKey::AgentServiceIndex(agent.clone()), &index);
+    });
+
+    let results = client.settle_all(&admin, &agent);
+    assert_eq!(results.len(), MAX_SETTLE_ALL);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #19)")]
+fn test_settle_all_one_over_max_settle_all_panics() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    env.budget().reset_unlimited();
+
+    env.as_contract(&contract_address_from_client(&client), || {
+        let mut index: Vec<Symbol> = Vec::new(&env);
+        let mut buf = [0u8; 8];
+        for i in 0..(MAX_SETTLE_ALL + 1) {
+            index.push_back(Symbol::new(&env, svc_name(&mut buf, i)));
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::AgentServiceIndex(agent.clone()), &index);
+    });
+
+    client.settle_all(&admin, &agent);
+}
+
 #[test]
 fn test_list_open_disputes_returns_empty_for_agent_without_disputes() {
     let env = Env::default();
@@ -2310,6 +2530,109 @@ fn test_set_agent_blocked_requires_admin_auth() {
     client.set_agent_blocked(&agent, &true);
 }
 #[test]
+fn test_set_agent_allowed_emits_agt_alw_event() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+
+    client.set_agent_allowed(&agent, &true);
+
+    let events = env.events().all();
+    let (_addr, topics, data) = events.last().unwrap();
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("agt_alw"),).into_val(&env);
+    assert_eq!(topics, expected_topics);
+    let decoded: (Address, bool) = data.into_val(&env);
+    assert_eq!(decoded, (agent, true));
+}
+#[test]
+fn test_set_agent_allowed_emits_event_on_every_toggle() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("agt_alw"),).into_val(&env);
+
+    client.set_agent_allowed(&agent, &true);
+    let (_, topics, data) = env.events().all().last().unwrap();
+    assert_eq!(topics, expected_topics);
+    let decoded: (Address, bool) = data.into_val(&env);
+    assert_eq!(decoded, (agent.clone(), true));
+
+    // A second, independent call emits its own event carrying the new
+    // value; each call's event is checked immediately after that call.
+    client.set_agent_allowed(&agent, &false);
+    let (_, topics, data) = env.events().all().last().unwrap();
+    assert_eq!(topics, expected_topics);
+    let decoded: (Address, bool) = data.into_val(&env);
+    assert_eq!(decoded, (agent, false));
+}
+#[test]
+fn test_set_agent_blocked_emits_agt_blk_event() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+
+    client.set_agent_blocked(&agent, &true);
+
+    let events = env.events().all();
+    let (_addr, topics, data) = events.last().unwrap();
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("agt_blk"),).into_val(&env);
+    assert_eq!(topics, expected_topics);
+    let decoded: (Address, bool) = data.into_val(&env);
+    assert_eq!(decoded, (agent, true));
+}
+#[test]
+fn test_set_agent_blocked_emits_event_on_every_toggle() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("agt_blk"),).into_val(&env);
+
+    client.set_agent_blocked(&agent, &true);
+    let (_, topics, data) = env.events().all().last().unwrap();
+    assert_eq!(topics, expected_topics);
+    let decoded: (Address, bool) = data.into_val(&env);
+    assert_eq!(decoded, (agent.clone(), true));
+
+    client.set_agent_blocked(&agent, &false);
+    let (_, topics, data) = env.events().all().last().unwrap();
+    assert_eq!(topics, expected_topics);
+    let decoded: (Address, bool) = data.into_val(&env);
+    assert_eq!(decoded, (agent, false));
+}
+#[test]
+fn test_agt_alw_and_agt_blk_topics_do_not_collide() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let alw_topics: soroban_sdk::Vec<soroban_sdk::Val> = (symbol_short!("agt_alw"),).into_val(&env);
+    let blk_topics: soroban_sdk::Vec<soroban_sdk::Val> = (symbol_short!("agt_blk"),).into_val(&env);
+
+    client.set_agent_allowed(&agent, &true);
+    let events = env.events().all();
+    assert_eq!(
+        events.iter().filter(|(_, t, _)| t == &alw_topics).count(),
+        1
+    );
+    assert_eq!(
+        events.iter().filter(|(_, t, _)| t == &blk_topics).count(),
+        0
+    );
+
+    client.set_agent_blocked(&agent, &true);
+    let events = env.events().all();
+    assert_eq!(
+        events.iter().filter(|(_, t, _)| t == &blk_topics).count(),
+        1
+    );
+    // The distinct topic ensures a blocklist write is never mistaken for an
+    // allowlist write by a listener subscribed to only one of the two.
+    assert!(alw_topics != blk_topics);
+}
+#[test]
 fn test_remove_service_price_clears_price() {
     let env = Env::default();
     let (client, admin) = setup_initialized(&env);
@@ -2686,6 +3009,16 @@ fn test_i20_wrong_caller_accept_rejected() {
     client.accept_admin_transfer(&intruder);
 }
 #[test]
+fn test_i20_cancel_with_nothing_pending_is_a_noop() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    // No propose_admin_transfer call: nothing is pending. Cancelling must
+    // be a no-op, not a panic — mirrors unpause()'s idempotency contract.
+    client.cancel_admin_transfer();
+    assert_eq!(client.get_pending_admin(), None);
+    assert_eq!(client.get_admin(), Some(admin));
+}
+#[test]
 fn test_i20_repropose_overwrites_pending() {
     let env = Env::default();
     let (client, admin) = setup_initialized(&env);
@@ -3016,6 +3349,13 @@ fn test_i22_propose_admin_transfer_requires_admin_auth() {
     let client = setup_scoped_auth(&env);
     let next = Address::generate(&env);
     client.propose_admin_transfer(&next);
+}
+#[test]
+#[should_panic]
+fn test_i22_cancel_admin_transfer_requires_admin_auth() {
+    let env = Env::default();
+    let client = setup_scoped_auth(&env);
+    client.cancel_admin_transfer();
 }
 #[test]
 #[should_panic]
@@ -4144,6 +4484,85 @@ fn test_get_contract_config_is_idempotent() {
     let first = client.get_contract_config();
     let second = client.get_contract_config();
     assert_eq!(first, second);
+}
+
+// ── get_admin_summary ──────────────────────────────────────────────────────
+//
+
+#[test]
+fn test_get_admin_summary_before_init_is_all_none() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, Escrow);
+    let client = EscrowClient::new(&env, &contract_id);
+
+    let summary = client.get_admin_summary();
+    assert_eq!(summary.admin, None);
+    assert_eq!(summary.pending_admin, None);
+}
+
+#[test]
+fn test_get_admin_summary_after_init_has_admin_no_pending() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+
+    let summary = client.get_admin_summary();
+    assert_eq!(summary.admin, Some(admin));
+    assert_eq!(summary.pending_admin, None);
+}
+
+#[test]
+fn test_get_admin_summary_reflects_pending_proposal() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let next = Address::generate(&env);
+
+    client.propose_admin_transfer(&next);
+
+    let summary = client.get_admin_summary();
+    assert_eq!(summary.admin, Some(admin));
+    assert_eq!(summary.pending_admin, Some(next));
+}
+
+#[test]
+fn test_get_admin_summary_clears_pending_after_accept() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let next = Address::generate(&env);
+
+    client.propose_admin_transfer(&next);
+    client.accept_admin_transfer(&next);
+
+    let summary = client.get_admin_summary();
+    assert_eq!(summary.admin, Some(next));
+    assert_eq!(summary.pending_admin, None);
+}
+
+#[test]
+fn test_get_admin_summary_clears_pending_after_cancel() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let next = Address::generate(&env);
+
+    client.propose_admin_transfer(&next);
+    client.cancel_admin_transfer();
+
+    let summary = client.get_admin_summary();
+    assert_eq!(summary.admin, Some(admin));
+    assert_eq!(summary.pending_admin, None);
+}
+
+#[test]
+fn test_get_admin_summary_matches_individual_getters() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let next = Address::generate(&env);
+    client.propose_admin_transfer(&next);
+
+    let summary = client.get_admin_summary();
+    assert_eq!(summary.admin, client.get_admin());
+    assert_eq!(summary.pending_admin, client.get_pending_admin());
+    assert_eq!(summary.admin, Some(admin));
 }
 
 // ── register_service_with_metadata ────────────────────────────────────────────
