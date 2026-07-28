@@ -417,6 +417,7 @@ agentpay-contracts/
 - [Escrow: Build, Test, and Deploy Guide](docs/escrow/build-deploy.md) — build the release WASM, run the test suite, and deploy to testnet with the Stellar/Soroban CLI.
 - [Escrow: Schema Versioning & Migration](docs/escrow/migrations.md) — the difference between `version()` and `SchemaVersion`, the double-run guard, and the migration runbook.
 - [Escrow: Storage DataKey Reference](docs/escrow/storage.md) — complete map of every `DataKey` variant: stored value type, default when absent, which entrypoints write it, and whether it is drained by `settle`. Explains why everything uses `persistent()` and the per-pair vs per-agent vs singleton key cardinality.
+- [Escrow: Events Reference](docs/escrow/events.md) — every event topic, its payload shape, and which entrypoint emits it, including the shared `cfg_set`/`dispute` topics and the four setters that currently emit no event at all.
 
 ## CI/CD
 
