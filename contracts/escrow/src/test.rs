@@ -938,6 +938,41 @@ fn test_propose_admin_transfer_does_not_emit_admin_chg_event() {
     }
 }
 #[test]
+fn test_propose_admin_transfer_emits_admin_prp_event() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let next = Address::generate(&env);
+
+    client.propose_admin_transfer(&next);
+
+    let events = env.events().all();
+    let (_addr, topics, data) = events.last().unwrap();
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("admin_prp"),).into_val(&env);
+    assert_eq!(topics, expected_topics);
+    let decoded: (Address, Address) = data.into_val(&env);
+    assert_eq!(decoded, (admin, next));
+}
+#[test]
+fn test_repropose_admin_transfer_emits_event_with_new_target() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let first = Address::generate(&env);
+    let second = Address::generate(&env);
+
+    client.propose_admin_transfer(&first);
+    client.propose_admin_transfer(&second);
+
+    let events = env.events().all();
+    let (_addr, topics, data) = events.last().unwrap();
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("admin_prp"),).into_val(&env);
+    assert_eq!(topics, expected_topics);
+    let decoded: (Address, Address) = data.into_val(&env);
+    assert_eq!(decoded, (admin, second.clone()));
+    assert_eq!(client.get_pending_admin(), Some(second));
+}
+#[test]
 #[should_panic(expected = "Error(Contract, #5)")]
 fn test_accept_admin_transfer_panics_with_no_pending() {
     let env = Env::default();
@@ -3253,6 +3288,42 @@ fn test_i22_cancel_admin_transfer_requires_admin_auth() {
     let env = Env::default();
     let client = setup_scoped_auth(&env);
     client.cancel_admin_transfer();
+}
+#[test]
+fn test_cancel_admin_transfer_emits_admin_can_event_with_cancelled_target() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let next = Address::generate(&env);
+    client.propose_admin_transfer(&next);
+
+    client.cancel_admin_transfer();
+
+    let events = env.events().all();
+    let (_addr, topics, data) = events.last().unwrap();
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("admin_can"),).into_val(&env);
+    assert_eq!(topics, expected_topics);
+    let decoded: (Address, Option<Address>) = data.into_val(&env);
+    assert_eq!(decoded, (admin, Some(next)));
+    assert_eq!(client.get_pending_admin(), None);
+}
+#[test]
+fn test_cancel_admin_transfer_noop_emits_event_with_none() {
+    // cancel_admin_transfer is documented as a no-op when nothing is
+    // pending; it must still emit admin_can so indexers can distinguish a
+    // deliberate no-op cancel from a call that never happened.
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+
+    client.cancel_admin_transfer();
+
+    let events = env.events().all();
+    let (_addr, topics, data) = events.last().unwrap();
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("admin_can"),).into_val(&env);
+    assert_eq!(topics, expected_topics);
+    let decoded: (Address, Option<Address>) = data.into_val(&env);
+    assert_eq!(decoded, (admin, None));
 }
 #[test]
 #[should_panic]
