@@ -4320,6 +4320,85 @@ fn test_get_contract_config_is_idempotent() {
     assert_eq!(first, second);
 }
 
+// ── get_admin_summary ──────────────────────────────────────────────────────
+//
+
+#[test]
+fn test_get_admin_summary_before_init_is_all_none() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, Escrow);
+    let client = EscrowClient::new(&env, &contract_id);
+
+    let summary = client.get_admin_summary();
+    assert_eq!(summary.admin, None);
+    assert_eq!(summary.pending_admin, None);
+}
+
+#[test]
+fn test_get_admin_summary_after_init_has_admin_no_pending() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+
+    let summary = client.get_admin_summary();
+    assert_eq!(summary.admin, Some(admin));
+    assert_eq!(summary.pending_admin, None);
+}
+
+#[test]
+fn test_get_admin_summary_reflects_pending_proposal() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let next = Address::generate(&env);
+
+    client.propose_admin_transfer(&next);
+
+    let summary = client.get_admin_summary();
+    assert_eq!(summary.admin, Some(admin));
+    assert_eq!(summary.pending_admin, Some(next));
+}
+
+#[test]
+fn test_get_admin_summary_clears_pending_after_accept() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let next = Address::generate(&env);
+
+    client.propose_admin_transfer(&next);
+    client.accept_admin_transfer(&next);
+
+    let summary = client.get_admin_summary();
+    assert_eq!(summary.admin, Some(next));
+    assert_eq!(summary.pending_admin, None);
+}
+
+#[test]
+fn test_get_admin_summary_clears_pending_after_cancel() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let next = Address::generate(&env);
+
+    client.propose_admin_transfer(&next);
+    client.cancel_admin_transfer();
+
+    let summary = client.get_admin_summary();
+    assert_eq!(summary.admin, Some(admin));
+    assert_eq!(summary.pending_admin, None);
+}
+
+#[test]
+fn test_get_admin_summary_matches_individual_getters() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let next = Address::generate(&env);
+    client.propose_admin_transfer(&next);
+
+    let summary = client.get_admin_summary();
+    assert_eq!(summary.admin, client.get_admin());
+    assert_eq!(summary.pending_admin, client.get_pending_admin());
+    assert_eq!(summary.admin, Some(admin));
+}
+
 // ── register_service_with_metadata ────────────────────────────────────────────
 //
 // Coverage:
