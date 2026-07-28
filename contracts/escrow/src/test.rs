@@ -1902,6 +1902,64 @@ fn test_settle_all_panics_paused_via_shared_helper() {
     client.settle_all(&admin, &agent);
 }
 
+// ── settle_all MAX_SETTLE_ALL boundary ─────────────────────────────────────
+//
+// record_usage caps the per-agent service index at MAX_AGENT_SERVICE_INDEX,
+// which equals MAX_SETTLE_ALL, so the SettleAllTooLarge guard in settle_all
+// can never fire through the public API alone — it exists to protect a
+// future migration that could write a larger index. These tests exercise
+// the guard directly by writing an oversized index via `as_contract`,
+// bypassing the normal write path the way the existing
+// `..._via_storage_helper` tests already do for other invariants.
+
+#[test]
+fn test_settle_all_at_exactly_max_settle_all_succeeds() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    // Settling 256 services in one call is exactly the kind of large batch
+    // the default test budget isn't sized for; this only relaxes the test
+    // harness's metering, not the contract's own MAX_SETTLE_ALL guard.
+    env.budget().reset_unlimited();
+
+    env.as_contract(&contract_address_from_client(&client), || {
+        let mut index: Vec<Symbol> = Vec::new(&env);
+        let mut buf = [0u8; 8];
+        for i in 0..MAX_SETTLE_ALL {
+            index.push_back(Symbol::new(&env, svc_name(&mut buf, i)));
+        }
+        assert_eq!(index.len(), MAX_SETTLE_ALL);
+        env.storage()
+            .persistent()
+            .set(&DataKey::AgentServiceIndex(agent.clone()), &index);
+    });
+
+    let results = client.settle_all(&admin, &agent);
+    assert_eq!(results.len(), MAX_SETTLE_ALL);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #19)")]
+fn test_settle_all_one_over_max_settle_all_panics() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    env.budget().reset_unlimited();
+
+    env.as_contract(&contract_address_from_client(&client), || {
+        let mut index: Vec<Symbol> = Vec::new(&env);
+        let mut buf = [0u8; 8];
+        for i in 0..(MAX_SETTLE_ALL + 1) {
+            index.push_back(Symbol::new(&env, svc_name(&mut buf, i)));
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::AgentServiceIndex(agent.clone()), &index);
+    });
+
+    client.settle_all(&admin, &agent);
+}
+
 #[test]
 fn test_list_open_disputes_returns_empty_for_agent_without_disputes() {
     let env = Env::default();
