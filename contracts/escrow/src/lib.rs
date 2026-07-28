@@ -2271,7 +2271,10 @@ impl Escrow {
     /// `dispute` event with `("open", agent, service_id)`.
     ///
     /// Dispute lifecycle:
-    /// 1. `open_dispute` — agent/caller flags the pair; `settle` is blocked.
+    /// 1. `open_dispute` — agent/caller flags the pair. Note: `settle` does
+    ///    **not** check this flag and will still drain and bill the pair
+    ///    while a dispute is open; the flag is advisory for off-chain
+    ///    tooling only (see `docs/escrow/storage.md`).
     /// 2. `resolve_dispute` (admin only) — admin subtracts contested usage
     ///    (or zero for no refund) and clears the flag; `settle` unblocks.
     pub fn open_dispute(env: Env, agent: Address, service_id: Symbol) {
