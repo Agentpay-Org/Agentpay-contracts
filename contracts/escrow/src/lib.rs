@@ -429,6 +429,19 @@ fn require_admin(env: &Env) -> Address {
     admin
 }
 
+/// Returns `true` iff `caller` is the admin or the given service `owner`.
+///
+/// Several entrypoints (`settle`, `settle_all`,
+/// `transfer_service_ownership`) authorize either the contract admin or a
+/// specific service's `ServiceMetadata.owner`. This centralises that
+/// comparison; call sites remain responsible for loading the relevant
+/// `owner` and for panicking with their own (call-site-specific) error
+/// code, since existing call sites do not all use the same code for this
+/// rejection.
+fn is_owner_or_admin(admin: &Address, caller: &Address, owner: &Address) -> bool {
+    caller == admin || caller == owner
+}
+
 /// Reject the call if the contract is currently paused.
 ///
 /// Panics with [`EscrowError::ContractPaused`] when the `Paused` flag is set.
@@ -1458,7 +1471,7 @@ impl Escrow {
                 .persistent()
                 .get(&DataKey::ServiceMetadata(service_id.clone()))
                 .unwrap_or_else(|| panic_with_error!(&env, EscrowError::ServiceMetadataNotFound));
-            if caller != meta.owner {
+            if !is_owner_or_admin(&admin, &caller, &meta.owner) {
                 panic_with_error!(&env, EscrowError::NotPendingAdmin);
             }
         }
@@ -1547,7 +1560,7 @@ impl Escrow {
                     .unwrap_or_else(|| {
                         panic_with_error!(&env, EscrowError::ServiceMetadataNotFound)
                     });
-                if caller != meta.owner {
+                if !is_owner_or_admin(&admin, &caller, &meta.owner) {
                     panic_with_error!(&env, EscrowError::Unauthorized);
                 }
             }
@@ -2154,7 +2167,7 @@ impl Escrow {
             .persistent()
             .get(&DataKey::ServiceMetadata(service_id.clone()))
             .unwrap_or_else(|| panic_with_error!(&env, EscrowError::ServiceMetadataNotFound));
-        if caller != meta.owner && caller != admin {
+        if !is_owner_or_admin(&admin, &caller, &meta.owner) {
             panic_with_error!(&env, EscrowError::Unauthorized);
         }
         // Reject a no-op transfer to the current owner. Mirrors the
