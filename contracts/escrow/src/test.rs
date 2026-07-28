@@ -2530,6 +2530,109 @@ fn test_set_agent_blocked_requires_admin_auth() {
     client.set_agent_blocked(&agent, &true);
 }
 #[test]
+fn test_set_agent_allowed_emits_agt_alw_event() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+
+    client.set_agent_allowed(&agent, &true);
+
+    let events = env.events().all();
+    let (_addr, topics, data) = events.last().unwrap();
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("agt_alw"),).into_val(&env);
+    assert_eq!(topics, expected_topics);
+    let decoded: (Address, bool) = data.into_val(&env);
+    assert_eq!(decoded, (agent, true));
+}
+#[test]
+fn test_set_agent_allowed_emits_event_on_every_toggle() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("agt_alw"),).into_val(&env);
+
+    client.set_agent_allowed(&agent, &true);
+    let (_, topics, data) = env.events().all().last().unwrap();
+    assert_eq!(topics, expected_topics);
+    let decoded: (Address, bool) = data.into_val(&env);
+    assert_eq!(decoded, (agent.clone(), true));
+
+    // A second, independent call emits its own event carrying the new
+    // value; each call's event is checked immediately after that call.
+    client.set_agent_allowed(&agent, &false);
+    let (_, topics, data) = env.events().all().last().unwrap();
+    assert_eq!(topics, expected_topics);
+    let decoded: (Address, bool) = data.into_val(&env);
+    assert_eq!(decoded, (agent, false));
+}
+#[test]
+fn test_set_agent_blocked_emits_agt_blk_event() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+
+    client.set_agent_blocked(&agent, &true);
+
+    let events = env.events().all();
+    let (_addr, topics, data) = events.last().unwrap();
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("agt_blk"),).into_val(&env);
+    assert_eq!(topics, expected_topics);
+    let decoded: (Address, bool) = data.into_val(&env);
+    assert_eq!(decoded, (agent, true));
+}
+#[test]
+fn test_set_agent_blocked_emits_event_on_every_toggle() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("agt_blk"),).into_val(&env);
+
+    client.set_agent_blocked(&agent, &true);
+    let (_, topics, data) = env.events().all().last().unwrap();
+    assert_eq!(topics, expected_topics);
+    let decoded: (Address, bool) = data.into_val(&env);
+    assert_eq!(decoded, (agent.clone(), true));
+
+    client.set_agent_blocked(&agent, &false);
+    let (_, topics, data) = env.events().all().last().unwrap();
+    assert_eq!(topics, expected_topics);
+    let decoded: (Address, bool) = data.into_val(&env);
+    assert_eq!(decoded, (agent, false));
+}
+#[test]
+fn test_agt_alw_and_agt_blk_topics_do_not_collide() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let alw_topics: soroban_sdk::Vec<soroban_sdk::Val> = (symbol_short!("agt_alw"),).into_val(&env);
+    let blk_topics: soroban_sdk::Vec<soroban_sdk::Val> = (symbol_short!("agt_blk"),).into_val(&env);
+
+    client.set_agent_allowed(&agent, &true);
+    let events = env.events().all();
+    assert_eq!(
+        events.iter().filter(|(_, t, _)| t == &alw_topics).count(),
+        1
+    );
+    assert_eq!(
+        events.iter().filter(|(_, t, _)| t == &blk_topics).count(),
+        0
+    );
+
+    client.set_agent_blocked(&agent, &true);
+    let events = env.events().all();
+    assert_eq!(
+        events.iter().filter(|(_, t, _)| t == &blk_topics).count(),
+        1
+    );
+    // The distinct topic ensures a blocklist write is never mistaken for an
+    // allowlist write by a listener subscribed to only one of the two.
+    assert!(alw_topics != blk_topics);
+}
+#[test]
 fn test_remove_service_price_clears_price() {
     let env = Env::default();
     let (client, admin) = setup_initialized(&env);
