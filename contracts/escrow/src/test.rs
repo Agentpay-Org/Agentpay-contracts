@@ -1389,6 +1389,57 @@ fn test_total_settled_counters_include_settle_all() {
     assert_eq!(client.get_total_settled_all_time(), 95i128);
 }
 #[test]
+fn test_settle_all_emits_settl_all_batch_summary_event() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let inference = Symbol::new(&env, "infer");
+    let storage = Symbol::new(&env, "storage");
+
+    client.set_service_price(&inference, &10i128);
+    client.set_service_price(&storage, &25i128);
+    client.record_usage(&agent, &inference, &2u32);
+    client.record_usage(&agent, &storage, &3u32);
+
+    client.settle_all(&admin, &agent);
+
+    // The batch summary is the most recent publish — one per-service
+    // `settled` event fires per iteration, then exactly one `settl_all`
+    // after the loop.
+    let events = env.events().all();
+    assert!(!events.is_empty());
+    let (_addr, topics, data) = events.last().unwrap();
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("settl_all"),).into_val(&env);
+    assert_eq!(topics, expected_topics);
+    let decoded: (Address, u32, i128) = data.into_val(&env);
+    assert_eq!(decoded, (agent, 2u32, 95i128));
+}
+#[test]
+fn test_settle_all_batch_summary_reflects_zero_usage_services() {
+    // settle_all does not deindex (unlike settle()), so a service it just
+    // drained stays in the index. A second settle_all sweep therefore
+    // covers the same service with zero usage — the batch event must
+    // still fire, with total_billed = 0.
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "infer");
+    client.set_service_price(&svc, &10i128);
+    client.record_usage(&agent, &svc, &1u32);
+    client.settle_all(&admin, &agent);
+
+    client.settle_all(&admin, &agent);
+    let events_after = env.events().all();
+    assert!(!events_after.is_empty());
+    let (_addr, topics, data) = events_after.last().unwrap();
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("settl_all"),).into_val(&env);
+    assert_eq!(topics, expected_topics);
+    let decoded: (Address, u32, i128) = data.into_val(&env);
+    assert_eq!(decoded, (agent, 1u32, 0i128));
+}
+#[test]
 fn test_total_settled_counters_saturate_at_i128_max() {
     let env = Env::default();
     let (client, admin) = setup_initialized(&env);
