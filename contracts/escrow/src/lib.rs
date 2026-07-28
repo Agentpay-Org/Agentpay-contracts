@@ -1972,7 +1972,9 @@ impl Escrow {
     /// Step 2 of admin handover. The pending admin (set by step 1)
     /// claims the role; this proves they control the key. Panics with
     /// NoPendingAdminTransfer if none is pending, or NotPendingAdmin
-    /// if the caller does not match the pending entry.
+    /// if the caller does not match the pending entry. On success, emits
+    /// `admin_chg(old_admin, new_admin)` so indexers can track admin
+    /// rotations without polling `get_admin`.
     pub fn accept_admin_transfer(env: Env, caller: Address) {
         caller.require_auth();
         let pending: Address = env
@@ -1983,8 +1985,11 @@ impl Escrow {
         if pending != caller {
             panic_with_error!(&env, EscrowError::NotPendingAdmin);
         }
+        let old_admin = get_admin_address(&env);
         env.storage().persistent().set(&DataKey::Admin, &caller);
         env.storage().persistent().remove(&DataKey::PendingAdmin);
+        env.events()
+            .publish((symbol_short!("admin_chg"),), (old_admin, caller));
     }
 
     /// Step 1 of admin handover. Current admin proposes a new admin
