@@ -6924,3 +6924,91 @@ fn test_svc_catalog_all_new_topics_distinct_from_existing() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// require_settlement_authorized (shared settle/settle_all check) — issue #300
+// ---------------------------------------------------------------------------
+
+/// A non-admin, non-owner caller is rejected from `settle` with the same
+/// `NotPendingAdmin` code the inline check used before it was extracted
+/// into `require_settlement_authorized`.
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")]
+fn test_settle_unauthorized_non_owner_panics() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let owner = Address::generate(&env);
+    let intruder = Address::generate(&env);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "infer");
+
+    client.set_service_metadata(&svc, &String::from_str(&env, "inference"), &owner);
+    client.set_service_price(&svc, &10i128);
+    client.record_usage(&agent, &svc, &5u32);
+
+    client.settle(&intruder, &agent, &svc);
+}
+
+/// A non-admin caller settling a service with no `ServiceMetadata` set is
+/// rejected with `ServiceMetadataNotFound`, not a generic auth error.
+#[test]
+#[should_panic(expected = "Error(Contract, #13)")]
+fn test_settle_service_metadata_not_found_panics() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let caller = Address::generate(&env);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "unregistered");
+
+    client.settle(&caller, &agent, &svc);
+}
+
+/// A non-admin, non-owner caller is rejected from `settle_all` with the
+/// same `Unauthorized` code the inline check used before it was extracted
+/// into `require_settlement_authorized`.
+#[test]
+#[should_panic(expected = "Error(Contract, #26)")]
+fn test_settle_all_unauthorized_non_owner_panics() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let owner = Address::generate(&env);
+    let intruder = Address::generate(&env);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "infer");
+
+    client.set_service_metadata(&svc, &String::from_str(&env, "inference"), &owner);
+    client.set_service_price(&svc, &10i128);
+    client.record_usage(&agent, &svc, &5u32);
+
+    client.settle_all(&intruder, &agent);
+}
+
+/// A non-admin caller running `settle_all` over an index entry with no
+/// `ServiceMetadata` set is rejected with `ServiceMetadataNotFound`.
+#[test]
+#[should_panic(expected = "Error(Contract, #13)")]
+fn test_settle_all_service_metadata_not_found_panics() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let owner = Address::generate(&env);
+    let intruder = Address::generate(&env);
+    let agent = Address::generate(&env);
+    let svc_owned = Symbol::new(&env, "owned");
+    let svc_unregistered = Symbol::new(&env, "bare");
+
+    // Give the intruder legitimate ownership of one service in the index so
+    // the loop reaches the second, unregistered service before rejecting --
+    // proving the metadata lookup, not just caller identity, drives this.
+    client.set_service_metadata(&svc_owned, &String::from_str(&env, "owned svc"), &intruder);
+    client.set_service_price(&svc_owned, &10i128);
+    client.record_usage(&agent, &svc_owned, &5u32);
+
+    client.set_service_price(&svc_unregistered, &10i128);
+    // set_require_service_registration defaults to lax, so record_usage
+    // succeeds without ServiceMetadata ever being set for this service.
+    client.record_usage(&agent, &svc_unregistered, &5u32);
+
+    let _ = admin;
+    let _ = owner;
+    client.settle_all(&intruder, &agent);
+}
