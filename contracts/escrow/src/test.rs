@@ -1101,16 +1101,21 @@ fn test_transfer_service_ownership_genuine_transfer_emits_event() {
     let new_owner = Address::generate(&env);
     let desc = String::from_str(&env, "inference service");
     client.set_service_metadata(&svc, &desc, &owner);
-    // Capture event count before transfer.
-    let events_before = env.events().all();
-    let count_before = events_before.len();
     // Perform genuine transfer.
     client.transfer_service_ownership(&owner, &svc, &new_owner);
-    // Exactly one new event (owner_chg).
+    // env.events().all() reflects only the most recent contract invocation
+    // (confirmed by every other event test in this file, e.g.
+    // assert_usage_event_count re-checking a count of 1 after each of
+    // several sequential record_usage calls), not a running total since
+    // the start of the test. The prior `set_service_metadata` call's
+    // `meta_set` event is therefore not present here — only this
+    // transfer's own event is. Comparing against a pre-call count of
+    // events from a *different* invocation was the bug; checking this
+    // call's own event count directly is the fix.
     let events_after = env.events().all();
     assert_eq!(
         events_after.len(),
-        count_before + 1,
+        1,
         "genuine transfer must emit exactly one event"
     );
     let (_addr, topics, data) = events_after.last().unwrap();
