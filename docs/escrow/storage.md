@@ -70,6 +70,9 @@ per-pair counters regularly to keep storage costs bounded.
 | `WindowSeconds` | `u64` | `0` (limiter disabled) | `set_rate_window_seconds` | No — lifetime |
 | `TotalRequestsAllTime` | `u64` | `0` | `record_usage` | No — lifetime (never reset) |
 | `TotalSettledAllTime` | `i128` (stroops) | `0` | `settle`, `settle_all` | No — lifetime (never reset) |
+| `UsageAlertThreshold` | `u32` | `0` (alerting disabled) | *(none — read only by `record_usage`; see note below)* | No — lifetime |
+| `MinServicePrice` | `i128` (stroops) | `0` (no floor) | `set_price_bounds` | No — lifetime |
+| `MaxServicePrice` | `i128` (stroops) | `i128::MAX` (no ceiling) | `set_price_bounds` | No — lifetime |
 
 ### Per-service slots — cardinality O(S)
 
@@ -79,6 +82,7 @@ per-pair counters regularly to keep storage costs bounded.
 | `ServiceRegistered(service_id)` | `Symbol` | `bool` | `false` | `register_service`, `register_service_with_metadata`; removed by `unregister_service` | No — lifetime |
 | `ServiceDisabled(service_id)` | `Symbol` | `bool` | `false` | `set_service_disabled` | No — lifetime |
 | `ServiceMetadata(service_id)` | `Symbol` | `ServiceMetadata { description: String, owner: Address }` | `None` (Option) | `set_service_metadata`, `register_service_with_metadata`, `transfer_service_ownership`; removed by `clear_service_metadata` | No — lifetime |
+| `PriceTiers(service_id)` | `Symbol` | `Vec<PriceTier>` | `None` (Option) — flat `ServicePrice` used instead | `set_price_tiers`; removed by `remove_price_tiers` | No — lifetime |
 
 ### Per-agent slots — cardinality O(A)
 
@@ -89,6 +93,9 @@ per-pair counters regularly to keep storage costs bounded.
 | `TotalUsageByAgent(agent)` | `Address` | `u32` | `0` | `record_usage` | No — lifetime (never reset by `settle`) |
 | `TotalSettledByAgent(agent)` | `Address` | `i128` (stroops) | `0` | `settle`, `settle_all` | No — lifetime (never reset by `settle`) |
 | `RateWindow(agent)` | `Address` | `(u64, u32)` = `(window_start, count)` | `(0, 0)` | `record_usage` (rate-limit path) | No — rolls forward on next call when window expires |
+| `AgentCredit(agent)` | `Address` | `i128` (stroops) | `0` | `credit_agent`; drawn down by `debit_agent_credit` (called from `record_usage`) | No — drawn down on debit, not on `settle` |
+| `AgentServiceIndex(agent)` | `Address` | `Vec<Symbol>` | `[]` (empty) | `index_agent_service` (called from `record_usage`); trimmed by `deindex_agent_service` | No — entries removed only when a service's usage is fully deindexed |
+| `AgentServices(agent)` | `Address` | `Vec<Symbol>` | — never read or written | *(unused)* | N/A |
 
 ### Per-(agent, service) pair slots — cardinality O(A × S)
 
@@ -96,6 +103,7 @@ per-pair counters regularly to keep storage costs bounded.
 |---|---|---|---|---|---|
 | `Usage(agent, service_id)` | `Address`, `Symbol` | `u32` | `0` | `record_usage` | **Yes** — reset to `0` by `settle` |
 | `LastSettlement(agent, service_id)` | `Address`, `Symbol` | `u64` (ledger timestamp, seconds since Unix epoch) | `None` (Option) | `settle` | No — stamped (not cleared) by `settle` |
+| `Dispute(agent, service_id)` | `Address`, `Symbol` | `bool` | `false` | `open_dispute`; cleared by `resolve_dispute` | No — cleared on resolution, not on `settle` |
 
 ---
 
@@ -138,6 +146,61 @@ limiter is active):
 
 An agent can never reset its own window early — `window_start` only advances.
 
+### `AgentCredit(agent)` — prepaid balance
+
+Set via `credit_agent(agent, amount)` (admin-gated, rejects non-positive
+`amount`). Drawn down inside `record_usage` by `debit_agent_credit`, which
+subtracts the newly-billed amount and panics with
+`InsufficientCreditBalance` if the draw would go negative. There is no public
+debit entrypoint — the only way this slot decreases is as a side effect of
+`record_usage` succeeding.
+
+### `AgentServiceIndex(agent)` and the unused `AgentServices(agent)`
+
+`AgentServiceIndex(agent)` is the real per-agent index of services with
+non-zero recorded usage. It backs `get_agent_services`,
+`get_agent_usage_page`, `list_open_disputes`, and `settle_all`'s iteration.
+`index_agent_service` appends a `service_id` the first time usage is
+recorded for a pair; `deindex_agent_service` removes it once the pair's
+usage returns to `0`.
+
+`AgentServices(agent)` is a separate `DataKey` variant that is declared but
+never read or written anywhere in `lib.rs` — despite an inline comment
+elsewhere describing it as "the alias used by `settle_all`". `settle_all`
+actually reads `AgentServiceIndex` directly (see the code above). Treat
+`AgentServices` as dead storage until it is wired up or removed; do not rely
+on it holding a value.
+
+### `UsageAlertThreshold` — configured but not yet settable
+
+`record_usage` reads this key to decide whether to emit a `usage_hi` alert
+event on the crossing edge (see [`docs/escrow/events.md`](events.md)), but no
+entrypoint in the current contract writes it. In practice the slot is always
+absent, so `record_usage` always uses the `unwrap_or(0)` default and the
+alerting block is permanently skipped. This is a gap, not a design choice —
+an admin setter is needed before this feature can be exercised on-chain.
+
+### `MinServicePrice` / `MaxServicePrice` — global price bounds
+
+Set together via `set_price_bounds(min_stroops, max_stroops)` (admin-gated).
+`set_service_price` reads both (defaulting to `0` and `i128::MAX` when
+absent) and rejects any price outside `[MinServicePrice, MaxServicePrice]`
+with `PriceOutOfBounds`. See
+[`docs/escrow/pricing.md`](pricing.md#global-price-bounds) for the full
+interaction, including the important caveat that `set_price_tiers` does
+**not** consult these bounds.
+
+### `Dispute(agent, service_id)`
+
+`true` while a dispute is open for the pair. `open_dispute` (caller = the
+agent) sets it and rejects a second open with `DisputeAlreadyOpen`.
+`resolve_dispute` (admin only) clears it after adjusting the usage counter.
+**Invariant gap:** `settle` never reads this flag — an open dispute does not
+stop the pair from being drained and billed by `settle` or `settle_all`.
+Off-chain settlement tooling must consult `has_open_dispute` /
+`list_open_disputes` itself before settling a disputed pair; the contract
+does not enforce the hold on-chain.
+
 ### `LastSettlement(agent, service_id)`
 
 Stores the ledger timestamp at which `settle` last drained this pair. Returns
@@ -175,3 +238,11 @@ default) for pre-migration contracts.
   service_id)` pairs with unsettled usage will accumulate storage rent. The
   off-chain settlement loop should drain pairs regularly to bound persistent
   storage costs.
+- **`Dispute` does not gate `settle`.** See the note above — a caller with
+  settlement rights can still drain a disputed pair. Do not rely on
+  `open_dispute` alone as an on-chain hold.
+- **`AgentServices` is dead storage.** The variant exists but nothing reads
+  or writes it; the real per-agent index is `AgentServiceIndex`.
+- **`UsageAlertThreshold` cannot currently be set.** No entrypoint writes it,
+  so the `usage_hi` alert path in `record_usage` is unreachable until a
+  setter is added.
