@@ -2689,6 +2689,16 @@ fn test_i20_wrong_caller_accept_rejected() {
     client.accept_admin_transfer(&intruder);
 }
 #[test]
+fn test_i20_cancel_with_nothing_pending_is_a_noop() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    // No propose_admin_transfer call: nothing is pending. Cancelling must
+    // be a no-op, not a panic — mirrors unpause()'s idempotency contract.
+    client.cancel_admin_transfer();
+    assert_eq!(client.get_pending_admin(), None);
+    assert_eq!(client.get_admin(), Some(admin));
+}
+#[test]
 fn test_i20_repropose_overwrites_pending() {
     let env = Env::default();
     let (client, admin) = setup_initialized(&env);
@@ -3019,6 +3029,13 @@ fn test_i22_propose_admin_transfer_requires_admin_auth() {
     let client = setup_scoped_auth(&env);
     let next = Address::generate(&env);
     client.propose_admin_transfer(&next);
+}
+#[test]
+#[should_panic]
+fn test_i22_cancel_admin_transfer_requires_admin_auth() {
+    let env = Env::default();
+    let client = setup_scoped_auth(&env);
+    client.cancel_admin_transfer();
 }
 #[test]
 #[should_panic]
