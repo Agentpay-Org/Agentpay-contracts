@@ -1702,9 +1702,16 @@ impl Escrow {
     }
 
     /// Admin sets the allowlist status for a specific agent.
+    ///
+    /// Emits an `agt_alw` event with `(agent, allowed)` after the storage
+    /// write so indexers can observe every per-agent allowlist change
+    /// on-chain, mirroring the `cfg_set` event already emitted by
+    /// [`Self::set_allowlist_enabled`] for the master toggle.
     pub fn set_agent_allowed(env: Env, agent: Address, allowed: bool) {
         require_admin(&env);
-        write_flag(&env, &DataKey::AgentAllowed(agent), allowed);
+        write_flag(&env, &DataKey::AgentAllowed(agent.clone()), allowed);
+        env.events()
+            .publish((symbol_short!("agt_alw"),), (agent, allowed));
     }
 
     /// Read whether an agent is on the blocklist (false for never-set).
@@ -1716,9 +1723,15 @@ impl Escrow {
     /// agent is rejected by `record_usage` with `AgentBlocked`,
     /// independent of the allowlist and taking precedence over it: an
     /// agent that is both allow-listed and blocked is still rejected.
+    ///
+    /// Emits an `agt_blk` event with `(agent, blocked)` after the storage
+    /// write so indexers can observe every per-agent blocklist change
+    /// on-chain.
     pub fn set_agent_blocked(env: Env, agent: Address, blocked: bool) {
         require_admin(&env);
-        write_flag(&env, &DataKey::AgentBlocked(agent), blocked);
+        write_flag(&env, &DataKey::AgentBlocked(agent.clone()), blocked);
+        env.events()
+            .publish((symbol_short!("agt_blk"),), (agent, blocked));
     }
 
     /// Admin sets the per-call lower bound on `requests` for batched
