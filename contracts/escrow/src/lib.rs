@@ -1857,6 +1857,47 @@ impl Escrow {
         env.events().publish((symbol_short!("rate_rst"),), agent);
     }
 
+    /// Read the configured usage-alert threshold, or `0` (alerting
+    /// disabled) when unset. See [`Self::set_usage_alert_threshold`] for
+    /// what crossing this value does.
+    pub fn get_usage_alert_threshold(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::UsageAlertThreshold)
+            .unwrap_or(0)
+    }
+
+    /// Admin sets the global usage-alert threshold consulted by
+    /// `record_usage`. Pass `0` to disable alerting (the default).
+    ///
+    /// `record_usage` emits a `usage_hi(agent, service_id, total)` event
+    /// the first time a `(agent, service_id)` pair's accumulated usage
+    /// crosses this value from below to at/above it (edge-triggered — it
+    /// does not re-fire on every subsequent call while already above the
+    /// threshold, and re-arms after `settle` drains the pair below it
+    /// again). See `docs/escrow/events.md` for the full edge-trigger
+    /// semantics.
+    ///
+    /// Before this entrypoint existed, `UsageAlertThreshold` had no
+    /// setter, so the `usage_hi` path could never fire on a live deploy —
+    /// this closes that gap.
+    ///
+    /// Emits a `cfg_set` event with data `(alert_thr, threshold)` after the
+    /// storage write, consistent with every other scalar admin setting.
+    /// (The tag is `alert_thr`, deliberately distinct from the `usage_hi`
+    /// event topic that firing this threshold later triggers, so the two
+    /// are never conflated by a listener.)
+    pub fn set_usage_alert_threshold(env: Env, threshold: u32) {
+        require_admin(&env);
+        env.storage()
+            .persistent()
+            .set(&DataKey::UsageAlertThreshold, &threshold);
+        env.events().publish(
+            (symbol_short!("cfg_set"),),
+            (symbol_short!("alert_thr"), threshold),
+        );
+    }
+
     /// Admin sets the per-call upper bound on `requests` accepted by
     /// `record_usage`. Pass `u32::MAX` to effectively disable the cap.
     ///
