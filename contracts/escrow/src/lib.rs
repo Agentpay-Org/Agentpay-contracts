@@ -39,6 +39,22 @@ pub struct ServiceMetadata {
     pub owner: Address,
 }
 
+/// A snapshot of the current admin-handover state, returned by
+/// [`Escrow::get_admin_summary`].
+///
+/// Combines `get_admin` and `get_pending_admin` into one read so callers
+/// (dashboards, migration tooling) can check whether a handover is in
+/// progress without two round trips. Both fields default to `None` — before
+/// `init`, and whenever no handover is pending, respectively — never a
+/// panic. The individual getters remain available and always agree with the
+/// corresponding field here.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminSummary {
+    pub admin: Option<Address>,
+    pub pending_admin: Option<Address>,
+}
+
 /// A snapshot of all global contract configuration, returned by
 /// [`Escrow::get_contract_config`].
 ///
@@ -1883,6 +1899,19 @@ impl Escrow {
     /// Read the pending admin, if any.
     pub fn get_pending_admin(env: Env) -> Option<Address> {
         env.storage().persistent().get(&DataKey::PendingAdmin)
+    }
+
+    /// Return the current admin and any pending handover in a single read.
+    ///
+    /// Pure read — no `require_auth`, no pause gate. Equivalent to calling
+    /// `get_admin` and `get_pending_admin` separately; this is a convenience
+    /// snapshot only, for callers (dashboards, migration tooling) that want
+    /// both in one round trip.
+    pub fn get_admin_summary(env: Env) -> AdminSummary {
+        AdminSummary {
+            admin: Self::get_admin(env.clone()),
+            pending_admin: Self::get_pending_admin(env),
+        }
     }
 
     /// Step 2 of admin handover. The pending admin (set by step 1)
