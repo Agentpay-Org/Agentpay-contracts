@@ -2,7 +2,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, Address,
-    Env, String, Symbol, Vec,
+    Env, IntoVal, String, Symbol, Val, Vec,
 };
 
 /// Current on-chain storage schema version stamped at init.
@@ -457,6 +457,23 @@ fn ensure_service_usable(env: &Env, service_id: &Symbol) {
     if read_flag(env, &DataKey::ServiceDisabled(service_id.clone())) {
         panic_with_error!(env, EscrowError::ServiceDisabled);
     }
+}
+
+/// Publish the shared `cfg_set(tag, value)` event used by every single-
+/// scalar admin config setter (`set_allowlist_enabled`,
+/// `set_min_requests_per_call`, `set_max_requests_per_call`,
+/// `set_max_requests_per_window`, `set_rate_window_seconds`,
+/// `set_require_service_registration`). Centralising the publish call keeps
+/// the topic and payload shape identical at every call site — a new config
+/// setter only needs to pick a `tag` and call this helper, rather than
+/// duplicating the `env.events().publish(...)` block.
+fn publish_cfg_event<T>(env: &Env, tag: Symbol, value: T)
+where
+    T: IntoVal<Env, Val>,
+    (Symbol, T): IntoVal<Env, Val>,
+{
+    env.events()
+        .publish((symbol_short!("cfg_set"),), (tag, value));
 }
 
 // Shared access-control helpers.
@@ -1789,10 +1806,7 @@ impl Escrow {
     pub fn set_allowlist_enabled(env: Env, enabled: bool) {
         require_admin(&env);
         write_flag(&env, &DataKey::AllowlistEnabled, enabled);
-        env.events().publish(
-            (symbol_short!("cfg_set"),),
-            (symbol_short!("allowlist"), enabled),
-        );
+        publish_cfg_event(&env, symbol_short!("allowlist"), enabled);
     }
 
     /// Read the master allowlist toggle.
@@ -1879,10 +1893,7 @@ impl Escrow {
         env.storage()
             .persistent()
             .set(&DataKey::MinRequestsPerCall, &min_requests);
-        env.events().publish(
-            (symbol_short!("cfg_set"),),
-            (symbol_short!("min_call"), min_requests),
-        );
+        publish_cfg_event(&env, symbol_short!("min_call"), min_requests);
     }
 
     /// Read the configured per-call cap, or `u32::MAX` (no limit) if
@@ -1915,10 +1926,7 @@ impl Escrow {
         env.storage()
             .persistent()
             .set(&DataKey::MaxRequestsPerWindow, &max_requests);
-        env.events().publish(
-            (symbol_short!("cfg_set"),),
-            (symbol_short!("max_win"), max_requests),
-        );
+        publish_cfg_event(&env, symbol_short!("max_win"), max_requests);
     }
 
     /// Read the configured rate-limit window length in seconds, or `0`
@@ -1942,10 +1950,7 @@ impl Escrow {
         env.storage()
             .persistent()
             .set(&DataKey::WindowSeconds, &window_seconds);
-        env.events().publish(
-            (symbol_short!("cfg_set"),),
-            (symbol_short!("win_sec"), window_seconds),
-        );
+        publish_cfg_event(&env, symbol_short!("win_sec"), window_seconds);
     }
 
     /// Admin-gated, pause-respecting entrypoint that clears the per-agent
@@ -2056,10 +2061,7 @@ impl Escrow {
         env.storage()
             .persistent()
             .set(&DataKey::MaxRequestsPerCall, &max_requests);
-        env.events().publish(
-            (symbol_short!("cfg_set"),),
-            (symbol_short!("max_call"), max_requests),
-        );
+        publish_cfg_event(&env, symbol_short!("max_call"), max_requests);
     }
 
     /// Admin toggles strict-registration mode. When enabled,
@@ -2071,10 +2073,7 @@ impl Escrow {
     pub fn set_require_service_registration(env: Env, required: bool) {
         require_admin(&env);
         write_flag(&env, &DataKey::RequireServiceRegistration, required);
-        env.events().publish(
-            (symbol_short!("cfg_set"),),
-            (symbol_short!("req_reg"), required),
-        );
+        publish_cfg_event(&env, symbol_short!("req_reg"), required);
     }
 
     /// Read the strict-registration flag.
