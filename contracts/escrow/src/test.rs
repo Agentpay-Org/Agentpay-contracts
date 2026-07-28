@@ -1319,6 +1319,74 @@ fn test_total_settled_getters_default_to_zero() {
     assert_eq!(client.get_total_settled_all_time(), 0i128);
 }
 #[test]
+fn test_agent_settlement_summary_defaults_for_unseen_agent() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+
+    let summary = client.get_agent_settlement_summary(&agent);
+    assert_eq!(summary.total_settled, 0i128);
+    assert_eq!(summary.outstanding_services, 0);
+    assert_eq!(summary.last_settlement, None);
+}
+#[test]
+fn test_agent_settlement_summary_counts_outstanding_and_settled() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let inference = Symbol::new(&env, "infer");
+    let storage = Symbol::new(&env, "storage");
+    client.set_service_price(&inference, &10i128);
+    client.set_service_price(&storage, &5i128);
+
+    client.record_usage(&agent, &inference, &4u32);
+    client.record_usage(&agent, &storage, &2u32);
+
+    // Nothing settled yet: both services outstanding, no settlement stamp.
+    let before = client.get_agent_settlement_summary(&agent);
+    assert_eq!(before.total_settled, 0i128);
+    assert_eq!(before.outstanding_services, 2);
+    assert_eq!(before.last_settlement, None);
+
+    // Settle only `inference` via settle() (not settle_all): it drains and
+    // is immediately deindexed, so it stops counting as outstanding *and*
+    // stops contributing to last_settlement (see the field's doc comment).
+    // `storage` remains outstanding.
+    client.settle(&admin, &agent, &inference);
+
+    let after = client.get_agent_settlement_summary(&agent);
+    assert_eq!(
+        after.total_settled,
+        client.get_total_settled_by_agent(&agent)
+    );
+    assert_eq!(after.total_settled, 40i128);
+    assert_eq!(after.outstanding_services, 1);
+    assert_eq!(after.last_settlement, None);
+}
+#[test]
+fn test_agent_settlement_summary_reflects_settle_all_timestamp() {
+    // Unlike settle(), settle_all() does not deindex, so a service it
+    // settles keeps contributing its LastSettlement stamp to the summary.
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let inference = Symbol::new(&env, "infer");
+    client.set_service_price(&inference, &10i128);
+    client.record_usage(&agent, &inference, &1u32);
+
+    advance_ledger(&env, 100);
+    client.settle_all(&admin, &agent);
+
+    let summary = client.get_agent_settlement_summary(&agent);
+    assert_eq!(
+        summary.last_settlement,
+        client.get_last_settlement(&agent, &inference)
+    );
+    assert!(summary.last_settlement.is_some());
+    // Already drained by settle_all, so no longer outstanding.
+    assert_eq!(summary.outstanding_services, 0);
+}
+#[test]
 fn test_total_settled_counters_sum_across_settles_and_agents() {
     let env = Env::default();
     let (client, admin) = setup_initialized(&env);

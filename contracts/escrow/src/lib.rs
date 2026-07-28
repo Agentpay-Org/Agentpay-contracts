@@ -89,6 +89,36 @@ pub struct BillingSummary {
     pub last_settlement: Option<u64>,
 }
 
+/// A cross-service settlement snapshot for one agent, returned by
+/// [`Escrow::get_agent_settlement_summary`].
+///
+/// [`BillingSummary`] covers a single `(agent, service_id)` pair; this
+/// covers the agent's whole active-service index in one bounded read (see
+/// `MAX_AGENT_SERVICE_INDEX`), so callers don't have to fan out a
+/// `get_billing_summary` call per service to answer "is this agent fully
+/// settled, and when did they last settle?"
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentSettlementSummary {
+    /// Lifetime settled amount for this agent across all services, in
+    /// stroops. Same value as `get_total_settled_by_agent`. Defaults to `0`.
+    pub total_settled: i128,
+    /// Number of services in the agent's active-service index that
+    /// currently carry non-zero (unsettled) usage.
+    pub outstanding_services: u32,
+    /// The most recent `LastSettlement` timestamp among services *currently
+    /// in the agent's active-service index*, or `None` if none of them
+    /// carry a stamp (including when the index is empty).
+    ///
+    /// Caveat: `settle` removes a service from the index once it is fully
+    /// drained, so a service settled individually (rather than via
+    /// `settle_all`, which does not deindex) stops contributing to this
+    /// field the moment it is settled. Use `get_last_settlement` for the
+    /// authoritative per-`(agent, service_id)` timestamp regardless of
+    /// index membership.
+    pub last_settlement: Option<u64>,
+}
+
 /// Storage keys used by the escrow contract.
 ///
 /// Persistent slots survive across full TTL cycles and are appropriate for
@@ -902,6 +932,48 @@ impl Escrow {
         env.storage()
             .persistent()
             .get(&DataKey::LastSettlement(agent, service_id))
+    }
+
+    /// Return a cross-service settlement snapshot for one agent.
+    ///
+    /// Pure read — no `require_auth`, no pause gate. Reuses
+    /// `get_total_settled_by_agent` for the lifetime total, then does one
+    /// bounded pass over the agent's active-service index (capped at
+    /// `MAX_AGENT_SERVICE_INDEX`) to count services with outstanding usage
+    /// and find the most recent settlement timestamp. Returns
+    /// `outstanding_services: 0` and `last_settlement: None` for an agent
+    /// with an empty or absent index — never a panic.
+    pub fn get_agent_settlement_summary(env: Env, agent: Address) -> AgentSettlementSummary {
+        let total_settled = Self::get_total_settled_by_agent(env.clone(), agent.clone());
+        let index: Vec<Symbol> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AgentServiceIndex(agent.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut outstanding_services: u32 = 0;
+        let mut last_settlement: Option<u64> = None;
+        for service_id in index.iter() {
+            if read_usage(&env, &agent, &service_id) > 0 {
+                outstanding_services = outstanding_services.saturating_add(1);
+            }
+            let stamped: Option<u64> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::LastSettlement(agent.clone(), service_id));
+            last_settlement = match (last_settlement, stamped) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            };
+        }
+
+        AgentSettlementSummary {
+            total_settled,
+            outstanding_services,
+            last_settlement,
+        }
     }
 
     /// Credit an agent with prepaid balance in stroops.
