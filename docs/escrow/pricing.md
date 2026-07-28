@@ -86,6 +86,50 @@ Equivalent to `set_service_price(svc, 5)` but using the tier path.
 
 ---
 
+## Global price bounds
+
+An admin can constrain the flat-rate price band with
+`set_price_bounds(min_stroops, max_stroops)`, stored in
+`DataKey::MinServicePrice` / `DataKey::MaxServicePrice`.
+
+### Defaults and enforcement
+
+- Unset: floor = `0`, ceiling = `i128::MAX` (unbounded). Calling
+  `set_price_bounds(0, i128::MAX)` restores these explicitly.
+- Once set, every `set_service_price(service_id, price_stroops)` call is
+  rejected with `PriceOutOfBounds` (#20) if
+  `price_stroops < MinServicePrice || price_stroops > MaxServicePrice`.
+- `set_price_bounds` itself rejects `min_stroops > max_stroops` with
+  `InvertedPriceBand` (#22) — a logically impossible band can never be
+  stored.
+- Emits `bnd_set(min_stroops, max_stroops)` on success.
+
+### Zero-is-free interacts with the floor
+
+A price of `0` means "free service." If `min_stroops > 0`, free services are
+explicitly forbidden — `set_service_price(svc, 0)` is rejected with
+`PriceOutOfBounds` until the floor is lowered back to `0`. This is
+intentional: a positive floor expresses that every service in the band must
+carry a non-zero cost.
+
+### Not retroactive
+
+`set_price_bounds` only gates *future* `set_service_price` calls. A price
+already stored before the bounds were tightened is left untouched — the
+bound is a write-time guard, not an invariant enforced on read. An admin
+that needs to bring existing prices into a new band must re-set each
+service's price explicitly.
+
+### Invariant gap: tier prices are unbounded
+
+**`set_price_tiers` does not consult `MinServicePrice` / `MaxServicePrice`
+at all.** Each `PriceTier.price_stroops` is validated only for
+non-negativity (see the schedule invariants above) — a tier price can be
+set below the floor or above the ceiling that would reject the same value
+via `set_service_price`. This means a service using tiered billing can
+bypass the global price-bounds policy entirely. Treat the two pricing paths
+as independently governed until this asymmetry is closed.
+
 ## API reference
 
 ### `set_price_tiers(service_id, tiers)`
@@ -114,6 +158,17 @@ than panicking.
 Drains the usage counter and returns the billed amount using the same
 tier-aware (or flat fallback) math as `compute_billing`.
 
+### `set_price_bounds(min_stroops, max_stroops)`
+
+Admin-gated. Stores the global flat-price floor/ceiling. Rejects
+`min_stroops > max_stroops` with `InvertedPriceBand`. Emits
+`bnd_set(min_stroops, max_stroops)`. Does not affect tiered pricing — see
+[Invariant gap](#invariant-gap-tier-prices-are-unbounded) above.
+
+### `get_min_service_price() -> i128` / `get_max_service_price() -> i128`
+
+Pure reads. Default to `0` and `i128::MAX` respectively when unset.
+
 ---
 
 ## Security notes
@@ -129,3 +184,7 @@ tier-aware (or flat fallback) math as `compute_billing`.
   the counter in a single persistent write before emitting the event.
 - **Backward compatibility**: services without a tier schedule continue to use
   the flat `ServicePrice` path unchanged. Existing callers need no migration.
+- **Price bounds are write-time-only and flat-rate-only**: `set_price_bounds`
+  does not re-validate prices already on chain, and `set_price_tiers` never
+  consults it — an admin relying on the global bounds as a hard invariant
+  must also audit tier schedules separately.
