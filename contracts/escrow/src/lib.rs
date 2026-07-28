@@ -405,6 +405,28 @@ fn write_flag(env: &Env, key: &DataKey, value: bool) {
     env.storage().persistent().set(key, &value);
 }
 
+/// Reject a `service_id` that is not currently usable, shared by every
+/// entrypoint that either records usage against a service or attaches a
+/// price to one (`record_usage`, `set_service_price`).
+///
+/// Panics with [`EscrowError::ServiceNotRegistered`] when strict
+/// registration is enabled (`RequireServiceRegistration`) and the service
+/// has not been registered. Panics with [`EscrowError::ServiceDisabled`]
+/// when the service has been explicitly disabled, regardless of the
+/// strict-registration setting.
+fn ensure_service_usable(env: &Env, service_id: &Symbol) {
+    // Conditional read: ServiceRegistered is only touched when strict
+    // registration is enabled (the `&&` short-circuits otherwise).
+    if read_flag(env, &DataKey::RequireServiceRegistration)
+        && !read_flag(env, &DataKey::ServiceRegistered(service_id.clone()))
+    {
+        panic_with_error!(env, EscrowError::ServiceNotRegistered);
+    }
+    if read_flag(env, &DataKey::ServiceDisabled(service_id.clone())) {
+        panic_with_error!(env, EscrowError::ServiceDisabled);
+    }
+}
+
 // Shared access-control helpers.
 //
 // Admin-gated entrypoints and the pause gate repeat the same small blocks of
@@ -778,16 +800,7 @@ impl Escrow {
         if requests < min_per_call {
             panic_with_error!(&env, EscrowError::RequestsBelowMinPerCall);
         }
-        // Conditional read: ServiceRegistered is only touched when strict
-        // registration is enabled (the `&&` short-circuits otherwise).
-        if read_flag(&env, &DataKey::RequireServiceRegistration)
-            && !read_flag(&env, &DataKey::ServiceRegistered(service_id.clone()))
-        {
-            panic_with_error!(&env, EscrowError::ServiceNotRegistered);
-        }
-        if read_flag(&env, &DataKey::ServiceDisabled(service_id.clone())) {
-            panic_with_error!(&env, EscrowError::ServiceDisabled);
-        }
+        ensure_service_usable(&env, &service_id);
         // Per-agent blocklist takes precedence over the allowlist: a blocked
         // agent is rejected even if also allow-listed.
         if read_flag(&env, &DataKey::AgentBlocked(agent.clone())) {
@@ -1243,14 +1256,7 @@ impl Escrow {
         if price_stroops < 0 {
             panic_with_error!(&env, EscrowError::RequestsMustBePositive);
         }
-        if read_flag(&env, &DataKey::RequireServiceRegistration)
-            && !read_flag(&env, &DataKey::ServiceRegistered(service_id.clone()))
-        {
-            panic_with_error!(&env, EscrowError::ServiceNotRegistered);
-        }
-        if read_flag(&env, &DataKey::ServiceDisabled(service_id.clone())) {
-            panic_with_error!(&env, EscrowError::ServiceDisabled);
-        }
+        ensure_service_usable(&env, &service_id);
         // Global price-bounds check. Defaults: floor = 0, ceiling = i128::MAX.
         // If a floor above 0 is configured, a price of 0 ("free service") is
         // explicitly **forbidden** — the admin must lower the floor to 0 first

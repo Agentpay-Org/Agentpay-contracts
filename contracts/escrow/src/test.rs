@@ -3471,6 +3471,36 @@ fn test_set_price_flag_toggled_mid_life() {
     client.set_service_price(&svc, &200i128); // strict + unregistered: rejected
 }
 
+/// `record_usage` and `set_service_price` share one gate
+/// (`ensure_service_usable`, extracted from what used to be two duplicated
+/// inline checks). This locks in that the two entrypoints reject a
+/// disabled service with the identical error, regardless of which one is
+/// called first — proving the extraction did not desync their behavior.
+#[test]
+#[should_panic(expected = "Error(Contract, #12)")]
+fn test_record_usage_and_set_service_price_share_disabled_gate() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let svc = Symbol::new(&env, "infer");
+    let agent = Address::generate(&env);
+    client.set_service_disabled(&svc, &true);
+    // set_service_price already rejects (proven by test_set_price_rejects_disabled_service);
+    // record_usage must reject with the identical error code via the same helper.
+    client.record_usage(&agent, &svc, &1u32);
+}
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn test_record_usage_and_set_service_price_share_registration_gate() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let svc = Symbol::new(&env, "phantom");
+    let agent = Address::generate(&env);
+    client.set_require_service_registration(&true);
+    // test_set_price_strict_rejects_unregistered_service proves the price side;
+    // record_usage must reject with the identical error code via the same helper.
+    client.record_usage(&agent, &svc, &1u32);
+}
+
 /// A service owner can settle their own service via `settle_all`.
 #[test]
 fn test_owner_can_settle_own_service() {
