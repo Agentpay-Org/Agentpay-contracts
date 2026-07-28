@@ -1491,7 +1491,12 @@ impl Escrow {
     /// zeroed, `LastSettlement` stamped, `settled` event emitted) matching
     /// the semantics of a direct `settle` call. Services with zero usage
     /// are still included in the return value (with a billed amount of 0)
-    /// so callers can confirm the full sweep.
+    /// so callers can confirm the full sweep. After the sweep, emits one
+    /// `settl_all(agent, count, total_billed)` batch-summary event so
+    /// indexers can track a full drain without summing the per-service
+    /// `settled` events themselves. `count` is the number of services in
+    /// the index (including zero-billed ones); `total_billed` is the sum
+    /// of every `billed` amount, saturating at `i128::MAX`.
     ///
     /// Honours the pause gate: panics with [`EscrowError::ContractPaused`]
     /// when paused.
@@ -1514,6 +1519,7 @@ impl Escrow {
 
         let now = env.ledger().timestamp();
         let mut results: Vec<(Symbol, i128)> = Vec::new(&env);
+        let mut total_billed: i128 = 0;
 
         for service_id in svc_list.iter() {
             // Non-admin callers must own this specific service.
@@ -1554,8 +1560,14 @@ impl Escrow {
                 (agent.clone(), service_id.clone(), requests, billed),
             );
 
+            total_billed = total_billed.saturating_add(billed);
             results.push_back((service_id.clone(), billed));
         }
+
+        env.events().publish(
+            (symbol_short!("settl_all"),),
+            (agent, results.len(), total_billed),
+        );
 
         results
     }
