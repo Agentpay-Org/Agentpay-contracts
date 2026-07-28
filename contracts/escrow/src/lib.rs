@@ -105,6 +105,38 @@ pub struct BillingSummary {
     pub last_settlement: Option<u64>,
 }
 
+/// A single-service pricing snapshot, returned by
+/// [`Escrow::get_service_pricing`].
+///
+/// Combines the four separate reads a caller would otherwise need
+/// (`get_service_price`, `get_price_tiers`, `get_min_service_price`,
+/// `get_max_service_price`) into one round trip, so an indexer or
+/// dashboard can answer "what would this service currently charge, and
+/// under what global bounds" without four calls that could observe four
+/// different ledger states.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServicePricing {
+    /// Flat per-request price in stroops. Defaults to `0` when unset.
+    /// Ignored by billing when `tiers` is `Some` — see [`Self::tiers`].
+    pub price_stroops: i128,
+    /// The volume-discount tier schedule, if one is configured. When
+    /// `Some`, `compute_billing` and `settle` use this instead of
+    /// `price_stroops`.
+    pub tiers: Option<Vec<PriceTier>>,
+    /// Global minimum service price in stroops (`0` when unset). Bounds
+    /// `set_service_price` only — does **not** bound `tiers` entries; see
+    /// `docs/escrow/pricing.md`.
+    pub min_bound: i128,
+    /// Global maximum service price in stroops (`i128::MAX` when unset).
+    /// Same flat-rate-only scope as `min_bound`.
+    pub max_bound: i128,
+    /// Whether the service is currently disabled
+    /// (`set_service_disabled`). A disabled service rejects both new
+    /// prices and new usage regardless of the values above.
+    pub disabled: bool,
+}
+
 /// A cross-service settlement snapshot for one agent, returned by
 /// [`Escrow::get_agent_settlement_summary`].
 ///
@@ -1451,6 +1483,46 @@ impl Escrow {
             price_stroops,
             billed,
             last_settlement,
+        }
+    }
+
+    /// Return a service's full pricing configuration in one read: flat
+    /// price, tier schedule (if any), the global price bounds, and the
+    /// disabled flag.
+    ///
+    /// Pure read — no `require_auth`, no pause gate. See
+    /// [`ServicePricing`] for field semantics, and
+    /// `docs/escrow/pricing.md` for how `tiers` interacts with
+    /// `price_stroops` and why `min_bound`/`max_bound` do not constrain
+    /// `tiers`.
+    pub fn get_service_pricing(env: Env, service_id: Symbol) -> ServicePricing {
+        let price_stroops = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ServicePrice(service_id.clone()))
+            .unwrap_or(0);
+        let tiers = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Vec<PriceTier>>(&DataKey::PriceTiers(service_id.clone()));
+        let min_bound = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MinServicePrice)
+            .unwrap_or(0);
+        let max_bound = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MaxServicePrice)
+            .unwrap_or(i128::MAX);
+        let disabled = read_flag(&env, &DataKey::ServiceDisabled(service_id));
+
+        ServicePricing {
+            price_stroops,
+            tiers,
+            min_bound,
+            max_bound,
+            disabled,
         }
     }
 
