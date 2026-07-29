@@ -4031,6 +4031,118 @@ fn test_reset_rate_window_idempotent() {
     client.reset_rate_window(&agent);
 }
 
+// ── Usage-alert threshold (get/set_usage_alert_threshold) ───────────────────
+//
+// `UsageAlertThreshold` previously had no setter, so the edge-triggered
+// `usage_hi` alert in `record_usage` could never fire on a live deploy.
+// These tests cover the new setter/getter and prove the alert now fires.
+
+#[test]
+fn test_get_usage_alert_threshold_defaults_to_zero() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    assert_eq!(client.get_usage_alert_threshold(), 0);
+}
+#[test]
+fn test_set_usage_alert_threshold_round_trip() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    client.set_usage_alert_threshold(&50u32);
+    assert_eq!(client.get_usage_alert_threshold(), 50u32);
+}
+#[test]
+fn test_set_usage_alert_threshold_emits_cfg_set_event() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    client.set_usage_alert_threshold(&50u32);
+    let (_, topics, data) = env.events().all().last().unwrap();
+    let expected: soroban_sdk::Vec<soroban_sdk::Val> = (symbol_short!("cfg_set"),).into_val(&env);
+    assert_eq!(topics, expected);
+    let decoded: (Symbol, u32) = data.into_val(&env);
+    assert_eq!(decoded, (symbol_short!("alert_thr"), 50u32));
+}
+#[test]
+#[should_panic(expected = "Unauthorized")]
+fn test_set_usage_alert_threshold_requires_admin_auth() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, Escrow);
+    let client = EscrowClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    env.mock_all_auths();
+    client.init(&admin);
+    env.set_auths(&[]);
+    client.set_usage_alert_threshold(&50u32);
+}
+#[test]
+fn test_usage_hi_fires_once_threshold_now_settable() {
+    // With the threshold configured, the crossing call must emit usage_hi;
+    // calls before and after the crossing edge must not.
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "infer");
+    let usage_hi_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("usage_hi"),).into_val(&env);
+
+    client.set_usage_alert_threshold(&100u32);
+
+    // Below threshold: no usage_hi event.
+    client.record_usage(&agent, &svc, &60u32);
+    let events = env.events().all();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|(_, t, _)| t == &usage_hi_topics)
+            .count(),
+        0
+    );
+
+    // Crosses the threshold (60 -> 110): exactly one usage_hi event.
+    client.record_usage(&agent, &svc, &50u32);
+    let events = env.events().all();
+    let matching: alloc::vec::Vec<_> = events
+        .iter()
+        .filter(|(_, t, _)| t == &usage_hi_topics)
+        .collect();
+    assert_eq!(matching.len(), 1);
+    let (_, _, data) = &matching[0];
+    let decoded: (Address, Symbol, u32) = data.into_val(&env);
+    assert_eq!(decoded, (agent.clone(), svc.clone(), 110u32));
+
+    // Already above threshold: no further usage_hi event (edge-triggered).
+    client.record_usage(&agent, &svc, &5u32);
+    let events = env.events().all();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|(_, t, _)| t == &usage_hi_topics)
+            .count(),
+        0
+    );
+}
+#[test]
+fn test_usage_hi_disabled_by_default_zero_threshold() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let agent = Address::generate(&env);
+    let svc = Symbol::new(&env, "infer");
+    let usage_hi_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("usage_hi"),).into_val(&env);
+
+    // Threshold left at its default (0): alerting is disabled regardless
+    // of how much usage accumulates.
+    client.record_usage(&agent, &svc, &1_000_000u32);
+
+    let events = env.events().all();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|(_, t, _)| t == &usage_hi_topics)
+            .count(),
+        0
+    );
+}
+
 // ── compute_billing tests ────────────────────────────────────────────────────
 //
 // `compute_billing(agent, service_id)` returns `accumulated_requests * price_per_request`
