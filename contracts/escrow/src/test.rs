@@ -56,6 +56,7 @@
 //! `env.set_auths(&[])` to drop mock authorisations before the call under
 //! test.
 extern crate alloc;
+extern crate std;
 
 use super::*;
 use soroban_sdk::{
@@ -166,6 +167,15 @@ fn assert_latest_pause_event(env: &Env, expected_flag: bool) {
     assert_eq!(topics, expected_topics);
     let flag: bool = data.into_val(env);
     assert_eq!(flag, expected_flag);
+}
+
+/// Assert that no `admin_chg` event was emitted by the most recent call.
+fn assert_no_admin_chg_event(env: &Env) {
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("admin_chg"),).into_val(env);
+    for (_addr, topics, _data) in env.events().all().iter() {
+        assert_ne!(topics, expected_topics);
+    }
 }
 
 // ── Convenience address / symbol helpers ─────────────────────────────────────
@@ -920,6 +930,37 @@ fn test_accept_admin_transfer_emits_admin_chg_event() {
     let decoded: (Address, Address) = data.into_val(&env);
     assert_eq!(decoded, (admin, next));
 }
+#[test]
+fn test_accept_admin_transfer_rejects_missing_pending_without_emitting_admin_chg_event() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let caller = make_agent(&env);
+
+    let had_panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.accept_admin_transfer(&caller);
+    }))
+    .is_err();
+    assert!(had_panic, "expected a panic for missing pending admin");
+    assert_no_admin_chg_event(&env);
+}
+
+#[test]
+fn test_accept_admin_transfer_rejects_wrong_pending_without_emitting_admin_chg_event() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let pending = make_agent(&env);
+    let intruder = make_agent(&env);
+
+    client.propose_admin_transfer(&pending);
+
+    let had_panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.accept_admin_transfer(&intruder);
+    }))
+    .is_err();
+    assert!(had_panic, "expected a panic for wrong pending caller");
+    assert_no_admin_chg_event(&env);
+}
+
 #[test]
 fn test_propose_admin_transfer_does_not_emit_admin_chg_event() {
     // Only the completed handover (accept_admin_transfer) is a genuine
