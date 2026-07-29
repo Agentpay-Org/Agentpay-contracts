@@ -2146,9 +2146,17 @@ impl Escrow {
 
     /// Cancel a pending admin transfer. Current admin only. No-op when
     /// nothing is pending.
+    ///
+    /// Emits an `admin_can` event with `(admin, cancelled)` after the
+    /// storage write, where `cancelled` is the pending address that was
+    /// cleared (`None` when the call was a no-op) so indexers can observe
+    /// every cancellation on-chain, including no-op ones.
     pub fn cancel_admin_transfer(env: Env) {
-        require_admin(&env);
+        let admin = require_admin(&env);
+        let cancelled: Option<Address> = env.storage().persistent().get(&DataKey::PendingAdmin);
         env.storage().persistent().remove(&DataKey::PendingAdmin);
+        env.events()
+            .publish((symbol_short!("admin_can"),), (admin, cancelled));
     }
 
     /// Read the pending admin, if any.
@@ -2196,6 +2204,11 @@ impl Escrow {
     /// address; the new admin must then call `accept_admin_transfer`
     /// from their own key to finish the rotation. Re-proposing
     /// overwrites the prior pending entry.
+    ///
+    /// Emits an `admin_prp` event with `(admin, new_admin)` after the
+    /// storage write so indexers can observe every proposal — including a
+    /// re-proposal that overwrites a still-pending entry — without polling
+    /// `get_pending_admin`.
     pub fn propose_admin_transfer(env: Env, new_admin: Address) {
         let admin = require_admin(&env);
         if new_admin == admin {
@@ -2204,6 +2217,8 @@ impl Escrow {
         env.storage()
             .persistent()
             .set(&DataKey::PendingAdmin, &new_admin);
+        env.events()
+            .publish((symbol_short!("admin_prp"),), (admin, new_admin));
     }
 
     /// Returns `true` iff the contract is currently paused.
