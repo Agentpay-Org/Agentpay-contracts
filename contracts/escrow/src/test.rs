@@ -6114,6 +6114,101 @@ fn test_get_price_tiers_no_extend_when_above_threshold() {
     );
 }
 
+// ── get_service_pricing (combined fees view) ─────────────────────────────────
+//
+// get_service_pricing bundles four independent reads (flat price, tier
+// schedule, global bounds, disabled flag) into one call. These tests check
+// it matches the individual getters in every configuration.
+
+#[test]
+fn test_get_service_pricing_defaults_for_never_configured_service() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let svc = Symbol::new(&env, "never_priced");
+
+    let pricing = client.get_service_pricing(&svc);
+
+    assert_eq!(pricing.price_stroops, 0);
+    assert_eq!(pricing.tiers, None);
+    assert_eq!(pricing.min_bound, 0);
+    assert_eq!(pricing.max_bound, i128::MAX);
+    assert!(!pricing.disabled);
+}
+#[test]
+fn test_get_service_pricing_reflects_flat_price() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let svc = Symbol::new(&env, "flat");
+    client.set_service_price(&svc, &250i128);
+
+    let pricing = client.get_service_pricing(&svc);
+
+    assert_eq!(pricing.price_stroops, 250i128);
+    assert_eq!(pricing.tiers, None);
+}
+#[test]
+fn test_get_service_pricing_reflects_tier_schedule() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let svc = Symbol::new(&env, "tiered");
+    let mut tiers = soroban_sdk::Vec::new(&env);
+    tiers.push_back(PriceTier {
+        threshold_requests: 100,
+        price_stroops: 10,
+    });
+    client.set_price_tiers(&svc, &tiers);
+
+    let pricing = client.get_service_pricing(&svc);
+
+    assert_eq!(pricing.tiers, Some(tiers));
+    // The flat-price slot is independently untouched by set_price_tiers.
+    assert_eq!(pricing.price_stroops, 0);
+}
+#[test]
+fn test_get_service_pricing_reflects_global_bounds() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let svc = Symbol::new(&env, "bounded");
+    client.set_price_bounds(&10i128, &1000i128);
+
+    let pricing = client.get_service_pricing(&svc);
+
+    assert_eq!(pricing.min_bound, 10i128);
+    assert_eq!(pricing.max_bound, 1000i128);
+}
+#[test]
+fn test_get_service_pricing_reflects_disabled_flag() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let svc = Symbol::new(&env, "off");
+    client.set_service_disabled(&svc, &true);
+
+    let pricing = client.get_service_pricing(&svc);
+
+    assert!(pricing.disabled);
+}
+#[test]
+fn test_get_service_pricing_matches_individual_getters() {
+    // Cross-check: every field must agree with its dedicated getter, for
+    // a service configured with all of flat price, bounds, and disabled
+    // (tiers omitted since a tier schedule and a meaningful flat price
+    // are independent axes already covered above).
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let svc = Symbol::new(&env, "full");
+    client.set_price_bounds(&0i128, &10_000i128);
+    client.set_service_price(&svc, &500i128);
+    client.set_service_disabled(&svc, &true);
+
+    let pricing = client.get_service_pricing(&svc);
+
+    assert_eq!(pricing.price_stroops, client.get_service_price(&svc));
+    assert_eq!(pricing.tiers, client.get_price_tiers(&svc));
+    assert_eq!(pricing.min_bound, client.get_min_service_price());
+    assert_eq!(pricing.max_bound, client.get_max_service_price());
+    assert_eq!(pricing.disabled, client.is_service_disabled(&svc));
+}
+
 /// Setting service metadata extends the entry's persistent TTL.
 #[test]
 fn test_set_service_metadata_extends_ttl() {
