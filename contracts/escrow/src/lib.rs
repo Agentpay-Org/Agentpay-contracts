@@ -442,6 +442,40 @@ fn is_owner_or_admin(admin: &Address, caller: &Address, owner: &Address) -> bool
     caller == admin || caller == owner
 }
 
+/// Shared settlement-authorization check used by [`Escrow::settle`] and
+/// [`Escrow::settle_all`]: `caller` may settle `service_id` if it is the
+/// contract admin, or the `ServiceMetadata.owner` of that service.
+///
+/// Admin callers skip the metadata lookup entirely (matching the previous
+/// inline behaviour at each call site), so calling this with `caller ==
+/// admin` never panics even for a `service_id` with no metadata set.
+///
+/// Panics with [`EscrowError::ServiceMetadataNotFound`] if a non-admin
+/// caller references a service with no metadata, or with
+/// `unauthorized_err` if a non-admin, non-owner caller is rejected --
+/// callers pass their own existing code here (`settle` uses
+/// `NotPendingAdmin`, `settle_all` uses `Unauthorized`) so this extraction
+/// changes no ABI-visible rejection behaviour.
+fn require_settlement_authorized(
+    env: &Env,
+    admin: &Address,
+    caller: &Address,
+    service_id: &Symbol,
+    unauthorized_err: EscrowError,
+) {
+    if caller == admin {
+        return;
+    }
+    let meta: ServiceMetadata = env
+        .storage()
+        .persistent()
+        .get(&DataKey::ServiceMetadata(service_id.clone()))
+        .unwrap_or_else(|| panic_with_error!(env, EscrowError::ServiceMetadataNotFound));
+    if !is_owner_or_admin(admin, caller, &meta.owner) {
+        panic_with_error!(env, unauthorized_err);
+    }
+}
+
 /// Reject the call if the contract is currently paused.
 ///
 /// Panics with [`EscrowError::ContractPaused`] when the `Paused` flag is set.
@@ -1465,16 +1499,13 @@ impl Escrow {
         ensure_not_paused(&env);
         caller.require_auth();
         let admin = get_admin_address(&env);
-        if caller != admin {
-            let meta: ServiceMetadata = env
-                .storage()
-                .persistent()
-                .get(&DataKey::ServiceMetadata(service_id.clone()))
-                .unwrap_or_else(|| panic_with_error!(&env, EscrowError::ServiceMetadataNotFound));
-            if !is_owner_or_admin(&admin, &caller, &meta.owner) {
-                panic_with_error!(&env, EscrowError::NotPendingAdmin);
-            }
-        }
+        require_settlement_authorized(
+            &env,
+            &admin,
+            &caller,
+            &service_id,
+            EscrowError::NotPendingAdmin,
+        );
         let usage_key = DataKey::Usage(agent.clone(), service_id.clone());
         let requests: u32 = env.storage().persistent().get(&usage_key).unwrap_or(0);
         // Use tier schedule when present; fall back to flat price.
@@ -1552,18 +1583,13 @@ impl Escrow {
 
         for service_id in svc_list.iter() {
             // Non-admin callers must own this specific service.
-            if caller != admin {
-                let meta: ServiceMetadata = env
-                    .storage()
-                    .persistent()
-                    .get(&DataKey::ServiceMetadata(service_id.clone()))
-                    .unwrap_or_else(|| {
-                        panic_with_error!(&env, EscrowError::ServiceMetadataNotFound)
-                    });
-                if !is_owner_or_admin(&admin, &caller, &meta.owner) {
-                    panic_with_error!(&env, EscrowError::Unauthorized);
-                }
-            }
+            require_settlement_authorized(
+                &env,
+                &admin,
+                &caller,
+                &service_id,
+                EscrowError::Unauthorized,
+            );
 
             let usage_key = DataKey::Usage(agent.clone(), service_id.clone());
             let requests: u32 = env.storage().persistent().get(&usage_key).unwrap_or(0);
