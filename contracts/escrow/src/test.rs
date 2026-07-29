@@ -4906,6 +4906,149 @@ fn test_defaults_no_bounds_stored_accepts_any_positive() {
     assert_eq!(rec.requests, 999_999);
 }
 
+// ── Boundary tests for event-emitting logic ──────────────────────────────────
+//
+// The min/max/rate-limit boundary conditions above (exact-count, cap-exact)
+// are already covered for *return-value* correctness. None of them checked
+// the `usage` event itself at those same boundaries. These tests close that
+// gap: the crossing call at each boundary must still emit exactly one
+// correctly-payloaded `usage` event, and the rejecting call one past the
+// boundary must panic before any event is published.
+
+/// requests == max_requests_per_call (the ceiling itself) succeeds and
+/// still emits a usage event with the correct payload.
+#[test]
+fn test_usage_event_at_exact_max_requests_per_call_boundary() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    client.set_max_requests_per_call(&100u32);
+    let agent = make_agent(&env);
+    let svc = Symbol::new(&env, "infer");
+
+    client.record_usage(&agent, &svc, &100u32);
+
+    let (_, topics, data) = env.events().all().last().unwrap();
+    let expected: soroban_sdk::Vec<soroban_sdk::Val> = (symbol_short!("usage"),).into_val(&env);
+    assert_eq!(topics, expected);
+    let decoded: (Address, Symbol, u32, u32) = data.into_val(&env);
+    assert_eq!(decoded, (agent, svc, 100u32, 100u32));
+}
+/// requests == min_requests_per_call (the floor itself) succeeds and still
+/// emits a usage event with the correct payload.
+#[test]
+fn test_usage_event_at_exact_min_requests_per_call_boundary() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    client.set_min_requests_per_call(&10u32);
+    let agent = make_agent(&env);
+    let svc = Symbol::new(&env, "infer");
+
+    client.record_usage(&agent, &svc, &10u32);
+
+    let (_, topics, data) = env.events().all().last().unwrap();
+    let expected: soroban_sdk::Vec<soroban_sdk::Val> = (symbol_short!("usage"),).into_val(&env);
+    assert_eq!(topics, expected);
+    let decoded: (Address, Symbol, u32, u32) = data.into_val(&env);
+    assert_eq!(decoded, (agent, svc, 10u32, 10u32));
+}
+/// One request above the ceiling panics before reaching the publish call —
+/// the rejected call must never be observable as a usage event.
+#[test]
+#[should_panic(expected = "Error(Contract, #8)")]
+fn test_usage_event_not_emitted_one_above_max_boundary() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    client.set_max_requests_per_call(&100u32);
+    let agent = make_agent(&env);
+    let svc = Symbol::new(&env, "infer");
+    client.record_usage(&agent, &svc, &101u32);
+}
+/// When min == max (the exact-count case), the one value that is allowed
+/// still emits a correctly-payloaded usage event.
+#[test]
+fn test_usage_event_at_min_equals_max_exact_boundary() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    client.set_max_requests_per_call(&50u32);
+    client.set_min_requests_per_call(&50u32);
+    let agent = make_agent(&env);
+    let svc = Symbol::new(&env, "infer");
+
+    client.record_usage(&agent, &svc, &50u32);
+
+    let (_, topics, data) = env.events().all().last().unwrap();
+    let expected: soroban_sdk::Vec<soroban_sdk::Val> = (symbol_short!("usage"),).into_val(&env);
+    assert_eq!(topics, expected);
+    let decoded: (Address, Symbol, u32, u32) = data.into_val(&env);
+    assert_eq!(decoded, (agent, svc, 50u32, 50u32));
+}
+/// Accumulating to exactly the rate-limit cap in one window still emits a
+/// usage event on the crossing call (the limiter rejecting is a separate,
+/// already-covered behavior — this confirms the *allowed* boundary call is
+/// not silently swallowed).
+#[test]
+fn test_usage_event_at_exact_rate_limit_cap_boundary() {
+    let env = Env::default();
+    env.ledger().with_mut(|li| li.timestamp = 1_000);
+    let (client, _admin) = setup_initialized(&env);
+    configure_rate_limit(&client, 10, 100);
+    let agent = make_agent(&env);
+    let svc = Symbol::new(&env, "infer");
+
+    client.record_usage(&agent, &svc, &6u32);
+    // This call lands exactly at the cap (6 + 4 = 10).
+    client.record_usage(&agent, &svc, &4u32);
+
+    let (_, topics, data) = env.events().all().last().unwrap();
+    let expected: soroban_sdk::Vec<soroban_sdk::Val> = (symbol_short!("usage"),).into_val(&env);
+    assert_eq!(topics, expected);
+    let decoded: (Address, Symbol, u32, u32) = data.into_val(&env);
+    assert_eq!(decoded, (agent, svc, 4u32, 10u32));
+}
+/// The cross-bound guard's own boundary: setting min equal to the current
+/// max is accepted (not rejected as an inverted range) and still emits the
+/// same cfg_set event every other floor change emits.
+#[test]
+fn test_cfg_set_emitted_when_min_set_equal_to_current_max() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    client.set_max_requests_per_call(&30u32);
+
+    client.set_min_requests_per_call(&30u32);
+
+    let (_, topics, data) = env.events().all().last().unwrap();
+    let expected: soroban_sdk::Vec<soroban_sdk::Val> = (symbol_short!("cfg_set"),).into_val(&env);
+    assert_eq!(topics, expected);
+    let decoded: (Symbol, u32) = data.into_val(&env);
+    assert_eq!(decoded, (symbol_short!("min_call"), 30u32));
+}
+/// The symmetric case: setting max equal to the current min is accepted
+/// and still emits its cfg_set event.
+#[test]
+fn test_cfg_set_emitted_when_max_set_equal_to_current_min() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    client.set_min_requests_per_call(&30u32);
+
+    client.set_max_requests_per_call(&30u32);
+
+    let (_, topics, data) = env.events().all().last().unwrap();
+    let expected: soroban_sdk::Vec<soroban_sdk::Val> = (symbol_short!("cfg_set"),).into_val(&env);
+    assert_eq!(topics, expected);
+    let decoded: (Symbol, u32) = data.into_val(&env);
+    assert_eq!(decoded, (symbol_short!("max_call"), 30u32));
+}
+/// One value past the boundary (min = max + 1) is rejected before the
+/// publish call — no cfg_set event for the rejected attempt.
+#[test]
+#[should_panic(expected = "Error(Contract, #23)")]
+fn test_cfg_set_not_emitted_when_min_one_above_max() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    client.set_max_requests_per_call(&30u32);
+    client.set_min_requests_per_call(&31u32);
+}
+
 /// set_max first, then a lower-but-valid min → accepted.
 ///
 /// Documents the recommended "ceiling first, floor second" operator
