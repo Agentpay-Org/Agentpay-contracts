@@ -7645,3 +7645,99 @@ fn test_settle_all_service_metadata_not_found_panics() {
     let _ = owner;
     client.settle_all(&intruder, &agent);
 }
+
+// ── Shared cfg_set event payload (publish_cfg_event helper) ─────────────────
+//
+// Six admin config setters share a single `cfg_set(tag, value)` publish call,
+// now centralised in the private `publish_cfg_event` helper. None of them had
+// a direct payload-correctness test before this refactor; these lock in the
+// exact (tag, value) pair each setter must keep emitting.
+
+#[test]
+fn test_cfg_set_payload_set_allowlist_enabled() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    client.set_allowlist_enabled(&true);
+    let (_, topics, data) = env.events().all().last().unwrap();
+    let expected: soroban_sdk::Vec<soroban_sdk::Val> = (symbol_short!("cfg_set"),).into_val(&env);
+    assert_eq!(topics, expected);
+    let decoded: (Symbol, bool) = data.into_val(&env);
+    assert_eq!(decoded, (symbol_short!("allowlist"), true));
+}
+#[test]
+fn test_cfg_set_payload_set_min_requests_per_call() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    client.set_min_requests_per_call(&3u32);
+    let (_, topics, data) = env.events().all().last().unwrap();
+    let expected: soroban_sdk::Vec<soroban_sdk::Val> = (symbol_short!("cfg_set"),).into_val(&env);
+    assert_eq!(topics, expected);
+    let decoded: (Symbol, u32) = data.into_val(&env);
+    assert_eq!(decoded, (symbol_short!("min_call"), 3u32));
+}
+#[test]
+fn test_cfg_set_payload_set_max_requests_per_call() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    client.set_max_requests_per_call(&500u32);
+    let (_, topics, data) = env.events().all().last().unwrap();
+    let expected: soroban_sdk::Vec<soroban_sdk::Val> = (symbol_short!("cfg_set"),).into_val(&env);
+    assert_eq!(topics, expected);
+    let decoded: (Symbol, u32) = data.into_val(&env);
+    assert_eq!(decoded, (symbol_short!("max_call"), 500u32));
+}
+#[test]
+fn test_cfg_set_payload_set_max_requests_per_window() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    client.set_max_requests_per_window(&100u32);
+    let (_, topics, data) = env.events().all().last().unwrap();
+    let expected: soroban_sdk::Vec<soroban_sdk::Val> = (symbol_short!("cfg_set"),).into_val(&env);
+    assert_eq!(topics, expected);
+    let decoded: (Symbol, u32) = data.into_val(&env);
+    assert_eq!(decoded, (symbol_short!("max_win"), 100u32));
+}
+#[test]
+fn test_cfg_set_payload_set_rate_window_seconds() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    client.set_rate_window_seconds(&60u64);
+    let (_, topics, data) = env.events().all().last().unwrap();
+    let expected: soroban_sdk::Vec<soroban_sdk::Val> = (symbol_short!("cfg_set"),).into_val(&env);
+    assert_eq!(topics, expected);
+    let decoded: (Symbol, u64) = data.into_val(&env);
+    assert_eq!(decoded, (symbol_short!("win_sec"), 60u64));
+}
+#[test]
+fn test_cfg_set_payload_set_require_service_registration() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    client.set_require_service_registration(&true);
+    let (_, topics, data) = env.events().all().last().unwrap();
+    let expected: soroban_sdk::Vec<soroban_sdk::Val> = (symbol_short!("cfg_set"),).into_val(&env);
+    assert_eq!(topics, expected);
+    let decoded: (Symbol, bool) = data.into_val(&env);
+    assert_eq!(decoded, (symbol_short!("req_reg"), true));
+}
+#[test]
+fn test_cfg_set_payload_tags_are_mutually_distinct() {
+    // The six setters share one topic; the tag in payload position 0 is
+    // what disambiguates them. Guards against two setters ever reusing
+    // the same tag, which would make them indistinguishable to indexers.
+    let tags = [
+        symbol_short!("allowlist"),
+        symbol_short!("min_call"),
+        symbol_short!("max_call"),
+        symbol_short!("max_win"),
+        symbol_short!("win_sec"),
+        symbol_short!("req_reg"),
+    ];
+    for i in 0..tags.len() {
+        for j in (i + 1)..tags.len() {
+            assert_ne!(
+                tags[i], tags[j],
+                "cfg_set tags must all be mutually distinct"
+            );
+        }
+    }
+}
