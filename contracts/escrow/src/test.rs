@@ -5288,6 +5288,188 @@ fn test_get_billing_summary_with_price_tiers() {
     assert_eq!(summary.last_settlement, None);
 }
 
+// ── Boundary tests for the fees/pricing logic ────────────────────────────────
+//
+// docs/escrow/pricing.md documents tier boundaries as inclusive at the
+// upper edge: tier k covers [threshold_{k-1}+1 .. threshold_k]. None of the
+// existing tier tests land exactly on a threshold or one past it — they use
+// mid-range values (e.g. 1500 against thresholds 100/1000). These tests
+// close that gap. `set_price_tiers`'s validation invariants (empty
+// schedule, non-ascending thresholds, negative price, zero first
+// threshold) also had no direct test at all before this.
+
+/// Exactly at the first tier's threshold: entirely billed at tier 0's rate.
+#[test]
+fn test_compute_billing_at_exact_first_tier_threshold() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let agent = make_agent(&env);
+    let svc = make_service(&env, "tiered");
+    let mut tiers = soroban_sdk::Vec::new(&env);
+    tiers.push_back(PriceTier {
+        threshold_requests: 100,
+        price_stroops: 10,
+    });
+    tiers.push_back(PriceTier {
+        threshold_requests: u32::MAX,
+        price_stroops: 4,
+    });
+    client.set_price_tiers(&svc, &tiers);
+
+    client.record_usage(&agent, &svc, &100u32);
+    assert_eq!(client.compute_billing(&agent, &svc), 1000i128); // 100 * 10
+}
+/// One request past the first tier's threshold: the boundary request
+/// itself is billed at the *next* tier's rate, not the one it just left.
+#[test]
+fn test_compute_billing_one_past_first_tier_threshold() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let agent = make_agent(&env);
+    let svc = make_service(&env, "tiered");
+    let mut tiers = soroban_sdk::Vec::new(&env);
+    tiers.push_back(PriceTier {
+        threshold_requests: 100,
+        price_stroops: 10,
+    });
+    tiers.push_back(PriceTier {
+        threshold_requests: u32::MAX,
+        price_stroops: 4,
+    });
+    client.set_price_tiers(&svc, &tiers);
+
+    client.record_usage(&agent, &svc, &101u32);
+    assert_eq!(client.compute_billing(&agent, &svc), 1004i128); // 100*10 + 1*4
+}
+/// Exactly at a middle tier's threshold (not the first, not open-ended):
+/// confirms the inclusive-upper-bound rule holds at an interior boundary.
+#[test]
+fn test_compute_billing_at_exact_middle_tier_threshold() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let agent = make_agent(&env);
+    let svc = make_service(&env, "tiered");
+    let mut tiers = soroban_sdk::Vec::new(&env);
+    tiers.push_back(PriceTier {
+        threshold_requests: 100,
+        price_stroops: 10,
+    });
+    tiers.push_back(PriceTier {
+        threshold_requests: 1000,
+        price_stroops: 7,
+    });
+    tiers.push_back(PriceTier {
+        threshold_requests: u32::MAX,
+        price_stroops: 4,
+    });
+    client.set_price_tiers(&svc, &tiers);
+
+    client.record_usage(&agent, &svc, &1000u32);
+    // 100*10 + 900*7 = 1000 + 6300 = 7300, still all in tier 1 (no tier-2 spillover).
+    assert_eq!(client.compute_billing(&agent, &svc), 7300i128);
+}
+/// `settle` uses the same tier math as `compute_billing`; confirms the
+/// billed amount returned by settle agrees at the exact same boundary.
+#[test]
+fn test_settle_agrees_with_compute_billing_at_tier_boundary() {
+    let env = Env::default();
+    let (client, admin) = setup_initialized(&env);
+    let agent = make_agent(&env);
+    let svc = make_service(&env, "tiered");
+    let mut tiers = soroban_sdk::Vec::new(&env);
+    tiers.push_back(PriceTier {
+        threshold_requests: 100,
+        price_stroops: 10,
+    });
+    tiers.push_back(PriceTier {
+        threshold_requests: u32::MAX,
+        price_stroops: 4,
+    });
+    client.set_price_tiers(&svc, &tiers);
+    client.record_usage(&agent, &svc, &100u32);
+
+    let expected = client.compute_billing(&agent, &svc);
+    let billed = client.settle(&admin, &agent, &svc);
+    assert_eq!(billed, expected);
+    assert_eq!(billed, 1000i128);
+}
+/// `set_price_tiers` rejects an empty schedule.
+#[test]
+#[should_panic(expected = "Error(Contract, #18)")]
+fn test_set_price_tiers_rejects_empty_schedule() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let svc = Symbol::new(&env, "infer");
+    let tiers: soroban_sdk::Vec<PriceTier> = soroban_sdk::Vec::new(&env);
+    client.set_price_tiers(&svc, &tiers);
+}
+/// The first tier's threshold must be > 0 — exactly 0 is rejected.
+#[test]
+#[should_panic(expected = "Error(Contract, #18)")]
+fn test_set_price_tiers_rejects_zero_first_threshold() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let svc = Symbol::new(&env, "infer");
+    let mut tiers = soroban_sdk::Vec::new(&env);
+    tiers.push_back(PriceTier {
+        threshold_requests: 0,
+        price_stroops: 5,
+    });
+    client.set_price_tiers(&svc, &tiers);
+}
+/// Tied (non-strictly-ascending) thresholds between two tiers are rejected.
+#[test]
+#[should_panic(expected = "Error(Contract, #18)")]
+fn test_set_price_tiers_rejects_tied_thresholds() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let svc = Symbol::new(&env, "infer");
+    let mut tiers = soroban_sdk::Vec::new(&env);
+    tiers.push_back(PriceTier {
+        threshold_requests: 100,
+        price_stroops: 10,
+    });
+    tiers.push_back(PriceTier {
+        threshold_requests: 100,
+        price_stroops: 5,
+    });
+    client.set_price_tiers(&svc, &tiers);
+}
+/// A negative tier price is rejected even when thresholds are valid.
+#[test]
+#[should_panic(expected = "Error(Contract, #18)")]
+fn test_set_price_tiers_rejects_negative_price() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let svc = Symbol::new(&env, "infer");
+    let mut tiers = soroban_sdk::Vec::new(&env);
+    tiers.push_back(PriceTier {
+        threshold_requests: 100,
+        price_stroops: -1,
+    });
+    client.set_price_tiers(&svc, &tiers);
+}
+/// Thresholds exactly one apart (100, 101 — the minimum valid ascending
+/// gap) are accepted: strictly-ascending means "no ties," not "a minimum
+/// gap size."
+#[test]
+fn test_set_price_tiers_accepts_thresholds_one_apart() {
+    let env = Env::default();
+    let (client, _admin) = setup_initialized(&env);
+    let svc = Symbol::new(&env, "infer");
+    let mut tiers = soroban_sdk::Vec::new(&env);
+    tiers.push_back(PriceTier {
+        threshold_requests: 100,
+        price_stroops: 10,
+    });
+    tiers.push_back(PriceTier {
+        threshold_requests: 101,
+        price_stroops: 5,
+    });
+    client.set_price_tiers(&svc, &tiers);
+    assert_eq!(client.get_price_tiers(&svc), Some(tiers));
+}
+
 // ── refund_batch tests ────────────────────────────────────────────────────────
 //
 // `refund_batch` is a bounded admin batch entrypoint that resolves disputes
