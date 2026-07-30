@@ -55,6 +55,7 @@
 //! verify that auth *is* enforced, use `setup_scoped_auth` or call
 //! `env.set_auths(&[])` to drop mock authorisations before the call under
 //! test.
+mod regression_test;
 extern crate alloc;
 
 use super::*;
