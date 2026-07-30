@@ -5,6 +5,8 @@ use soroban_sdk::{
     Env, IntoVal, String, Symbol, Val, Vec,
 };
 
+mod events;
+
 /// Current on-chain storage schema version stamped at init.
 const CURRENT_SCHEMA: u32 = 2;
 
@@ -472,8 +474,7 @@ where
     T: IntoVal<Env, Val>,
     (Symbol, T): IntoVal<Env, Val>,
 {
-    env.events()
-        .publish((symbol_short!("cfg_set"),), (tag, value));
+    env.events().publish((events::TOPIC_CFG_SET,), (tag, value));
 }
 
 // Shared access-control helpers.
@@ -641,7 +642,7 @@ fn debit_agent_credit(env: &Env, agent: &Address, billed: i128) {
             .persistent()
             .set(&DataKey::AgentCredit(agent.clone()), &new_balance);
         env.events().publish(
-            (symbol_short!("cred_deb"),),
+            (events::TOPIC_CRED_DEB,),
             (agent.clone(), debit, new_balance),
         );
     }
@@ -969,7 +970,7 @@ impl Escrow {
         );
 
         env.events().publish(
-            (symbol_short!("usage"),),
+            (events::TOPIC_USAGE,),
             (agent.clone(), service_id.clone(), requests, total),
         );
 
@@ -995,9 +996,10 @@ impl Escrow {
             .unwrap_or(0);
         if threshold > 0 && prev < threshold && total >= threshold {
             env.events().publish(
-                (symbol_short!("usage_hi"),),
+                (events::TOPIC_USAGE_HI,),
                 (agent.clone(), service_id.clone(), total),
             );
+
         }
 
         UsageRecord {
@@ -1042,7 +1044,7 @@ impl Escrow {
         env.storage().persistent().set(&key, &new_total);
 
         env.events().publish(
-            (symbol_short!("usage_dec"),),
+            (events::TOPIC_USAGE_DEC,),
             (agent, service_id, amount, new_total),
         );
 
@@ -1363,7 +1365,7 @@ impl Escrow {
             .persistent()
             .set(&DataKey::ServicePrice(service_id.clone()), &price_stroops);
         env.events()
-            .publish((symbol_short!("price_set"),), (service_id, price_stroops));
+            .publish((events::TOPIC_PRICE_SET,), (service_id, price_stroops));
     }
 
     /// Remove the configured per-request price for a service, freeing the
@@ -1387,7 +1389,7 @@ impl Escrow {
             .persistent()
             .remove(&DataKey::ServicePrice(service_id.clone()));
         env.events()
-            .publish((symbol_short!("price_rmv"),), service_id);
+            .publish((events::TOPIC_PRICE_RMV,), service_id);
     }
 
     /// Admin sets a volume-discount tier schedule for a service.
@@ -2445,8 +2447,8 @@ impl Escrow {
         }
         write_flag(&env, &key, true);
         env.events().publish(
-            (symbol_short!("dispute"),),
-            (symbol_short!("open"), agent, service_id),
+            (events::TOPIC_DISPUTE,),
+            (events::TOPIC_OPEN, agent, service_id),
         );
     }
 
@@ -2518,8 +2520,8 @@ impl Escrow {
         // Clear the dispute flag so settle can proceed.
         write_flag(&env, &dispute_key, false);
         env.events().publish(
-            (symbol_short!("dispute"),),
-            (symbol_short!("resolve"), agent, service_id, refund_requests),
+            (events::TOPIC_DISPUTE,),
+            (events::TOPIC_RESOLVE, agent, service_id, refund_requests),
         );
     }
 
@@ -2555,13 +2557,8 @@ impl Escrow {
             // Clear the dispute flag so settle can proceed.
             write_flag(&env, &dispute_key, false);
             env.events().publish(
-                (symbol_short!("dispute"),),
-                (
-                    symbol_short!("resolve"),
-                    agent.clone(),
-                    service_id.clone(),
-                    current,
-                ),
+                (events::TOPIC_DISPUTE,),
+                (events::TOPIC_RESOLVE, agent.clone(), service_id.clone(), current),
             );
         }
     }
