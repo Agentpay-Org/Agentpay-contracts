@@ -1,5 +1,14 @@
 # AgentPay Contracts
 
+## Live
+
+| | |
+| --- | --- |
+| Website | https://agentpay-frontend-ashy.vercel.app |
+| Docs | https://agentpay-frontend-ashy.vercel.app/docs |
+| API | https://agentpay-backend-red.vercel.app ([API docs](https://agentpay-backend-red.vercel.app/docs), [health](https://agentpay-backend-red.vercel.app/health)) |
+| Contract (testnet) | [`CAWQI63RISS2AXF2YSH77RQGUMVMXIAJUIDBW4DTVSTYU2L5TLCAMXNU`](https://stellar.expert/explorer/testnet/contract/CAWQI63RISS2AXF2YSH77RQGUMVMXIAJUIDBW4DTVSTYU2L5TLCAMXNU) |
+
 [![CI](https://github.com/Agentpay-Org/Agentpay-contracts/actions/workflows/ci.yml/badge.svg)](https://github.com/Agentpay-Org/Agentpay-contracts/actions/workflows/ci.yml)
 
 Soroban smart contracts for the AgentPay protocol: escrow, usage recording, and payment settlement on Stellar.
