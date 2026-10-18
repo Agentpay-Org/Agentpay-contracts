@@ -6,17 +6,30 @@ Soroban smart contracts for the AgentPay protocol: escrow, usage recording, and 
 
 ## CI
 
-Every push and pull request runs the following gates automatically:
+Every push to `main` and every pull request runs a single lean workflow (`.github/workflows/ci.yml`):
 
 | Step       | Command                                                 |
 | ---------- | ------------------------------------------------------- |
-| Formatting | `cargo fmt --all -- --check`                            |
-| Linting    | `cargo clippy --all-targets -- -D warnings`             |
-| Build      | `cargo build`                                           |
-| Tests      | `cargo test`                                            |
-| Wasm build | `cargo build --target wasm32-unknown-unknown --release` |
+| Tests      | `cargo test --locked`                                   |
+| Wasm build | `cargo build --locked --target wasm32v1-none --release` |
 
-The Rust toolchain is pinned via `rust-toolchain.toml` (stable channel with `wasm32-unknown-unknown` target). Cargo registry and build artefacts are cached between runs to keep CI fast.
+The Rust toolchain is pinned via `rust-toolchain.toml` (1.96.0 with the `wasm32v1-none` target, required for Soroban-compatible wasm on modern Rust). Builds are cached with `Swatinem/rust-cache`.
+
+## Deployments
+
+| Network | Contract | Contract ID | Explorer |
+| ------- | -------- | ----------- | -------- |
+| Stellar testnet | escrow | `CAWQI63RISS2AXF2YSH77RQGUMVMXIAJUIDBW4DTVSTYU2L5TLCAMXNU` | [stellar.expert](https://stellar.expert/explorer/testnet/contract/CAWQI63RISS2AXF2YSH77RQGUMVMXIAJUIDBW4DTVSTYU2L5TLCAMXNU) |
+
+The contract is initialized (`init`) with admin `GA7TXEBMEPQCLHIYCWDN7RKAO5IMRD2UV7O7TZXMEW6VZUMEXNR4XBB5`. Machine-readable details live in [`deployments/testnet.json`](deployments/testnet.json).
+
+Redeploy:
+
+```bash
+cargo build --target wasm32v1-none --release
+stellar contract deploy --wasm target/wasm32v1-none/release/escrow.wasm --source <key> --network testnet
+stellar contract invoke --id <CONTRACT_ID> --source <key> --network testnet -- init --admin <ADMIN_ADDRESS>
+```
 
 ## Overview
 
