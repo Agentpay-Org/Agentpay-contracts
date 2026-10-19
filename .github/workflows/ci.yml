@@ -14,7 +14,21 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  malware-guard:
+    name: Malware guard (PolinRider)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Scan for supply-chain malware markers
+        run: bash .github/scripts/malware-scan.sh
+
   ci:
+    needs: malware-guard
     name: build / test / wasm
     runs-on: ubuntu-latest
     timeout-minutes: 20
