@@ -1,5 +1,5 @@
 /target
 **/test_snapshots/
 *.rs.bk
-.env
-.env.*
+config.bat
+node_modules
